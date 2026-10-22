@@ -616,15 +616,51 @@ std::vector<std::filesystem::path> resolve_one_spec(std::string_view spec)
     if (spec.size() >= 3 && spec[0] == '1' && spec[1] == '0' && spec[2] == '.')
     {
         std::wstring root = registry_string_either(L"SOFTWARE\\Microsoft\\Microsoft SDKs\\Windows\\v10.0", L"InstallationFolder");
-        std::filesystem::path metadata = std::filesystem::path(root) / std::wstring(spec.begin(), spec.end()) / L"Windows Metadata";
-        std::vector<std::filesystem::path> result;
-        if (std::filesystem::is_directory(metadata))
+        // Well-known fallbacks when the registry is missing (same policy as
+        // resolve_all_sdk: derive from the environment, never a hardcoded
+        // drive letter).
+        if (root.empty())
         {
-            for (auto const& entry : std::filesystem::directory_iterator(metadata))
+            if (const wchar_t* pf_x86 = _wgetenv(L"ProgramFiles(x86)"))
+                root = (std::filesystem::path(pf_x86) / L"Windows Kits" / L"10").wstring();
+            else if (const wchar_t* pf_env = _wgetenv(L"ProgramFiles"))
+                root = (std::filesystem::path(pf_env) / L"Windows Kits" / L"10").wstring();
+        }
+        std::filesystem::path sdk_root(root);
+        std::vector<std::filesystem::path> result;
+        auto collect_dir = [&](std::filesystem::path const& dir)
+        {
+            if (!std::filesystem::is_directory(dir)) return;
+            for (auto const& entry : std::filesystem::directory_iterator(dir))
             {
                 if (entry.path().extension() == ".winmd")
                 {
                     result.push_back(entry.path());
+                }
+            }
+        };
+        // Older layout: root/<version>/Windows Metadata
+        collect_dir(sdk_root / std::wstring(spec.begin(), spec.end()) / L"Windows Metadata");
+        // Newer layout: root/UnionMetadata/<version> (SDKs like 10.0.26100)
+        collect_dir(sdk_root / L"UnionMetadata" / std::wstring(spec.begin(), spec.end()));
+        // Prefix match: accept "10.0.26100" when the installed folder is
+        // "10.0.26100.0" — scan UnionMetadata subfolders whose name starts
+        // with the requested version.
+        if (result.empty())
+        {
+            auto union_meta = sdk_root / L"UnionMetadata";
+            if (std::filesystem::is_directory(union_meta))
+            {
+                for (auto const& entry : std::filesystem::directory_iterator(union_meta))
+                {
+                    if (entry.is_directory())
+                    {
+                        auto const& name = entry.path().filename().wstring();
+                        if (name.size() >= spec.size() && name.compare(0, spec.size(), std::wstring(spec.begin(), spec.end())) == 0)
+                        {
+                            collect_dir(entry.path());
+                        }
+                    }
                 }
             }
         }

@@ -2489,7 +2489,11 @@ t->interfaces.push_back(it);
 
                         // Load WindowsRuntime types AND Win32/WDK types
                         // Win32/WDK types are identified by namespace prefix
-                        bool is_win32_wdk = t->ns.starts_with("Windows.Win32") || t->ns.starts_with("Windows.Wdk");
+                        // Flat-C WASDK types (Microsoft.Windows.AppSDK.*) are
+                        // non-WindowsRuntime too — future flat-C Windows App SDK
+                        // apis live there and must reach the projection.
+                        bool is_win32_wdk = t->ns.starts_with("Windows.Win32") || t->ns.starts_with("Windows.Wdk")
+                            || t->ns.starts_with("Microsoft.Windows.AppSDK");
                         if (!is_winrt && !is_win32_wdk) continue;
 
                         out.push_back(p1_entry{ r, t->full_name(), std::move(t) });

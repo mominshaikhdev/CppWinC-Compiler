@@ -286,12 +286,11 @@ The compiler auto-detects any namespace starting with `Windows.Wdk.*`
 as WDK and projects accordingly. Module names match the namespace from the
 `.winmd` (e.g. `import Windows.Wdk.BASETSD;`, `import Windows.Wdk.STRSAFE;`).
 
-The current WDK `.winmd` covers shared utility headers — type-safe
-integer conversion macros, string safety helpers, RPC/NDR marshaling,
-network extension helpers, and related low-level APIs. Core WDM/KMDF/UMDF
-driver APIs (`IoCreateDevice`, `WdfDeviceCreate`, etc.) require
-additional winversec coverage of `ntddk.h`, `wdm.h`, `fltKernel.h`,
-and WDF framework headers.
+The current WDK `.winmd` covers the kernel surface — `ntddk.h`, `wdm.h`,
+`fltKernel.h`, `ndis.h`, `storport.h`, the rest of `km/` and `shared/`
+(type-safe integer conversion macros, string safety helpers, RPC/NDR
+marshaling, network extension helpers), and the KMDF/UMDF WDF framework
+trees (`Include\wdf\{kmdf,umdf}`: `WdfDeviceCreate` and friends).
 
 ### Driver projection semantics
 
@@ -382,11 +381,11 @@ Tbsip_Context_Close(context);
 ### Generate all four projections
 
 ```bat
-cppwinc.exe -input local,Windows.Win32.winmd,Windows.Wdk.winmd -base -output out
+cppwinc.exe -input local,Windows.Win32.winmd,Windows.Wdk.winmd,MyApp.winmd -base -output out
 
 :: add WinUI 3 (WASDK `Microsoft.UI.*`): -winui auto-discovers the WASDK
 :: metadata + runtime DLLs and builds it alongside WinRT/Win32/WDK
-cppwinc.exe -input local,Windows.Win32.winmd,Windows.Wdk.winmd -base -winui -output out
+cppwinc.exe -input local,Windows.Win32.winmd,Windows.Wdk.winmd,MyApp.winmd -base -winui -output out
 ```
 
 ### Example — WinRT async + Win32 file I/O
@@ -531,10 +530,11 @@ cppwinc.exe -input MyApp.winmd -winui -output .
 
 How `-component` resolves its inputs and outputs:
 
-- **Component source = the LAST user-specified `-input` winmd.** The CLI
-  convention is `-input <OS/Win32 winmd>,...,<app>.winmd` — the app winmd
-  comes last. System metadata (`local`, SDK contracts) never names the
-  component.
+- **Component source = the app `-input` winmd(s).** Every user-supplied
+  winmd named in `-input` is an app/component source; system metadata
+  (`local`, SDK contracts) and the generated `Windows.Win32` / `Windows.Wdk`
+  projections never name the component. Position in `-input` does not
+  matter — order is irrelevant.
 - **`-name <name>`** sets the explicit component file name; without it the
   app winmd stem is used.
 - **`-component [<path>]`** chooses the destination folder; without a path
@@ -550,12 +550,12 @@ How `-component` resolves its inputs and outputs:
 
 `-component` is not WinUI-specific — use it to author any WinRT runtime
 class, interface, struct, enum, or delegate (a class library that exposes
-general WinRT APIs). Point it at your own component `.winmd`, placed
-**last** in `-input` after the OS metadata your types reference:
+general WinRT APIs). Point it at your own component `.winmd` in `-input`
+next to the OS metadata your types reference — order does not matter:
 
 ```bat
 :: Author a general WinRT class library from its winmd.
-:: OS metadata first, your component winmd last. -component emits the
+:: -component emits the
 :: projection for your types PLUS the implementation + activation templates.
 :: -name names the component files (default: the winmd stem).
 :: -compile builds everything (release, all cores) in the same run.
@@ -590,7 +590,7 @@ land (both default to the `-output` folder / the winmd stem).
 
 Define the component surface in IDL, compile it to a winmd with the
 Windows SDK's MIDLRT compiler, then hand that winmd to `-component`
-(authored winmd last in `-input`, after the OS metadata it references):
+(anywhere in `-input` — the order of winmds does not matter):
 
 ```bat
 :: 1. IDL -> component/authoring winmd (midlrt ships with the Windows SDK)

@@ -126,9 +126,17 @@ std::string win32_ns_cpp(std::string_view ns)
 }
 
 // Win32/WDK type name: type lives in its actual namespace
+// Globally anchored (leading ::): a flat-C module can itself live inside a
+// namespace whose first segments shadow a global one (e.g. the WASDK flat-C
+// modules are emitted inside namespace Microsoft::Windows::AppSDK::X, which
+// captures a bare "Windows::..." reference and resolves it to the
+// non-existent Microsoft::Windows::Win32 — C3083/C2039). A leading :: always
+// resolves from the global scope, so a reference never binds to the wrong
+// enclosing namespace. This is the reference-site helper only; namespace
+// *definitions* use win32_ns_cpp (no leading ::, which is illegal there).
 std::string win32_type_cpp_name(winmd::type_info const& type)
 {
-    return win32_ns_cpp(type.ns) + "::" + type.name;
+    return "::" + win32_ns_cpp(type.ns) + "::" + type.name;
 }
 
 std::string type_cpp_name(winmd::type_info const& type)
@@ -417,6 +425,16 @@ bool is_wdk_namespace(std::string_view ns)
     return ns.starts_with("Windows.Wdk") || ns.starts_with("Windows.Win32.Kernel");
 }
 
+// Flat-C Windows App SDK namespaces (microsoft.windows.appsdk.* as
+// authored by winversec from the WASDK NuGet headers via -include_wasdk):
+// free functions + C types in ECMA-335 metadata — no WinRT activation, so
+// they follow the same flat-C++ / P-Invoke projection model as
+// Windows.Win32.* rather than the winrt:: model.
+bool is_flatc_namespace(std::string_view ns)
+{
+    return ns.starts_with("Microsoft.Windows.AppSDK");
+}
+
 bool is_win32_type(winmd::type_info const& type)
 {
     return is_win32_namespace(type.ns);
@@ -431,6 +449,8 @@ ns_projection_model classify_namespace(std::string_view ns)
 {
     if (is_wdk_namespace(ns)) return ns_projection_model::wdk;
     if (is_win32_namespace(ns)) return ns_projection_model::win32;
+    // Flat-C WASDK (Microsoft.Windows.AppSDK.*) uses the win32 flat model
+    if (is_flatc_namespace(ns)) return ns_projection_model::win32;
     return ns_projection_model::winrt;
 }
 

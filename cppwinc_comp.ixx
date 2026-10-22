@@ -8,12 +8,13 @@ bool is_component_type(winmd::type_info const& type)
 {
     std::error_code ec;
     auto const db = std::filesystem::weakly_canonical(type.db->path(), ec).string();
-    // Component classes come only from the app .winmd (the last user-
-    // specified .winmd in -input). Matching any input db made every OS
-    // type a component class: the component module then absorbed the whole
-    // SDK surface and imported it through non-existent winrt.* modules.
-    if (!settings.app_db.empty())
-        return db == settings.app_db;
+    // Component classes come only from the app .winmd(s) — every non-system
+    // winmd in -input, whatever its position. Matching any input db made
+    // every OS type a component class: the component module then absorbed
+    // the whole SDK surface and imported it through non-existent winrt.*
+    // modules.
+    if (!settings.app_dbs.empty())
+        return settings.app_dbs.contains(db);
     return settings.input_dbs.contains(db);
 }
 

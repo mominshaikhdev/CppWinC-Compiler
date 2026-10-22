@@ -122,11 +122,11 @@ struct settings_type
     bool component = false;
     std::string component_folder;
     std::string component_name;
-    // Canonical path of the app .winmd (the last user-specified .winmd in
-    // the -input list). Component classes only come from the app winmd —
-    // every type in an input db must never qualify, or the component module
-    // would absorb the whole OS surface.
-    std::string app_db;
+    // Canonical paths of the app .winmd(s) — every non-system winmd named
+    // in -input, regardless of position. Component classes only come from
+    // app winmds — every type in a system/projection input db must never
+    // qualify, or the component module would absorb the whole OS surface.
+    std::set<std::string, std::less<>> app_dbs;
     std::set<std::string, std::less<>> include;
     std::set<std::string, std::less<>> exclude;
     std::set<std::string, std::less<>> module_include;

@@ -634,15 +634,17 @@ void process_args(arg_parser const& args)
         settings.component_name = args.value("name");
         if (settings.component_name.empty())
         {
-            // Component source = the app .winmd: the LAST user-specified
-            // .winmd in the -input list. The CLI convention is
-            // `-input <OS/Win32 winmd>,...,<app>.winmd` — the app winmd comes
-            // last. Taking the FIRST entry named the component module after
-            // Windows.Win32, whose 84MB component file then clobbered the
-            // SCC group module of the same name and broke every import of it.
+            // Component source = the app .winmd(s): EVERY non-system .winmd
+            // named in -input, in any order. System/projection winmds
+            // (Windows.Win32, Windows.Wdk, Windows, Microsoft.*) are skipped,
+            // so naming Windows.Win32 first can no longer produce a 84MB
+            // component file that clobbered the SCC group module of the same
+            // name and broke every import of it — and no position in -input
+            // decides which winmd is "the app": winuic view winmds and
+            // component winmds qualify alike.
             // args.values("input") returns the raw -input value(s), and the
             // spec is ONE comma-separated list. Split on commas before
-            // scanning for the app winmd.
+            // scanning for the app winmds.
             std::vector<std::string> inputs;
             for (auto const& raw : args.values("input"))
             {
@@ -659,18 +661,26 @@ void process_args(arg_parser const& args)
                     start = comma + 1;
                 }
             }
-            for (auto it = inputs.rbegin(); it != inputs.rend(); ++it)
+            std::string best_stem;
+            for (auto const& in : inputs)
             {
-                if (it->size() > 6 && it->rfind(".winmd") == it->size() - 6)
+                if (in.size() > 6 && in.rfind(".winmd") == in.size() - 6)
                 {
-                    std::string stem = std::filesystem::path(*it).filename().replace_extension().string();
+                    std::string stem = std::filesystem::path(in).filename().replace_extension().string();
                     if (stem == "Windows.Win32" || stem == "Windows.Wdk" || stem == "Windows" || stem.starts_with("Microsoft."))
                         continue;
                     std::error_code app_ec;
-                    settings.app_db = std::filesystem::weakly_canonical(*it, app_ec).string();
-                    settings.component_name = stem;
-                    break;
+                    settings.app_dbs.insert(std::filesystem::weakly_canonical(in, app_ec).string());
+                    // Default file name stays order-independent too: with a
+                    // single app winmd (the normal case) it is its stem;
+                    // with several, the lexicographic first wins.
+                    if (best_stem.empty() || stem < best_stem)
+                        best_stem = stem;
                 }
+            }
+            if (!best_stem.empty())
+            {
+                settings.component_name = best_stem;
             }
             if (settings.component_name.empty() && !settings.input_dbs.empty())
             {
@@ -1117,6 +1127,75 @@ static void write_win32_delegate(writer& w, winmd::type_info const& type, type_m
     w.write("export using % = %(%*)(%);\n\n", type.name, mapper.map(method.ret), cc, params);
 }
 
+// Linear, non-throwing scanners for the component metadata sweeps over
+// generated .ixx files. These replace std::regex: MSVC's std::regex threw
+// regex_error(error_complexity) part-way through the sweep, and because the
+// sweep sits inside a best-effort heuristic (discovering which properties /
+// base members the generated views call) that exception aborted the whole
+// -component run with no module diagnostics. Same language as the original
+// patterns, O(n) per line, cannot throw.
+template <typename F>
+static void for_each_prop_call(std::string const& line, F&& fn)
+{
+    auto is_word = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; };
+    std::size_t i = 0;
+    while (i < line.size())
+    {
+        std::size_t a = i;
+        while (a < line.size() && is_word(line[a])) ++a;
+        if (a == i) { ++i; continue; }
+        // group1 ends here only if a separator follows: (\w+)[_.](\w+)\s*\(
+        if (a < line.size() && (line[a] == '_' || line[a] == '.'))
+        {
+            std::size_t b = a + 1;
+            std::size_t be = b;
+            while (be < line.size() && is_word(line[be])) ++be;
+            if (be > b)
+            {
+                std::size_t k = be;
+                while (k < line.size() && (line[k] == ' ' || line[k] == '\t')) ++k;
+                if (k < line.size() && line[k] == '(')
+                {
+                    fn(line.substr(i, a - i), line.substr(b, be - b));
+                    i = k + 1;
+                    continue;
+                }
+            }
+        }
+        // No match can start inside this word run either: any inner start
+        // would end group1 at the same `a` and hit the same failing tail.
+        i = a;
+    }
+}
+
+template <typename F>
+static void for_each_call_pattern(std::string const& line, F&& fn)
+{
+    auto is_word = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; };
+    // \b(\w+)_\d+\.(\w+)\s*\( — anchor on the "_digits." separator, then
+    // walk back for the greedy group1 and forward for group2.
+    std::size_t q = 0;
+    while ((q = line.find('_', q)) != std::string::npos)
+    {
+        std::size_t d = q + 1;
+        while (d < line.size() && std::isdigit(static_cast<unsigned char>(line[d]))) ++d;
+        if (d == q + 1 || d >= line.size() || line[d] != '.') { ++q; continue; }
+        std::size_t s = q;
+        while (s > 0 && is_word(line[s - 1])) --s;
+        if (s == q) { ++q; continue; }              // group1 needs >= 1 char
+        if (s > 0 && is_word(line[s - 1])) { ++q; continue; }  // \b boundary
+        std::size_t b = d + 1;
+        std::size_t be = b;
+        while (be < line.size() && is_word(line[be])) ++be;
+        if (be == b) { ++q; continue; }
+        std::size_t k = be;
+        while (k < line.size() && (line[k] == ' ' || line[k] == '\t')) ++k;
+        if (k >= line.size() || line[k] != '(') { ++q; continue; }
+        fn(line.substr(s, q - s), line.substr(b, be - b));
+        q = k + 1;
+    }
+}
+
 static void write_win32_function(writer& w, winmd::type_info const& type, type_mapper const& mapper, winmd::metadata const&, std::set<std::string>& emitted)
 {
     if (type.methods.empty()) return;
@@ -1217,7 +1296,11 @@ static void write_win32_com_interface(writer& w, winmd::type_info const& type, t
     w.write("};\n\n");
     if (type.com_interface && type.has_com_iid)
         w.write("inline constexpr % IID_% = { % };\n\n",
-            "Windows::Win32::GUIDDEF::GUID", cn, guid_brace_bytes(type.com_iid));
+            // Globally anchored: inside a flat-C WASDK module (namespace
+            // Microsoft::Windows::AppSDK::X) a bare "Windows::..." resolves
+            // relative to Microsoft::Windows -> C3083/C2039 on every
+            // IID_* constant. Same anchoring as win32_type_cpp_name.
+            "::Windows::Win32::GUIDDEF::GUID", cn, guid_brace_bytes(type.com_iid));
 }
 
 static bool is_win32_function(winmd::type_info const& type)
@@ -1677,6 +1760,16 @@ export int run(int const, char**)
             for (auto const& [ns, info] : metadata.namespaces())
                 ns_order.emplace_back(ns, &info);
 
+            // -module_include entries are namespace PREFIXES, matching -include/
+            // -exclude (matches() uses starts_with) and the help examples
+            // (-module_include Windows.Win32.Graphics selects the Graphics
+            // subtree). A prefix that names a real namespace therefore also
+            // selects its children, and because WDF-style families are flat
+            // siblings (Windows.Wdk.Wdf / WdfDevice / ...) a plain string
+            // prefix selects the whole family. The self-consistency fixpoint
+            // below adds whatever the selected namespaces reference, so a
+            // subtree filter never emits dangling refs.
+
             struct ns_acc
             {
                 std::set<std::string, std::less<>> selected;      // projected namespaces
@@ -1702,7 +1795,7 @@ export int run(int const, char**)
                     if (i >= ns_order.size()) break;
                     std::string const& ns = ns_order[i].first;
                     auto const& info = *ns_order[i].second;
-                    if (std::getenv("CPPWINC_NS_TRACE") && (ns.find("ROAPI") != std::string::npos || ns.find("ERRHANDLING") != std::string::npos))
+                    if (std::getenv("CPPWINC_NS_TRACE") && (ns.find("ROAPI") != std::string::npos || ns.find("ERRHANDLING") != std::string::npos || ns.find("AppSDK") != std::string::npos))
                     {
                         std::fprintf(stderr, "[ns] %s classes=%zu ifaces=%zu enums=%zu structs=%zu dels=%zu\n",
                             ns.c_str(), info.classes.size(), info.interfaces.size(), info.enums.size(),
@@ -1721,7 +1814,7 @@ export int run(int const, char**)
                     bool projected = false;
                     for (auto const* t : info.classes)
                     {
-                        if (std::getenv("CPPWINC_NS_TRACE") && (ns.find("ROAPI") != std::string::npos || ns.find("ERRHANDLING") != std::string::npos))
+                        if (std::getenv("CPPWINC_NS_TRACE") && (ns.find("ROAPI") != std::string::npos || ns.find("ERRHANDLING") != std::string::npos || ns.find("AppSDK") != std::string::npos))
                         {
                             std::fprintf(stderr, "[ns-type] %s: %s internal=%d api_contract=%d in_projection=%d methods=%zu\n",
                                 ns.c_str(), t->name.c_str(), (int)t->internal_, (int)t->api_contract,
@@ -1747,9 +1840,28 @@ export int run(int const, char**)
                     {
                         continue;
                     }
-                    if (!settings.module_include.empty() && !settings.module_include.contains(ns))
+                    if (!settings.module_include.empty())
                     {
-                        continue;
+                        // Plain string prefix, matching matches() semantics
+                        // used by -include/-exclude. A dot-boundary rule was
+                        // wrong here: the WDF namespaces are flat siblings
+                        // (Windows.Wdk.Wdf, Windows.Wdk.WdfDevice, ...), so
+                        // "Windows.Wdk.Wdf" must select the whole Wdf* family
+                        // but a dot check rejected WdfDevice (the next char is
+                        // 'D', not '.') and yielded only the single leaf.
+                        bool included = false;
+                        for (auto const& inc : settings.module_include)
+                        {
+                            if (ns.starts_with(inc))
+                            {
+                                included = true;
+                                break;
+                            }
+                        }
+                        if (!included)
+                        {
+                            continue;
+                        }
                     }
                     if (settings.module_exclude.contains(ns))
                     {
@@ -1799,6 +1911,55 @@ export int run(int const, char**)
             {
                 win32_namespaces.insert(acc.win32.begin(), acc.win32.end());
                 wdk_namespaces.insert(acc.wdk.begin(), acc.wdk.end());
+            }
+
+            // -module_include must be self-consistent. A selected namespace's
+            // signatures reference types owned by other modules, and an
+            // "export import" line is emitted only for a module that was
+            // actually generated — so a filter that leaves those owners out
+            // emits the reference with no import, which is guaranteed-broken
+            // output (C2039 'tagDEC is not a member of global namespace',
+            // C2230 'could not find module'). Pull the transitive dependency
+            // closure of the selected set into the selection. Full runs
+            // select everything already, so this is a no-op there, and
+            // -winui's type-level closure runs afterwards and still prunes to
+            // what the app needs. Namespaces the user excluded stay out.
+            if (!settings.module_include.empty())
+            {
+                std::set<std::string, std::less<>> selected(module_ns.begin(), module_ns.end());
+                std::vector<std::string> queue(module_ns.begin(), module_ns.end());
+                while (!queue.empty())
+                {
+                    std::string ns = std::move(queue.back());
+                    queue.pop_back();
+                    auto nit = metadata.namespaces().find(ns);
+                    if (nit == metadata.namespaces().end()) continue;
+                    auto dit = ns_deps.find(ns);
+                    if (dit == ns_deps.end())
+                    {
+                        collect_namespace_deps(nit->second, metadata, ns_deps[ns]);
+                        dit = ns_deps.find(ns);
+                    }
+                    for (auto const& d : dit->second)
+                    {
+                        if (d == ns || selected.contains(d)) continue;
+                        if (d == "Windows.Foundation.Metadata") continue;
+                        if (settings.module_exclude.contains(d)) continue;
+                        if (!metadata.namespaces().contains(d)) continue;
+                        selected.insert(d);
+                        queue.push_back(d);
+                    }
+                }
+                if (selected.size() != module_ns.size())
+                {
+                    // Rebuild in namespace-map order so downstream grouping
+                    // and emission stay deterministic.
+                    module_ns.clear();
+                    for (auto const& [n, info] : ns_order)
+                    {
+                        if (selected.contains(n)) module_ns.push_back(n);
+                    }
+                }
             }
         }
 
@@ -2462,10 +2623,25 @@ export int run(int const, char**)
             }
             if (settings.verbose)
             {
-                std::printf("  component: app_db=%s classes=%zu\n", settings.app_db.c_str(), component_classes.size());
+                std::printf("  component: app_dbs=%zu classes=%zu\n", settings.app_dbs.size(), component_classes.size());
                 for (auto const* t : component_classes)
                     std::printf("    comp: %s.%s (db=%s)\n", t->ns.c_str(), t->name.c_str(), t->db ? t->db->path().string().c_str() : "<null>");
             }
+        }
+
+        // Component diagnostics for plain -component runs. The block above
+        // only reports when WinUI views were generated, so without this a
+        // plain -component run prints nothing about its component selection
+        // and order-independence of app_dbs cannot be verified from the
+        // outside. Guarded on view_class_names so view runs still print once.
+        if (settings.component && settings.verbose && view_class_names.empty())
+        {
+            std::printf("  component: app_dbs=%zu classes=%zu component_name=%s\n",
+                settings.app_dbs.size(), component_classes.size(),
+                settings.component_name.c_str());
+            for (auto const* t : component_classes)
+                std::printf("    comp: %s.%s (db=%s)\n", t->ns.c_str(), t->name.c_str(),
+                    t->db ? t->db->path().filename().string().c_str() : "<null>");
         }
 
         // Find needed modules: scan view imports + compute transitive deps from metadata
@@ -3937,7 +4113,6 @@ export int run(int const, char**)
                         if (!cache_built)
                         {
                             cache_built = true;
-                            std::regex prop_re(R"((\w+)[_.](\w+)\s*\()");
                             for (auto const& entry : std::filesystem::directory_iterator(settings.output_folder))
                             {
                                 if (!entry.is_regular_file() || entry.path().extension() != ".ixx") continue;
@@ -3945,12 +4120,10 @@ export int run(int const, char**)
                                 std::string line;
                                 while (std::getline(ifs, line))
                                 {
-                                    std::smatch m;
-                                    auto begin = line.cbegin();
-                                    while (std::regex_search(begin, line.cend(), m, prop_re))
+                                    for_each_prop_call(line, [&](std::string const& type_in, std::string const& prop_in)
                                     {
-                                        std::string type = m[1].str();
-                                        std::string prop = m[2].str();
+                                        std::string type = type_in;
+                                        std::string prop = prop_in;
                                         // Locals are named <Type>_<n> - the element type is the
                                         // prefix before the trailing _digits suffix.
                                         auto us = type.find_last_of('_');
@@ -3964,8 +4137,7 @@ export int run(int const, char**)
                                         // Check if this type is a component we care about
                                         if (winuic::g_project_nss.count(winuic::resolve_type_ns(type)))
                                             comp_props_cache[type].insert(prop);
-                                        begin = m.suffix().first;
-                                    }
+                                    });
                                 }
                             }
                         }
@@ -4121,7 +4293,6 @@ export int run(int const, char**)
                         if (!used_cache_built)
                         {
                             used_cache_built = true;
-                            std::regex call_re(R"(\b(\w+)_\d+\.(\w+)\s*\()");
                             for (auto const& entry : std::filesystem::directory_iterator(settings.output_folder))
                             {
                                 if (!entry.is_regular_file() || entry.path().extension() != ".ixx") continue;
@@ -4129,13 +4300,10 @@ export int run(int const, char**)
                                 std::string line;
                                 while (std::getline(ifs, line))
                                 {
-                                    std::smatch m;
-                                    auto begin = line.cbegin();
-                                    while (std::regex_search(begin, line.cend(), m, call_re))
+                                    for_each_call_pattern(line, [&](std::string const& type_in, std::string const& member_in)
                                     {
-                                        comp_used_members[m[1].str()].insert(m[2].str());
-                                        begin = m.suffix().first;
-                                    }
+                                        comp_used_members[type_in].insert(member_in);
+                                    });
                                 }
                             }
                         }
