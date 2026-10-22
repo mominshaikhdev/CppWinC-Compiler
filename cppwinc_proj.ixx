@@ -733,6 +733,19 @@ bool operator==(std::nullptr_t) const noexcept { return m_ptr == nullptr; }
     }
 
     w.write("\n");
+    if (generic)
+    {
+        // Instance IID for a closed generic instantiation, runtime-computed
+        // exactly like the delegate iid() (the pinterface SHA-1 cannot be
+        // constexpr): authoring-side query_interface compares against it,
+        // and consumers acquire through impl::query_interface(ptr, iid(), ...).
+        std::string gargs;
+        for (std::size_t p = 0; p < type.generic_params.size(); ++p)
+            gargs += (p ? ", " : "") + std::string("winrt::generic_arg_of<T") + std::to_string(p) + ">";
+        w.write("    static winrt::winrt_guid const& iid() noexcept\n    {\n");
+        w.write("        static winrt::winrt_guid const value = winrt::impl::make_generic_iid(% , %);\n", guid_literal(type), gargs);
+        w.write("        return value;\n    }\n\n");
+    }
     std::set<std::string> iface_emitted;
     for (std::size_t i = 0; i < methods.size(); ++i)
     {

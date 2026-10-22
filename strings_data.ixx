@@ -2163,6 +2163,11 @@ com_ns::CoTaskMemFree(m_data);
         export constexpr winrt_guid guid_ivectorview{ 0xbbe1fa4c, 0xb0e3, 0x4583, { 0xba, 0xef, 0x1f, 0x1b, 0x2e, 0x48, 0x3e, 0x56 } };
         export constexpr winrt_guid guid_ivector{ 0x913337e9, 0x11a1, 0x4345, { 0xa3, 0xa2, 0x4e, 0x7f, 0x95, 0x6e, 0x22, 0x2d } };
         export constexpr winrt_guid guid_iobservablevector{ 0x5917eb53, 0x50b4, 0x4a0d, { 0xb3, 0x09, 0x65, 0x86, 0x2b, 0x3f, 0x1d, 0xbc } };
+        // IReserveableVector<T> (proposal): IVector<T> extended with
+        // Reserve(UInt32). Provisional IID — this interface has no official
+        // Microsoft GUID yet; the value below is stable so QI works end-to-end
+        // and can be swapped in one place when an official one is assigned.
+        export constexpr winrt_guid guid_ireserveablevector{ 0x3f7a19c2, 0x6b1e, 0x4d95, { 0x8a, 0x24, 0xd1, 0x5e, 0x9c, 0x47, 0xb3, 0x08 } };
         export constexpr winrt_guid guid_imapview{ 0xe480ce40, 0xa338, 0x4ada, { 0xad, 0xcf, 0x27, 0x22, 0x72, 0xe4, 0x8c, 0xb9 } };
         export constexpr winrt_guid guid_imap{ 0x3c2925fe, 0x8519, 0x45c1, { 0xaa, 0x79, 0x19, 0x7b, 0x67, 0x18, 0xc1, 0xc1 } };
         export constexpr winrt_guid guid_iobservablemap{ 0x65df2bf5, 0xbf39, 0x41b5, { 0xae, 0xbc, 0x5a, 0x9d, 0x86, 0x5e, 0x47, 0x2b } };
@@ -3057,10 +3062,54 @@ com_ns::CoTaskMemFree(m_data);
                 }
             };
 
+            // IReserveableVector<T>: IInspectable (slots 0-5) + Reserve at
+            // slot 6. Capacity-reservation extension of IVector<T>; lets
+            // append-heavy callers preallocate storage (std::vector::reserve
+            // semantics) so bulk insertion does not repeatedly reallocate.
+            struct reserveable_iface : inspectable_iface_base<vector_impl<T>>
+            {
+                using inspectable_iface_base<vector_impl<T>>::from_self;
+
+                static void* const* vtable() noexcept
+                {
+                    static void* const v[7] =
+                    {
+                        reinterpret_cast<void*>(&inspectable_iface_base<vector_impl<T>>::qi),
+                        reinterpret_cast<void*>(&inspectable_iface_base<vector_impl<T>>::add_ref),
+                        reinterpret_cast<void*>(&inspectable_iface_base<vector_impl<T>>::release),
+                        reinterpret_cast<void*>(&inspectable_iface_base<vector_impl<T>>::get_iids),
+                        reinterpret_cast<void*>(&inspectable_iface_base<vector_impl<T>>::get_class_name),
+                        reinterpret_cast<void*>(&inspectable_iface_base<vector_impl<T>>::get_trust),
+                        reinterpret_cast<void*>(&reserve),
+                    };
+                    return v;
+                }
+
+                // Reserve(capacity): grow backing capacity to >= capacity.
+                // std::vector::reserve is a no-op when capacity <= current
+                // capacity and never shrinks or touches elements, matching the
+                // proposal's contract (Size unchanged, elements preserved).
+                static std::int32_t __stdcall reserve(void* self, std::uint32_t capacity) noexcept
+                {
+                    auto* owner = from_self(self)->m_owner;
+                    try
+                    {
+                        std::lock_guard lock(owner->m_guard);
+                        owner->m_values.reserve(capacity);
+                        return hr_ok;
+                    }
+                    catch (...)
+                    {
+                        return catch_to_hresult();
+                    }
+                }
+            };
+
             iterable_iface m_iterable;
             vector_iface m_vector;
             view_iface m_view;
             observable_iface m_observable;
+            reserveable_iface m_reserveable;
 
             vector_impl()
             {
@@ -3072,6 +3121,8 @@ com_ns::CoTaskMemFree(m_data);
                 m_view.m_owner = this;
                 m_observable.m_vtable = observable_iface::vtable();
                 m_observable.m_owner = this;
+                m_reserveable.m_vtable = reserveable_iface::vtable();
+                m_reserveable.m_owner = this;
             }
 
             void* get_abi() noexcept { return &m_observable; }
@@ -3135,6 +3186,7 @@ com_ns::CoTaskMemFree(m_data);
                 static winrt_guid const vector_iid = make_generic_iid(guid_ivector, generic_arg_of<T>);
                 static winrt_guid const view_iid = make_generic_iid(guid_ivectorview, generic_arg_of<T>);
                 static winrt_guid const observable_iid = make_generic_iid(guid_iobservablevector, generic_arg_of<T>);
+                static winrt_guid const reserveable_iid = make_generic_iid(guid_ireserveablevector, generic_arg_of<T>);
                 if (iid == winrt_guid::from(iid_iunknown) || iid == winrt_guid::from(iid_iinspectable) || iid == vector_iid)
                 {
                     *result = &m_vector;
@@ -3159,6 +3211,12 @@ com_ns::CoTaskMemFree(m_data);
                     add_ref();
                     return hr_ok;
                 }
+                if (iid == reserveable_iid)
+                {
+                    *result = &m_reserveable;
+                    add_ref();
+                    return hr_ok;
+                }
                 *result = nullptr;
                 return hr_no_interface;
             }
@@ -3169,6 +3227,7 @@ com_ns::CoTaskMemFree(m_data);
                 static winrt_guid const vector_iid = make_generic_iid(guid_ivector, generic_arg_of<T>);
                 static winrt_guid const view_iid = make_generic_iid(guid_ivectorview, generic_arg_of<T>);
                 static winrt_guid const observable_iid = make_generic_iid(guid_iobservablevector, generic_arg_of<T>);
+                static winrt_guid const reserveable_iid = make_generic_iid(guid_ireserveablevector, generic_arg_of<T>);
                 static winrt_guid const list[] =
                 {
                     winrt_guid::from(iid_iunknown),
@@ -3177,9 +3236,10 @@ com_ns::CoTaskMemFree(m_data);
                     view_iid,
                     iterable_iid,
                     observable_iid,
+                    reserveable_iid,
                 };
-                *count = 6;
-                auto* result = new winrt_guid[6];
+                *count = 7;
+                auto* result = new winrt_guid[7];
                 std::copy(std::begin(list), std::end(list), result);
                 *iids = result;
                 return hr_ok;

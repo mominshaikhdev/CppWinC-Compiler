@@ -27,7 +27,7 @@ using namespace winuic;
 export namespace winuic
 {
 
-// §1  Minimal JSON value (enough to round-trip winuic layout JSON)
+// 1  Minimal JSON value (enough to round-trip winuic layout JSON)
 
 struct json_value;
 
@@ -76,7 +76,7 @@ inline json_value const* json_object::find(std::string_view key) const
     return nullptr;
 }
 
-// §2  JSON parser
+// 2  JSON parser
 
 class json_parser
 {
@@ -155,7 +155,7 @@ public:
     json_value parse(std::string_view json) { src_ = json; pos_ = 0; return parse_value(); }
 };
 
-// §3  Catalog: abstract control → WinUI3 platform type mapping
+// 3  Catalog: abstract control → WinUI3 platform type mapping
 
 struct platform_mapping
 {
@@ -355,7 +355,7 @@ public:
     bool empty() const { return entries_.empty(); }
 };
 
-// §4  Layout node (parsed from JSON)
+// 4  Layout node (parsed from JSON)
 
 struct layout_state_var
 {
@@ -425,7 +425,7 @@ struct layout_view
     std::vector<std::string> exposed_component_events;
 };
 
-// §5  Parse layout JSON into layout_view
+// 5  Parse layout JSON into layout_view
 
 inline layout_node parse_body_node(json_value const& j)
 {
@@ -552,7 +552,7 @@ inline layout_view parse_layout_json(std::string_view json, std::string_view vie
     return view;
 }
 
-// §6  C++23 module code generation
+// 6  C++23 module code generation
 
 inline std::string to_cxx_type(std::string_view json_type)
 {

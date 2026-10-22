@@ -447,7 +447,7 @@ std::string module_name_for_namespace(std::string const& ns)
     return "winrt." + ns;
 }
 
-// ── selective -winui type closure ────────────────────────────────────
+// selective -winui type closure
 // In -winui / -winui_no_compile mode the projection emits only the types
 // reachable from the project's own code: component classes, view element
 // trees, and the framework types the generated view/bootstrap modules
@@ -739,12 +739,23 @@ void collect_ref_ns(winmd::type const& t, winmd::metadata const& metadata, std::
                 out.insert(type->ns);
             }
         }
-        else if (std::getenv("CPPWINC_DEPTRACE"))
+        else
         {
-            // Unresolvable signature reference: the dep scan cannot record a
-            // namespace for it, yet the emitter prints *something* for the
-            // same row. Surface the gap so missing imports are explainable.
-            std::fprintf(stderr, "[dep] unresolvable sig ref kind=0x%02x\n", t.kind);
+            // Row-based fallback: the type exists in metadata but is not a
+            // loaded type_info (its row still names ns+name). Without this,
+            // every named struct/enum/interface reference (GUID -> GUIDDEF,
+            // NODE_ADDRESS -> ...) silently lost its namespace, the owning
+            // module never entered dep_owners, and the `export import` line
+            // was skipped — C3083 'must be a type' in 157+ modules.
+            std::string rns, rname;
+            if (metadata.resolve_type_name(t, rns, rname) && !rns.empty())
+            {
+                out.insert(rns);
+            }
+            else if (std::getenv("CPPWINC_DEPTRACE"))
+            {
+                std::fprintf(stderr, "[dep] unresolvable sig ref kind=0x%02x\n", t.kind);
+            }
         }
     }
     for (auto const& a : t.args)
@@ -903,7 +914,7 @@ void collect_namespace_deps(winmd::namespace_info const& info, winmd::metadata c
     add(info.classes);
 }
 
-// ── type-level dependency closure (selective -winui mode) ───────────
+// type-level dependency closure (selective -winui mode)
 // Collects every type directly referenced by a type's metadata: base,
 // interfaces, statics/activatables, method signatures, fields, properties,
 // events, generic params/constraints. Returns types, not namespaces —
@@ -992,7 +1003,7 @@ void collect_type_edges(winmd::type_info const& type, winmd::metadata const& met
     }
 }
 
-// ── selective -winui closure construction ───────────────────────────
+// selective -winui closure construction
 // Type-level dependencies of one type, restricted to namespaces the
 // -winui projection is actually emitting. collect_type_edges walks all
 // metadata refs; winui_collect_edges keeps only winrt/WASDK namespaces

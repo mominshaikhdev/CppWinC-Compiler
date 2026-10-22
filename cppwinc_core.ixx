@@ -137,6 +137,13 @@ struct settings_type
     // -compile: run the built-in module compilation pass (same machinery as
     // -winui) without WASDK auto-discovery — for winrt/win32/wdk projections.
     bool compile = false;
+    // -target exe,sys,dll — explicit link targets (comma-separated,
+    // case-insensitive). Empty = auto-detect from project sources.
+    std::set<std::string, std::less<>> targets;
+    // Folder from the -compile/-winui path switches that receives ONLY the
+    // final linked binaries (exe/sys/dll); generated modules and build
+    // intermediates stay with -output. Empty = -output folder.
+    std::string final_output;
 };
 
 settings_type settings;

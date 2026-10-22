@@ -261,7 +261,13 @@ bool build_std_module(std::filesystem::path const& out_dir)
         {
             for (auto const& entry : std::filesystem::directory_iterator(kits, sec))
             {
-                if (entry.is_directory() && (newest.empty() || entry.path().filename() > newest.filename()))
+                auto fname = entry.path().filename().string();
+                // Version dirs only (10.0.x.x): the Kits\10\Include root also
+                // carries non-version folders like 'wdf' that outrank versions
+                // in a string compare and break the ucrt include path.
+                if (entry.is_directory() && !fname.empty() &&
+                    std::isdigit(static_cast<unsigned char>(fname.front())) &&
+                    (newest.empty() || fname > newest.filename().string()))
                 {
                     newest = entry.path();
                 }
@@ -573,21 +579,42 @@ void process_args(arg_parser const& args)
             }
         }
     }
-    for (auto const& prefix : args.values("include"))
+    // Comma-separated lists accepted: a single flag value can carry several
+    // namespaces (leading/trailing spaces trimmed).
+    auto split_ns_list = [](std::string const& spec,
+                            std::set<std::string, std::less<>>& sink)
     {
-        settings.include.insert(prefix);
+        std::string item;
+        auto flush = [&]()
+        {
+            if (!item.empty())
+            {
+                sink.insert(item);
+                item.clear();
+            }
+        };
+        for (char c : spec)
+        {
+            if (c == ',') flush();
+            else if (c != ' ' && c != '\t' && c != '\r' && c != '\n') item.push_back(c);
+        }
+        flush();
+    };
+    for (auto const& spec : args.values("include"))
+    {
+        split_ns_list(spec, settings.include);
     }
-    for (auto const& prefix : args.values("exclude"))
+    for (auto const& spec : args.values("exclude"))
     {
-        settings.exclude.insert(prefix);
+        split_ns_list(spec, settings.exclude);
     }
-    for (auto const& ns : args.values("module_include"))
+    for (auto const& spec : args.values("module_include"))
     {
-        settings.module_include.insert(ns);
+        split_ns_list(spec, settings.module_include);
     }
-    for (auto const& ns : args.values("module_exclude"))
+    for (auto const& spec : args.values("module_exclude"))
     {
-        settings.module_exclude.insert(ns);
+        split_ns_list(spec, settings.module_exclude);
     }
 
     std::string output = args.value("output", ".");
@@ -653,9 +680,9 @@ void process_args(arg_parser const& args)
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════
+//
 // Win32 API projection writers
-// ═══════════════════════════════════════════════════════════════════════
+//
 
 // Win32 handle type mapping: metadata type names to projected void* wrappers
 static std::string win32_handle_projected(std::string_view type_name)
@@ -677,22 +704,62 @@ static std::string win32_handle_projected(std::string_view type_name)
     return it != handle_map.end() ? std::string(it->second) : "";
 }
 
+// Enum member names that collide with C++ keywords or alternative-operator
+// tokens (ICU `or = 201`, TEXTSERV `not = ...`) are a hard syntax error
+// (C2143) if emitted verbatim — mangle with a trailing underscore.
+static std::string mangle_enum_member(std::string const& n)
+{
+    static const std::set<std::string> kw = {
+        "alignas","alignof","and","and_eq","asm","auto","bitand","bitor","bool","break",
+        "case","catch","char","char8_t","char16_t","char32_t","class","compl","concept",
+        "const","consteval","constexpr","constinit","const_cast","continue","co_await",
+        "co_return","co_yield","decltype","default","delete","do","double","dynamic_cast",
+        "else","enum","explicit","export","extern","false","float","for","friend","goto",
+        "if","inline","int","long","mutable","namespace","new","noexcept","not","not_eq",
+        "nullptr","operator","or","or_eq","private","protected","public","register",
+        "reinterpret_cast","requires","return","short","signed","sizeof","static",
+        "static_assert","static_cast","struct","switch","template","this","thread_local",
+        "throw","true","try","typedef","typeid","typename","union","unsigned","using",
+        "virtual","void","volatile","wchar_t","while","xor","xor_eq",
+        "near","far","pascal","cdecl","stdcall","small"
+    };
+    if (kw.count(n)) return n + "_";
+    return n;
+}
+
 static void write_win32_enum(writer& w, winmd::type_info const& type, type_mapper const& mapper)
 {
+    if (type.has_irp_major_function)
+        w.write("// IRP major function code: %\n", type.irp_major_function);
+    if (type.ioctl_code)
+        w.write("// IOCTL code: % (buffering method %)\n", type.ioctl_code, type.ioctl_buffering);
     std::string underlying = enum_underlying_cpp(type.enum_underlying);
     if (underlying.empty()) underlying = "std::int32_t";
     w.write("export enum class % : %\n{\n", type.name, underlying);
-    for (auto const& [name, value] : type.enum_fields)
-        w.write("    % = %,\n", name, value);
+    // Keep the first definition of each enumerator name. Some SDK headers
+    // define the same enumerator twice (e.g. MSI's SCRIPTFLAGS_REGDATA_APPINFO
+    // = 0 then = 16); emitting both is a C2086 redefinition error.
+    {
+        std::set<std::string> seen_enum;
+        for (auto const& [name, value] : type.enum_fields)
+        {
+            if (!seen_enum.insert(name).second) continue;
+            w.write("    % = %,\n", mangle_enum_member(name), value);
+        }
+    }
     w.write("};\n\n");
     if (type.enum_flags)
     {
-        w.write("constexpr % operator|(% a, % b) noexcept { return static_cast<%>(static_cast<%>(a) | static_cast<%>(b)); }\n",
-            type.name, type.name, type.name, underlying, underlying);
-        w.write("constexpr % operator&(% a, % b) noexcept { return static_cast<%>(static_cast<%>(a) & static_cast<%>(b)); }\n",
-            type.name, type.name, type.name, underlying, underlying);
-        w.write("constexpr % operator~(% a) noexcept { return static_cast<%>(~static_cast<%>(a)); }\n\n",
-            type.name, type.name, underlying);
+        // 6/6/4 placeholders: signature names + OUTER cast are the enum
+        // type, the inner casts are the underlying type (5 args left a
+        // literal `%` in every FLAGS enum: `static_cast<%>(b)` — C2760).
+        // `export` so importing modules can actually use the operators.
+        w.write("export constexpr % operator|(% a, % b) noexcept { return static_cast<%>(static_cast<%>(a) | static_cast<%>(b)); }\n",
+            type.name, type.name, type.name, type.name, underlying, underlying);
+        w.write("export constexpr % operator&(% a, % b) noexcept { return static_cast<%>(static_cast<%>(a) & static_cast<%>(b)); }\n",
+            type.name, type.name, type.name, type.name, underlying, underlying);
+        w.write("export constexpr % operator~(% a) noexcept { return static_cast<%>(~static_cast<%>(a)); }\n\n",
+            type.name, type.name, type.name, underlying);
     }
 }
 
@@ -710,8 +777,30 @@ static void write_structs_topo(writer& w,
     std::vector<winmd::type_info const*> const& structs,
     winmd::metadata const& metadata, EmitFn&& emit)
 {
+    // Hoisted anonymous-union/struct helpers (`_AnonymousUnion`,
+    // `_AnonymousUnion_3`, ...) are embedded BY VALUE in their enclosing
+    // struct (NET_BUFFER::USHORT, NET_BUFFER_LIST::NET_BUFFER_LIST_CONTEXT),
+    // but the reference does not always survive winmd field encoding, so
+    // the dep pass below can miss it and emit the enclosing struct first
+    // (C2079 '_AnonymousUnion' undefined in NBL -> NBL dies -> Windows dies
+    // -> the whole SDK cascades). winversec hoists innermost-first, so the
+    // helpers' relative order is already dependency-correct; hoist the
+    // whole group ahead of every other struct. The helpers never embed a
+    // non-helper struct by value (they are nested INSIDE the outer struct,
+    // so such a reference would be recursive and illegal C), so this is
+    // always safe.
+    // Keep this pre-pass PREFIX-only and unsorted: infix-named hoists
+    // (tagPROPVARIANT_AnonymousUnion) are ordered by the Kahn pass, whose
+    // walker only follows by-value edges (no ptr/fnptr descent).
+    std::vector<winmd::type_info const*> ordered;
+    ordered.reserve(structs.size());
+    for (auto const* t : structs)
+        if (t->name.rfind("_Anonymous", 0) == 0) ordered.push_back(t);
+    for (auto const* t : structs)
+        if (t->name.rfind("_Anonymous", 0) != 0) ordered.push_back(t);
+
     std::map<winmd::type_info const*, std::set<winmd::type_info const*>> field_deps;
-    std::set<winmd::type_info const*> remaining(structs.begin(), structs.end());
+    std::set<winmd::type_info const*> remaining(ordered.begin(), ordered.end());
     for (auto const* t : structs)
     {
         for (auto const& f : t->fields)
@@ -723,7 +812,18 @@ static void write_structs_topo(writer& w,
                 stack.pop_back();
                 if (ty->kind == winmd::et_class || ty->kind == winmd::et_valuetype || ty->kind == winmd::et_genericinst)
                 {
-                    if (auto const* dep = metadata.find(*ty))
+                    // metadata.find misses named-type refs in signatures (see
+                    // collect_ref_ns); fall back to the row's own ns/name so
+                    // hoisted anonymous unions still order before the structs
+                    // that embed them by value (NBL_NET_BUFFER_LIST).
+                    winmd::type_info const* dep = metadata.find(*ty);
+                    if (!dep)
+                    {
+                        std::string dns, dname;
+                        if (metadata.resolve_type_name(*ty, dns, dname) && !dns.empty())
+                            dep = metadata.find(dns, dname);
+                    }
+                    if (dep)
                     {
                         if (dep->is_struct() && remaining.contains(dep))
                         {
@@ -731,16 +831,23 @@ static void write_structs_topo(writer& w,
                         }
                     }
                 }
-                for (auto const& a : ty->args) stack.push_back(&a);
-                for (auto const& c : ty->children) stack.push_back(&c);
+                // By-value carriers only: ptr/byref/fnptr members do not
+                // require complete targets, and walking them fabricates
+                // false cycles (pElems -> tagPROPVARIANT) that stall Kahn.
+                if (ty->kind != winmd::et_ptr && ty->kind != winmd::et_byref &&
+                    ty->kind != winmd::et_fnptr)
+                {
+                    for (auto const& a : ty->args) stack.push_back(&a);
+                    for (auto const& c : ty->children) stack.push_back(&c);
+                }
             }
         }
     }
     std::set<winmd::type_info const*> done;
-    while (done.size() < structs.size())
+    while (done.size() < ordered.size())
     {
         bool progress = false;
-        for (auto const* t : structs)
+        for (auto const* t : ordered)
         {
             if (done.contains(t)) continue;
             bool ready = true;
@@ -757,10 +864,46 @@ static void write_structs_topo(writer& w,
         }
         if (!progress) break;
     }
-    for (auto const* t : structs)
+    for (auto const* t : ordered)
     {
         if (!done.contains(t)) emit(w, *t);
     }
+}
+
+// Names that must never become a `using X = ...;` alias. C++ keywords
+// (`using wchar_t = void*;` is a hard C2059 syntax error — the keyword is
+// natively available to consumers anyway) and SAL annotation macro names
+// that winversec parse debris promotes to type names (`_Must_inspect_result_`
+// expands to nothing, leaving `using = void*;`, also C2059). Emitted nowhere
+// and referenced nowhere, so skipping is safe.
+static bool is_valid_alias_name(std::string const& n)
+{
+    static const std::set<std::string> kw = {
+        "void","char","short","int","long","float","double","signed","unsigned",
+        "bool","wchar_t","char8_t","char16_t","char32_t","auto","decltype",
+        "struct","class","union","enum","const","volatile","typedef","static",
+        "extern","register","template","typename","operator","new","delete",
+        "this","using","namespace","goto","sizeof","alignas","return","if","else",
+        "switch","case","default","break","continue","for","while","do","try",
+        "catch","throw","public","private","protected","virtual","friend","inline",
+        "export","module","import","nullptr","true","false",
+        // MSVC type/keyword tokens leaked as identifiers or alias targets
+        "__unaligned","__ptr32","__ptr64","__sptr","__uptr","__w64","__based",
+        "__segment","__declspec","__forceinline","__inline","__asm","__wchar_t",
+        "__int8","__int16","__int32","__int64","__leave","__try","__finally","__except",
+        // C++ alternative-operator tokens
+        "and","or","not","xor","bitand","bitor","compl","and_eq","or_eq","not_eq","xor_eq"
+    };
+    if (kw.count(n)) return false;
+    // SAL annotation debris promoted to a type name
+    static const char* sal_prefixes[] = {
+        "_Must_","_Out_","_In_","_Inout_","_Ret_","_When_","_Post_","_Pre_",
+        "_Null_","_Notnull_","_Check_","_Deref_","_Field_","_Success_","_At_",
+        "_Use_decl_annotations_","_Printf_format_string_","_Null_terminated_"
+    };
+    for (auto const* p : sal_prefixes)
+        if (n.rfind(p, 0) == 0) return false;
+    return true;
 }
 
 static void write_win32_struct(writer& w, winmd::type_info const& type, type_mapper const& mapper, winmd::metadata const&)
@@ -811,7 +954,10 @@ static void write_win32_struct(writer& w, winmd::type_info const& type, type_map
         for (auto const& f : type.fields)
         {
             if (is_void_field(f)) continue;
-            w.write("        % %;\n", mapper.map(f.value), unique_name(f.name));
+            if (f.arr_n > 0)
+                w.write("        % %[%];\n", mapper.map(f.value), unique_name(f.name), f.arr_n);
+            else
+                w.write("        % %;\n", mapper.map(f.value), unique_name(f.name));
         }
         w.write("    };\n};\n\n");
     }
@@ -822,7 +968,10 @@ static void write_win32_struct(writer& w, winmd::type_info const& type, type_map
         for (auto const& f : type.fields)
         {
             if (is_void_field(f)) continue;
-            w.write("    % %;\n", mapper.map(f.value), unique_name(f.name));
+            if (f.arr_n > 0)
+                w.write("    % %[%];\n", mapper.map(f.value), unique_name(f.name), f.arr_n);
+            else
+                w.write("    % %;\n", mapper.map(f.value), unique_name(f.name));
         }
         w.write("};\n");
         if (type.struct_pack > 0) w.write("#pragma pack(pop)\n");
@@ -838,6 +987,10 @@ static std::set<std::string> make_cxx_kw_set()
         "switch","case","default","if","else","for","while","do","goto","sizeof","typedef",
         "new","delete","try","catch","throw","operator","this","true","false","namespace",
         "using","template","typename","register","auto","signed","unsigned",
+        "wchar_t","char8_t","char16_t","char32_t","nullptr","constexpr","decltype","noexcept",
+        // C++ alternative-operator tokens: SDK enums carry `or`/`not`/`and`
+        // as member names (ICU, TEXTSERV); they are keywords, not identifiers.
+        "and","or","not","xor","bitand","bitor","compl","and_eq","or_eq","not_eq","xor_eq",
         "_","in","out","inout","opt","optional","reserved","result","buffer",
         "size","length","count","index","value","type","name","handle","flags",
         "constant","near","far","pascal","cdecl","stdcall"
@@ -923,6 +1076,11 @@ static std::string param_type_cpp(type_mapper const& mapper, winmd::param_info c
 
 static void write_win32_delegate(writer& w, winmd::type_info const& type, type_mapper const& mapper, winmd::metadata const&, std::set<std::string>& emitted)
 {
+    // C++ keywords cannot be alias targets (`using wchar_t = ...;` is a hard
+    // C2059). RPCNDR's scalar typedefs (byte, boolean, wchar_t, size_t) get
+    // misclassified as delegates; the keyword ones must not be emitted — the
+    // keyword is natively available to consumers.
+    if (!is_valid_alias_name(type.name)) return;
     if (type.invoke < 0 || type.invoke >= static_cast<std::int32_t>(type.methods.size()))
     {
         // Delegate without a usable Invoke signature (winversec parse debris
@@ -955,6 +1113,7 @@ static void write_win32_delegate(writer& w, winmd::type_info const& type, type_m
     // `export` is mandatory: a named type alias is not visible to importing
     // modules without it (winrt_base's imported PVECTORED_EXCEPTION_HANDLER
     // and friends failed with C2061 until this).
+    if (type.is_driver_dispatch) w.write("// DRIVER_DISPATCH callback\n");
     w.write("export using % = %(%*)(%);\n\n", type.name, mapper.map(method.ret), cc, params);
 }
 
@@ -986,9 +1145,19 @@ static void write_win32_function(writer& w, winmd::type_info const& type, type_m
         }
         std::string sig_key = fname;
         if (!emitted.insert(sig_key).second) continue;
-        if (type.is_inline_function)
+        // Inline duplicate of a REAL dllimport API (winbase.h's _M_CEE
+        // block re-declares FormatMessage/LocalFree with __inline bodies;
+        // after macro expansion the inline copy wins the row). A mapped
+        // import library means the export exists - emit the extern decl so
+        // consumers (winrt_base) link it, not the empty stub.
+        if (type.is_inline_function && type.import_library.empty())
         {
-            w.write("inline % %(%)\n{\n    return {};\n}\n\n", ret, fname, params);
+            // A void stub must not `return {};` (C2562 'void' function
+            // returning a value).
+            if (ret == "void")
+                w.write("inline % %(%)\n{\n}\n\n", ret, fname, params);
+            else
+                w.write("inline % %(%)\n{\n    return {};\n}\n\n", ret, fname, params);
         }
         else
         {
@@ -998,9 +1167,24 @@ static void write_win32_function(writer& w, winmd::type_info const& type, type_m
             w.write("export extern \"C\" % % %(%);\n", ret, cc, fname, params);
             if (!type.import_library.empty()) w.write("// Import library: %\n", type.import_library);
             if (type.last_error) w.write("// SetLastError: true\n");
+            if (type.callback_optional) w.write("// Optional callback parameter (may be nullptr)\n");
+            if (type.is_driver_dispatch) w.write("// DRIVER_DISPATCH callback\n");
             w.write("\n");
         }
     }
+}
+
+// Format 16 GUID bytes as a GUID brace initializer:
+// { Data1, Data2, Data3, { Data4[0..7] } } (fields little-endian).
+static std::string guid_brace_bytes(std::uint8_t const* g)
+{
+    char buf[96];
+    std::snprintf(buf, sizeof(buf),
+        "0x%08X, 0x%04X, 0x%04X, { 0x%02X, 0x%02X, 0x%02X, 0x%02X, 0x%02X, 0x%02X, 0x%02X, 0x%02X }",
+        (std::uint32_t)g[0] | ((std::uint32_t)g[1] << 8) | ((std::uint32_t)g[2] << 16) | ((std::uint32_t)g[3] << 24),
+        (unsigned)(g[4] | (g[5] << 8)), (unsigned)(g[6] | (g[7] << 8)),
+        g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]);
+    return buf;
 }
 
 static void write_win32_com_interface(writer& w, winmd::type_info const& type, type_mapper const& mapper, winmd::metadata const&)
@@ -1010,7 +1194,12 @@ static void write_win32_com_interface(writer& w, winmd::type_info const& type, t
     w.write("    void* m_ptr = nullptr;\n");
     w.write("    %() noexcept = default;\n", cn);
     w.write("    %(void* p) noexcept : m_ptr(p) {}\n", cn);
-    w.write("    ~%() { if (m_ptr) winrt::IUnknown(m_ptr).Release(); }\n", cn);
+    // Self-contained IUnknown::Release via vtable slot 2 (QI=0, AddRef=1,
+    // Release=2). Win32/WDK modules must NOT depend on winrt::IUnknown —
+    // winrt_base is never generated in Win32-only runs (x64: __stdcall is
+    // the only calling convention, matching the slot function pointer).
+    w.write("    ~%() { if (m_ptr) { void** v = *reinterpret_cast<void***>(m_ptr);"
+            " reinterpret_cast<unsigned long (__stdcall*)(void*)>(v[2])(m_ptr); m_ptr = nullptr; } }\n", cn);
     w.write("    void* get_abi() const noexcept { return m_ptr; }\n");
     w.write("    explicit operator bool() const noexcept { return m_ptr != nullptr; }\n");
     for (auto const& method : type.methods)
@@ -1027,7 +1216,8 @@ static void write_win32_com_interface(writer& w, winmd::type_info const& type, t
     }
     w.write("};\n\n");
     if (type.com_interface && type.has_com_iid)
-        w.write("inline constexpr GUID IID_% = { /* TODO */ };\n\n", cn);
+        w.write("inline constexpr % IID_% = { % };\n\n",
+            "Windows::Win32::GUIDDEF::GUID", cn, guid_brace_bytes(type.com_iid));
 }
 
 static bool is_win32_function(winmd::type_info const& type)
@@ -1043,9 +1233,9 @@ static bool is_win32_com(winmd::type_info const& type)
     return false;
 }
 
-// ═══════════════════════════════════════════════════════════════════════
+//
 // WDK/Driver API projection writers
-// ═══════════════════════════════════════════════════════════════════════
+//
 
 enum class wdk_driver_model { unknown, wdm, kmdf, umdf, wdf };
 
@@ -1073,20 +1263,33 @@ static wdk_driver_model classify_driver_model(winmd::type_info const& type)
 
 static void write_wdk_enum(writer& w, winmd::type_info const& type, type_mapper const& mapper)
 {
+    if (type.has_irp_major_function)
+        w.write("// IRP major function code: %\n", type.irp_major_function);
+    if (type.ioctl_code)
+        w.write("// IOCTL code: % (buffering method %)\n", type.ioctl_code, type.ioctl_buffering);
     std::string underlying = enum_underlying_cpp(type.enum_underlying);
     if (underlying.empty()) underlying = "std::int32_t";
     w.write("export enum class % : %\n{\n", type.name, underlying);
-    for (auto const& [name, value] : type.enum_fields)
-        w.write("    % = %,\n", name, value);
+    // Keep the first definition of each enumerator name. Some SDK headers
+    // define the same enumerator twice (e.g. MSI's SCRIPTFLAGS_REGDATA_APPINFO
+    // = 0 then = 16); emitting both is a C2086 redefinition error.
+    {
+        std::set<std::string> seen_enum;
+        for (auto const& [name, value] : type.enum_fields)
+        {
+            if (!seen_enum.insert(name).second) continue;
+            w.write("    % = %,\n", mangle_enum_member(name), value);
+        }
+    }
     w.write("};\n\n");
     if (type.enum_flags)
     {
-        w.write("constexpr % operator|(% a, % b) noexcept { return static_cast<%>(static_cast<%>(a) | static_cast<%>(b)); }\n",
-            type.name, type.name, type.name, underlying, underlying);
-        w.write("constexpr % operator&(% a, % b) noexcept { return static_cast<%>(static_cast<%>(a) & static_cast<%>(b)); }\n",
-            type.name, type.name, type.name, underlying, underlying);
-        w.write("constexpr % operator~(% a) noexcept { return static_cast<%>(~static_cast<%>(a)); }\n\n",
-            type.name, type.name, underlying);
+        w.write("export constexpr % operator|(% a, % b) noexcept { return static_cast<%>(static_cast<%>(a) | static_cast<%>(b)); }\n",
+            type.name, type.name, type.name, type.name, underlying, underlying);
+        w.write("export constexpr % operator&(% a, % b) noexcept { return static_cast<%>(static_cast<%>(a) & static_cast<%>(b)); }\n",
+            type.name, type.name, type.name, type.name, underlying, underlying);
+        w.write("export constexpr % operator~(% a) noexcept { return static_cast<%>(~static_cast<%>(a)); }\n\n",
+            type.name, type.name, type.name, underlying);
     }
 }
 
@@ -1128,7 +1331,10 @@ static void write_wdk_struct(writer& w, winmd::type_info const& type, type_mappe
         for (auto const& f : type.fields)
         {
             if (is_void_field(f)) continue;
-            w.write("        % %;\n", mapper.map(f.value), unique_name(f.name));
+            if (f.arr_n > 0)
+                w.write("        % %[%];\n", mapper.map(f.value), unique_name(f.name), f.arr_n);
+            else
+                w.write("        % %;\n", mapper.map(f.value), unique_name(f.name));
         }
         w.write("    };\n};\n\n");
     }
@@ -1139,7 +1345,10 @@ static void write_wdk_struct(writer& w, winmd::type_info const& type, type_mappe
         for (auto const& f : type.fields)
         {
             if (is_void_field(f)) continue;
-            w.write("    % %;\n", mapper.map(f.value), unique_name(f.name));
+            if (f.arr_n > 0)
+                w.write("    % %[%];\n", mapper.map(f.value), unique_name(f.name), f.arr_n);
+            else
+                w.write("    % %;\n", mapper.map(f.value), unique_name(f.name));
         }
         w.write("};\n");
         if (type.struct_pack > 0) w.write("#pragma pack(pop)\n");
@@ -1188,14 +1397,35 @@ static void write_wdk_function(writer& w, winmd::type_info const& type, type_map
             std::string pname = sanitize_param_name(method.params[p].name, seen);
             params += param_type_cpp(mapper, method.params[p]) + " " + pname;
         }
-        if (cc.empty())
-            w.write("inline % %(%) {\n", ret, fname, params);
+        if (type.is_driver_dispatch) w.write("// DRIVER_DISPATCH callback\n");
+        if (type.callback_optional) w.write("// Optional callback parameter (may be nullptr)\n");
+        // User-mode Win32 API with a real import library: the symbol exists
+        // in the DLL, so emit the real extern decl - an inline stub is
+        // invisible across the module boundary and consumers fail C2039
+        // (winrt_base's ss::FormatMessageW / ss::LocalFree). Mirrors
+        // write_win32_function's rule; Wdk namespaces / rows without an
+        // import library keep the intentional kernel stub below.
+        bool user_mode_export = type.ns.starts_with("Windows.Win32") && !type.import_library.empty();
+        if (user_mode_export)
+        {
+            std::string decl_cc = "__stdcall";
+            switch (type.calling_convention) { case 1: decl_cc = "__cdecl"; break; case 3: decl_cc = "__thiscall"; break; case 4: decl_cc = "__fastcall"; break; }
+            w.write("export extern \"C\" % % %(%);\n", ret, decl_cc, fname, params);
+            w.write("// Import library: %\n", type.import_library);
+            if (type.last_error) w.write("// SetLastError: true\n");
+            w.write("\n");
+        }
         else
-            w.write("inline % % %(%)\n{\n", ret, cc, fname, params);
-        if (ret == "void")
-            w.write("    // %\n}\n\n", lib_name);
-        else
-            w.write("    // %\n    return {};\n}\n\n", lib_name);
+        {
+            if (cc.empty())
+                w.write("inline % %(%) {\n", ret, fname, params);
+            else
+                w.write("inline % % %(%)\n{\n", ret, cc, fname, params);
+            if (ret == "void")
+                w.write("    // %\n}\n\n", lib_name);
+            else
+                w.write("    // %\n    return {};\n}\n\n", lib_name);
+        }
     }
 }
 
@@ -1209,7 +1439,7 @@ static void write_wdk_ioctl_constant(writer& w, std::string const& name, std::ui
 // The CRT argv/argc are intentionally unused: the raw command line is
 // re-split below (the CRT mangles quoted paths ending in a backslash).
 // compile/copy helpers shared by -winui and -compile (defined after run)
-int compile_project_folder(std::filesystem::path const& proj_folder, std::string const& app_name);    void copy_winui_pri();
+int compile_project_folder(std::filesystem::path const& proj_folder, std::string const& app_name, std::string const& final_out = {});    void copy_winui_pri();
     void copy_winui_assets();
     void copy_winui_bootstrap_dll();
 
@@ -1251,6 +1481,50 @@ export int run(int const, char**)
             return build_std_module(std_out) ? 0 : 1;
         }
 
+        // -target exe,sys,dll — explicit link targets (comma-separated,
+        // case-insensitive). Parsed here, before any build path, so the
+        // quick-test `-compile <folder>` flow sees it too (process_args does
+        // not run on that path). Empty = auto-detect from project sources.
+        for (auto const& spec : args.values("target"))
+        {
+            std::string item;
+            auto flush = [&]()
+            {
+                if (item.empty()) return;
+                for (char& c : item)
+                    c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+                if (item != "exe" && item != "sys" && item != "dll")
+                    throw std::runtime_error("invalid -target '" + item + "' (expected exe, sys, dll)");
+                settings.targets.insert(item);
+                item.clear();
+            };
+            for (char c : spec)
+            {
+                if (c == ',') flush();
+                else if (c != ' ' && c != '\t' && c != '\r' && c != '\n') item.push_back(c);
+            }
+            flush();
+        }
+        // -target only makes sense for the -compile link phase: with -winui
+        // (mutually exclusive with -compile) or generation-only runs there is
+        // no requested link step to gate.
+        if (!settings.targets.empty() && !args.exists("compile"))
+        {
+            throw std::runtime_error("-target requires -compile (targets select the exe/sys/dll link steps of the compile phase)");
+        }
+        // Final-output path switches: with -input, `-compile <path>` (and
+        // `-winui [<path>]` / `-winui_no_compile [<path>]`) name the folder
+        // that receives ONLY the final linked binaries; generated modules
+        // and build intermediates stay with -output.
+        if (args.exists("winui") || args.exists("winui_no_compile") ||
+            (args.exists("compile") && args.exists("input")))
+        {
+            std::string key = args.exists("winui") ? "winui"
+                : args.exists("winui_no_compile") ? "winui_no_compile" : "compile";
+            std::string p = args.value(key);
+            if (!p.empty()) settings.final_output = p;
+        }
+
         // `-compile <folder>` alone: compile an existing projection folder
         // in place — modules, app .cpp sources, then link <name>.exe (or
         // <name>.sys when a driver source is present). Quick-test path:
@@ -1264,7 +1538,11 @@ export int run(int const, char**)
                 std::printf("cppwinc : error -compile needs a projection folder: cppwinc -compile <folder>\n");
                 return 1;
             }
-            return compile_project_folder(std::filesystem::weakly_canonical(folder), {});
+            // Quick-test: <folder> is the SOURCE projection. When -output is
+            // given it receives ONLY the final binaries (exe/sys/dll);
+            // otherwise they land in place next to the sources.
+            std::string final_out = args.value("output");
+            return compile_project_folder(std::filesystem::weakly_canonical(folder), {}, final_out);
         }
 
         if (!args.exists("input") && !args.exists("winui") && !args.exists("winui_no_compile"))
@@ -1304,36 +1582,79 @@ export int run(int const, char**)
         // modules from earlier input sets are never rewritten.
         std::mutex write_mutex;
         std::set<std::string, std::less<>> emitted_this_run;
+        // namespace -> owning module name (SCC group). Filled after the
+        // grouping phase; declared before write_output_file so every module
+        // write can remap per-namespace Win32 imports to their owner.
+        std::map<std::string, std::string, std::less<>> ns_owner;
         auto write_output_file = [&](std::filesystem::path const& path, std::string const& content)
         {
             {
                 std::lock_guard<std::mutex> lock(write_mutex);
                 emitted_this_run.insert(path.stem().string());
             }
+            // Full-mode SCC grouping merges related Win32 namespaces into one
+            // owner module, so `import Windows.Win32.X;` emitted by the
+            // handwritten templates (winrt_base, the App entry, view modules)
+            // must be remapped to X's owner or the import fails with C2230.
+            // Generated Win32 modules already name their owner and are a
+            // no-op here; WDK (Windows.Wdk.*) and winrt.* lines are untouched.
+            std::string text = content;
+            if (!ns_owner.empty() && text.find("import Windows.Win32") != std::string::npos)
+            {
+                std::string out;
+                std::set<std::string, std::less<>> seen;
+                size_t pos = 0;
+                while (pos < text.size())
+                {
+                    size_t eol = text.find('\n', pos);
+                    if (eol == std::string::npos) eol = text.size();
+                    std::string_view lv(text.data() + pos, eol - pos);
+                    if (!lv.empty() && lv.back() == '\r') lv.remove_suffix(1);
+                    std::string line;
+                    bool dropped = false;
+                    if (lv.starts_with("import ") && lv.ends_with(";"))
+                    {
+                        std::string mod(lv.substr(7, lv.size() - 8));
+                        if (mod == "Windows.Win32" || mod.starts_with("Windows.Win32."))
+                        {
+                            auto oit = ns_owner.find(mod);
+                            std::string resolved = (oit != ns_owner.end() && !oit->second.empty())
+                                ? sanitize_module_name(oit->second) : mod;
+                            // Several source namespaces can share one owner;
+                            // one import per resolved module.
+                            if (!seen.insert(resolved).second)
+                            {
+                                dropped = true;
+                            }
+                            else
+                            {
+                                line = "import " + resolved + ";";
+                            }
+                        }
+                    }
+                    if (!dropped)
+                    {
+                        if (line.empty()) line.assign(text, pos, eol - pos);
+                        out += line;
+                        out += '\n';
+                    }
+                    pos = eol + 1;
+                }
+                text = std::move(out);
+            }
             if (std::filesystem::exists(path))
             {
                 std::ifstream existing(path, std::ios::binary);
                 std::string old{ std::istreambuf_iterator<char>(existing), std::istreambuf_iterator<char>() };
-                if (old == content)
+                if (old == text)
                 {
                     return;
                 }
             }
             std::filesystem::create_directories(path.parent_path());
             std::ofstream file(path, std::ios::binary);
-            file.write(content.data(), static_cast<std::streamsize>(content.size()));
+            file.write(text.data(), static_cast<std::streamsize>(text.size()));
         };
-
-        // base module (the runtime template carries its own module header)
-        if (settings.base)
-        {
-            std::string base_ixx(cppwinc::strings::base_module_ixx);
-            replace_all(base_ixx, "@STL_GMF@", "");
-            replace_all(base_ixx, "@STD_IMPORT@", cppwinc::strings::std_import);
-            writer base;
-            base.write("%", base_ixx);
-            write_output_file(output_folder / "winrt_base.ixx", base.str());
-        }
 
         // collect projected types per namespace
         type_mapper mapper{ metadata };
@@ -1619,7 +1940,6 @@ export int run(int const, char**)
 
         // namespace -> owning module name (dotted)
         // Win32/WDK namespaces use their namespace as the module name
-        std::map<std::string, std::string, std::less<>> ns_owner;
         for (auto const& [owner, members] : groups)
         {
             for (auto const& m : members)
@@ -1629,6 +1949,19 @@ export int run(int const, char**)
         }
 
         phase("ns_owner done");
+
+        // base module (the runtime template carries its own module header).
+        // Emitted AFTER grouping so the import remap below can rewrite the
+        // per-namespace Win32 imports to their SCC-owner modules.
+        if (settings.base)
+        {
+            std::string base_ixx(cppwinc::strings::base_module_ixx);
+            replace_all(base_ixx, "@STL_GMF@", "");
+            replace_all(base_ixx, "@STD_IMPORT@", cppwinc::strings::std_import);
+            writer base;
+            base.write("%", base_ixx);
+            write_output_file(output_folder / "winrt_base.ixx", base.str());
+        }
 
         // Track which classes have view modules (to skip component struct generation)
         std::set<std::string, std::less<>> view_class_names;
@@ -1678,8 +2011,8 @@ export int run(int const, char**)
         }
 
         phase("globals done");
-        // ── winuic view generation (before projection, so we can
-        //     scan imports and only generate needed modules) ──
+        // winuic view generation (before projection, so we can
+        // scan imports and only generate needed modules)
         {
             winuic::attribute_catalog catalog;
             if (!metadata.module_catalog_json().empty())
@@ -1933,7 +2266,7 @@ export int run(int const, char**)
                         vj.exposed_component_events.assign(it->second.begin(), it->second.end());
                 }
             }
-            phase("view emission start");
+            if (!view_jobs.empty()) phase("view emission start");
             // Emit view modules in parallel on all cores
             if (view_jobs.size() > 1)
             {
@@ -2021,8 +2354,7 @@ export int run(int const, char**)
                     write_output_file(output_folder / fname, code);
                 }
             }
-            phase("view modules emitted");
-            phase("view modules emitted");
+            if (!view_jobs.empty()) phase("view modules emitted");
             // main.ixx (only when WinUI views exist; re-emit on every -winui
             // run when the file already exists so the stale-module cleanup —
             // which lists "main" as generator-owned — can never delete the
@@ -2136,7 +2468,7 @@ export int run(int const, char**)
             }
         }
 
-        // ── Find needed modules: scan view imports + compute transitive deps from metadata ──
+        // Find needed modules: scan view imports + compute transitive deps from metadata
         // Only active in -winui / -winui_no_compile (selective project mode):
         // a plain SDK/component projection keeps every module; only the winui
         // switches tell us which app winmd defines "the project", so only then
@@ -2344,7 +2676,7 @@ export int run(int const, char**)
             }
         }
 
-        // ── selective -winui type closure ────────────────────────────────
+        // selective -winui type closure
         // With the needed module set known, build the TYPE-level closure:
         // only the winrt types reachable from the app's component classes
         // and from the namespaces the generated code imports. Activating
@@ -2679,8 +3011,13 @@ export int run(int const, char**)
             
             if (model == ns_projection_model::win32 || model == ns_projection_model::wdk)
             {
-                // Win32/WDK: module name IS the namespace
-                reexport_name = ns;
+                // Win32/WDK: module name IS the namespace - but mangle it
+                // like every other module name (Windows.Wdk.1394 has a
+                // digit-led segment that is not a legal C++ module name
+                // identifier; MSVC rejects `export module Windows.Wdk.1394;`
+                // with C2143). sanitize_module_name keeps decl+importers
+                // in agreement.
+                reexport_name = sanitize_module_name(ns);
                 owner_module = owner;
             }
             else
@@ -2809,6 +3146,27 @@ export int run(int const, char**)
                 auto pos = owner.rfind(".P");
                 if (pos != std::string::npos) root_owner = owner.substr(0, pos);
             }
+            // A COM interface IID constant (`inline constexpr GUID IID_IFoo =
+            // {...}`) hardcodes the GUIDDEF type, so no metadata signature            // reference registers the dep. Seed GUIDDEF here whenever this module
+            // emits any such IID, else the const fails C3083/C2039 ("GUID is not
+            // a member of Windows::Win32") in every COM-carrying module.
+            if (job.model == ns_projection_model::win32 || job.model == ns_projection_model::wdk)
+            {
+                for (auto const& m : job.members)
+                {
+                    auto mit = metadata.namespaces().find(m);
+                    if (mit == metadata.namespaces().end()) continue;
+                    auto const& minfo = mit->second;
+                    for (auto const* t : minfo.interfaces)
+                    {
+                        if (t && in_projection(*t) && t->com_interface && t->has_com_iid)
+                        {
+                            dep_owners.insert("Windows.Win32.GUIDDEF");
+                            break;
+                        }
+                    }
+                }
+            }
             for (auto const& d : dep_owners)
             {
                 // Only import modules that were actually generated (in needed_modules)
@@ -2834,6 +3192,14 @@ export int run(int const, char**)
                 // inserted below, so the set is never empty and full-mode
                 // runs silently skipped every cross-module import.)
                 bool dep_ok = emitted_modules.contains(dep_module_name);
+                // Compare the SANITIZED dep name against this module's name:
+                // `d != owner` compared the raw namespace (BITS2.5) with the
+                // mangled module name (BITS2_5), so digit-led namespaces
+                // slipped a self-import past the guard (`export import
+                // Windows.Win32.BITS2_5;` inside the module itself -> C2230
+                // "could not find module" in BITS2_5/BITS5_0/D2D1_1/
+                // D3D10_1.SHADER/D3D11_2).
+                if (dep_module_name == job.module_name) continue;
                 if (d != owner && dep_ok)
                 {
                     // Skip root owner for P* sub-modules to avoid cycles
@@ -2943,9 +3309,52 @@ export int run(int const, char**)
                     }
                 }
             };
-            // Forward-declare types in THIS module's namespaces
-            // Skip for Win32/WDK: no types need forward-declaration (function-classes are inline)
-            if (job.model != ns_projection_model::win32 && job.model != ns_projection_model::wdk)
+            // Forward-declare types in THIS module's namespaces.
+            // Win32/WDK: interfaces reference each other in cycles (IFileDialog
+            // -> IFileDialogEvents) and STRUCTS are emitted in a later pass
+            // than the interfaces that use them, so declaration order alone
+            // can never satisfy first use (C2039 otherwise). Only interfaces
+            // and structs are forward-declared here — delegates and handle
+            // classes are `export using` aliases in Win32 (a `struct` fwd
+            // would conflict with the alias — why this path was disabled).
+            if (job.model == ns_projection_model::win32 || job.model == ns_projection_model::wdk)
+            {
+                for (auto const& m : job.ordered)
+                {
+                    auto nit = metadata.namespaces().find(m);
+                    if (nit == metadata.namespaces().end()) continue;
+                    w.write("namespace %\n{\n", win32_ns_cpp(m));
+                    // Enums too: aliases/fnptrs referencing an enum defined
+                    // later in the module (ICU UBiDiClassCallback ->
+                    // UCharDirection) need the fwd decl; winmd always has
+                    // the fixed underlying type.
+                    for (auto const* t : nit->second.enums)
+                    {
+                        if (!in_projection(*t)) continue;
+                        std::string underlying = enum_underlying_cpp(t->enum_underlying);
+                        if (underlying.empty()) underlying = "std::int32_t";
+                        w.write("export enum class % : %;\n", t->name, underlying);
+                    }
+                    for (auto const* t : nit->second.interfaces)
+                    {
+                        if (!in_projection(*t)) continue;
+                        if (t->generic_params.empty())
+                            w.write("export struct %;\n", t->name);
+                        else
+                            w.write("export %struct %;\n", tpl_prefix(*t, metadata), t->name);
+                    }
+                    for (auto const* t : nit->second.structs)
+                    {
+                        if (!in_projection(*t)) continue;
+                        if (t->generic_params.empty())
+                            w.write("export struct %;\n", t->name);
+                        else
+                            w.write("export %struct %;\n", tpl_prefix(*t, metadata), t->name);
+                    }
+                    w.write("}\n\n");
+                }
+            }
+            else
             {
             for (auto const& m : job.ordered)
             {
@@ -2959,7 +3368,7 @@ export int run(int const, char**)
                 forward(metadata.namespaces().find(m)->second);
                 w.write("}\n\n");
             }
-            } // end if not win32/wdk
+            } // end forward-declare block
             // Also forward-declare types in OTHER namespaces so P-chunks
             // referencing types from sibling chunks compile.
             // Only emit when this module has been split (has_subs).
@@ -3058,7 +3467,10 @@ export int run(int const, char**)
                         if (!t->fields.empty() || !t->methods.empty() ||
                             !t->interfaces.empty() || !t->properties.empty())
                             continue;
-                        w.write("export using % = void*;\n\n", t->name);
+                        if (!t->coclass_clsid.empty())
+                            w.write("// COM coclass CLSID %\n", t->coclass_clsid);
+                        if (is_valid_alias_name(t->name))
+                            w.write("export using % = void*;\n\n", t->name);
                     }
                     // Flat functions are deferred to a second pass below:
                     // a merged Win32 module spans several namespaces and a
@@ -3091,7 +3503,10 @@ export int run(int const, char**)
                         if (!t->fields.empty() || !t->methods.empty() ||
                             !t->interfaces.empty() || !t->properties.empty())
                             continue;
-                        w.write("export using % = void*;\n\n", t->name);
+                        if (!t->coclass_clsid.empty())
+                            w.write("// COM coclass CLSID %\n", t->coclass_clsid);
+                        if (is_valid_alias_name(t->name))
+                            w.write("export using % = void*;\n\n", t->name);
                     }
                     // Flat functions deferred (see the Win32 branch above).
                 }
@@ -3171,6 +3586,58 @@ export int run(int const, char**)
                 for (auto const* t : info.interfaces)
                 {
                     if (in_projection(*t)) write_interface(w, *t, mapper, metadata, winrt_specs, bodies, component_bodies, component_bodies_mutex, module_has_async, co_await_text);
+                }
+                // IReserveableVector<T> is a proposal interface that no OS
+                // winmd carries, so synthesize it here whenever the
+                // namespace projects IVector. Sibling interface (like
+                // IIterable beside IVector): base stays null so the slot
+                // math lands Reserve at 6 + 0 + 0 = slot 6 - winrt_base's
+                // reserveable_iface vtable (IInspectable 0-5 + Reserve) -
+                // and interface_method_count=1 sizes
+                // interface_impl_base<D,I>::m_methods for authoring
+                // (slot 6+i is exactly m_methods[i]).
+                {
+                    bool already = false;
+                    winmd::type_info const* ivector = nullptr;
+                    for (auto const* t : info.interfaces)
+                    {
+                        if (!t) continue;
+                        if (t->name == "IReserveableVector") already = true;
+                        if (t->name == "IVector" && !t->generic_params.empty()) ivector = t;
+                    }
+                    if (!already && ivector && in_projection(*ivector))
+                    {
+                        winmd::type_info synth;
+                        synth.ns = m;
+                        synth.name = "IReserveableVector"; // type names strip the `1 arity at load
+                        synth.kind = ivector->kind; // interface (avoid the SDK `interface` macro here)
+                        synth.flags = ivector->flags;
+                        synth.db = ivector->db;
+                        synth.row = ivector->row;
+                        synth.generic_params = ivector->generic_params; // T0
+                        // 3f7a19c2-6b1e-4d95-8a24-d15e9c47b308 in winmd blob
+                        // order (guid_literal prints guid[3..0] as the u32).
+                        static constexpr std::uint8_t reserve_guid[16] = {
+                            0xc2, 0x19, 0x7a, 0x3f, 0x1e, 0x6b, 0x95, 0x4d,
+                            0x8a, 0x24, 0xd1, 0x5e, 0x9c, 0x47, 0xb3, 0x08 };
+                        for (std::size_t i = 0; i < 16; ++i) synth.guid[i] = reserve_guid[i];
+                        synth.has_guid = true;
+                        winmd::method_info reserve;
+                        reserve.name = "Reserve";
+                        reserve.ret.kind = winmd::et_void;
+                        winmd::param_info cap;
+                        cap.name = "capacity";
+                        cap.value.kind = winmd::et_u4;
+                        cap.flags = winmd::param_in;
+                        cap.sequence = 1;
+                        reserve.params.push_back(std::move(cap));
+                        reserve.flags = ivector->methods.empty() ? 0 : ivector->methods[0].flags;
+                        reserve.is_virtual = true;
+                        reserve.is_abstract = true;
+                        synth.methods.push_back(std::move(reserve));
+                        write_interface(w, synth, mapper, metadata, winrt_specs, bodies,
+                            component_bodies, component_bodies_mutex, module_has_async, co_await_text);
+                    }
                 }
                 if (module_has_async && !async_helpers_emitted)
                 {
@@ -3921,7 +4388,12 @@ export int run(int const, char**)
         if (do_compile)
         {
             std::filesystem::path proj_folder(settings.output_folder);
-            if (compile_project_folder(proj_folder, settings.component_name) != 0)
+            // Final binaries land in the -compile/-winui path-switch folder
+            // when one was given (only the exe/sys/dll go there), else in
+            // the -output folder itself.
+            std::string final_out = settings.final_output.empty()
+                ? settings.output_folder : settings.final_output;
+            if (compile_project_folder(proj_folder, settings.component_name, final_out) != 0)
                 result = 1;
         }
     }
@@ -4048,6 +4520,17 @@ std::string locate_wasdk_bootstrap_dll(bool verbose)
     return {};
 }
 
+// Runtime folder for the -winui companions: wherever the linked exe lands
+// (-winui/-compile path switch, else -output). resources.pri / <exe>.pri /
+// Assets / the bootstrap DLL are only found at runtime NEXT TO the exe.
+static std::string winui_runtime_dir()
+{
+    std::string dir = settings.final_output.empty() ? settings.output_folder : settings.final_output;
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
 // copy_winui_bootstrap_dll — put Microsoft.WindowsAppRuntime.Bootstrap.dll
 // beside the produced app exe so MddBootstrapInitialize2 resolves at startup
 // on machines without a system-wide Windows App Runtime install.
@@ -4060,7 +4543,7 @@ void copy_winui_bootstrap_dll()
                     " copy it next to the exe or install the Windows App Runtime\n");
         return;
     }
-    auto dst = std::filesystem::path(settings.output_folder) / L"Microsoft.WindowsAppRuntime.Bootstrap.dll";
+    auto dst = std::filesystem::path(winui_runtime_dir()) / L"Microsoft.WindowsAppRuntime.Bootstrap.dll";
     // Always overwrite: a stale lower-version DLL left in the output folder
     // breaks MddBootstrapInitialize2 (0x80670016) — the located source is
     // always the highest-version x64 DLL from the NuGet cache.
@@ -4098,7 +4581,7 @@ void copy_winui_pri()
                 exe_name.pop_back();
         }
         std::error_code ec;
-        auto dst_res = std::filesystem::path(settings.output_folder) / L"resources.pri";
+        auto dst_res = std::filesystem::path(winui_runtime_dir()) / L"resources.pri";
         std::filesystem::copy_file(pri, dst_res, std::filesystem::copy_options::overwrite_existing, ec);
         if (!ec)
             std::printf("-winui: resources.pri copied from %s\n", pri.string().c_str());
@@ -4106,7 +4589,7 @@ void copy_winui_pri()
             std::printf("cppwinc : warning could not copy resources.pri: %s\n", ec.message().c_str());
         if (!exe_name.empty())
         {
-            auto dst_exe = std::filesystem::path(settings.output_folder) / (exe_name + L".pri");
+            auto dst_exe = std::filesystem::path(winui_runtime_dir()) / (exe_name + L".pri");
             std::error_code ec2;
             std::filesystem::copy_file(pri, dst_exe, std::filesystem::copy_options::overwrite_existing, ec2);
             if (!ec2)
@@ -4131,7 +4614,7 @@ void copy_winui_assets()
         if (!std::filesystem::is_regular_file(in)) continue;
         auto src = in.parent_path() / L"Assets";
         if (!std::filesystem::is_directory(src)) continue;
-        auto dst = std::filesystem::path(settings.output_folder) / L"Assets";
+        auto dst = std::filesystem::path(winui_runtime_dir()) / L"Assets";
         std::error_code ec;
         std::filesystem::copy(src, dst,
             std::filesystem::copy_options::overwrite_existing | std::filesystem::copy_options::recursive, ec);
@@ -4152,7 +4635,8 @@ void copy_winui_assets()
 //    (-winui) and a kernel <name>.sys when a DriverEntry source exists
 //    (-compile); the WDK module objects feed the driver link, everything
 //    else feeds the app link.
-int compile_project_folder(std::filesystem::path const& proj_folder, std::string const& app_name)
+int compile_project_folder(std::filesystem::path const& proj_folder, std::string const& app_name,
+                           std::string const& final_out)
 {
     int result = 0;
     std::filesystem::path toolchain = locate_msvc_toolchain();
@@ -4225,8 +4709,15 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
                     std::filesystem::path newest;
                     if (!kits.empty())
                         for (auto const& entry : std::filesystem::directory_iterator(kits, sec))
-                            if (entry.is_directory() && (newest.empty() || entry.path().filename() > newest.filename()))
+                        {
+                            auto fname = entry.path().filename().string();
+                            // Version dirs only (10.0.x.x) — same guard as
+                            // build_std_module: 'wdf' must not win the compare.
+                            if (entry.is_directory() && !fname.empty() &&
+                                std::isdigit(static_cast<unsigned char>(fname.front())) &&
+                                (newest.empty() || fname > newest.filename().string()))
                                 newest = entry.path();
+                        }
                     if (!newest.empty())
                     {
                         sdk_inc = newest.string();
@@ -4722,12 +5213,16 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
                 std::size_t ok = compiled_ok.load(), fail = compiled_fail.load();
                 if (fail > 0) result = 1;
 
-    // ── Link phase: app exe (main.ixx present) + driver sys (DriverEntry present) ──
+    // Link phase: app exe (main.ixx present) + driver sys (DriverEntry
+    // present) + release DLL (DllMain or a .def file present) — each target
+    // links independently so one pass can produce all of them.
     if (result == 0)
     {
         std::vector<std::filesystem::path> app_cpp;
         std::vector<std::filesystem::path> driver_srcs;
         bool has_main = false;
+        bool has_dllmain = false;
+        std::filesystem::path def_file;
         for (auto const& entry : std::filesystem::directory_iterator(proj_folder))
         {
             if (!entry.is_regular_file()) continue;
@@ -4745,15 +5240,22 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
                 {
                     if (dline.find("DriverEntry") != std::string::npos ||
                         dline.find("WDF_DRIVER_CONFIG") != std::string::npos)
-                    {
                         driver_srcs.push_back(entry.path());
-                        break;
-                    }
+                    // Shared-library target: a .cpp carrying DllMain marks a
+                    // DLL project (same plain-text heuristic as DriverEntry).
+                    if (dline.find("DllMain") != std::string::npos)
+                        has_dllmain = true;
                 }
             }
             else if (fn == "main.ixx")
             {
                 has_main = true;
+            }
+            else if (ext == ".def")
+            {
+                // Module-definition file also marks a DLL target and feeds /DEF.
+                def_file = entry.path();
+                has_dllmain = true;
             }
         }
 
@@ -4761,6 +5263,11 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
         while (!out_name.empty() && (out_name.back() == '/' || out_name.back() == '\\'))
             out_name.pop_back();
 
+        // Only the final linked binaries land in the -compile/-winui path
+        // folder when one was given; build intermediates (objs, logs, ifc)
+        // always stay in <project>/build/obj.
+        std::filesystem::path final_dir = final_out.empty() ? proj_folder : std::filesystem::path(final_out);
+        std::filesystem::create_directories(final_dir);
         auto link_with = [&](std::string const& out_file, std::vector<std::string> const& objs,
                              std::vector<std::string> const& libs, std::string const& flags)
         {
@@ -4771,22 +5278,33 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
             {
                 std::ofstream rsp(rsp_path, std::ios::binary);
                 for (auto const& o : objs) rsp << "\"" << o << "\"\n";
-                for (auto const& l : libs) rsp << "\"" << l << "\"\n";
+                for (auto const& l : libs)
+                {
+                    // Directory entries are search paths, not input files:
+                    // the driver link pushes the WDK km\\x64 folder so
+                    // ntoskrnl.lib/hal.lib resolve. Writing it as a quoted
+                    // file made link fail LNK1181 on the bare lib names.
+                    std::error_code dec;
+                    if (std::filesystem::is_directory(l, dec))
+                        rsp << "/LIBPATH:\"" << l << "\"\n";
+                    else
+                        rsp << "\"" << l << "\"\n";
+                }
                 rsp << flags << "\n";
             }
             std::string cmd = env_prefix;
-            cmd += "\"" + link_path + "\" /NOLOGO \"/OUT:" + (proj_folder / out_file).string() + "\"";
+            cmd += "\"" + link_path + "\" /NOLOGO \"/OUT:" + (final_dir / out_file).string() + "\"";
             cmd += " @\"" + rsp_path + "\"";
             cmd += " >\"" + (obj_dir / (out_file + ".link.log")).string() + "\" 2>&1";
             std::printf("-linking %s\n", out_file.c_str());
             int rc = std::system(cmd.c_str());
-            if (rc != 0 || !std::filesystem::exists(proj_folder / out_file))
+            if (rc != 0 || !std::filesystem::exists(final_dir / out_file))
             {
                 std::printf("cppwinc : error linking %s (log: %s)\n", out_file.c_str(),
                             (obj_dir / (out_file + ".link.log")).string().c_str());
                 return false;
             }
-            std::printf("  produced %s\n", (proj_folder / out_file).string().c_str());
+            std::printf("  produced %s\n", (final_dir / out_file).string().c_str());
             return true;
         };
 
@@ -4795,6 +5313,21 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
                     proj_folder.string().c_str(), std::filesystem::is_directory(proj_folder) ? 1 : 0);
         std::string name = app_name.empty() ? out_name : app_name;
         if (name.empty()) name = "app";
+
+        // Target selection: `-target exe,sys,dll` forces specific links and
+        // errors when a forced target has no matching source; without -target
+        // every auto-detected target links — one pass can produce the exe,
+        // the sys AND the dll together.
+        bool const explicit_targets = !settings.targets.empty();
+        bool const want_sys = explicit_targets ? settings.targets.contains("sys") : !driver_srcs.empty();
+        bool const want_dll = explicit_targets ? settings.targets.contains("dll") : has_dllmain;
+        bool const want_exe = !explicit_targets || settings.targets.contains("exe");
+        if (explicit_targets && want_sys && driver_srcs.empty())
+        {
+            std::printf("cppwinc : error -target sys: no driver source (DriverEntry) found in %s\n",
+                        proj_folder.string().c_str());
+            result = 1;
+        }
 
         // Compile the .cpp app/driver sources now (module objects already
         // exist; .cpp files are outside the .ixx topological pass).
@@ -4825,7 +5358,7 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
         if (result != 0) return result;
 
         // Kernel driver: WDK modules (Windows.Wdk.* / driver .cpp) -> <name>.sys
-        if (!driver_srcs.empty())
+        if (want_sys && !driver_srcs.empty())
         {
             std::string wdk_inc, wdk_lib;
             {
@@ -4837,11 +5370,16 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
                     std::error_code wec;
                     std::filesystem::path newest_w;
                     auto inc_root = wdk_root / "Include";
-                    if (std::filesystem::is_directory(inc_root, wec))
-                        for (auto const& e : std::filesystem::directory_iterator(inc_root, wec))
-                            if (e.is_directory() && e.path().filename().string().find("wdk") == std::string::npos
-                                && (newest_w.empty() || e.path().filename().string() > newest_w.filename().string()))
-                                newest_w = e.path();
+                    if (std::filesystem::is_directory(inc_root, wec))                                for (auto const& e : std::filesystem::directory_iterator(inc_root, wec))
+                                {
+                                    auto nm = e.path().filename().string();
+                                    // Version dirs only — excludes 'wdf'/'wdk'
+                                    // folders that would win a string compare.
+                                    if (e.is_directory() && !nm.empty() &&
+                                        std::isdigit(static_cast<unsigned char>(nm.front()))
+                                        && (newest_w.empty() || nm > newest_w.filename().string()))
+                                        newest_w = e.path();
+                                }
                     if (!newest_w.empty())
                     {
                         wdk_inc = newest_w.string();
@@ -4857,14 +5395,41 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
                     drv_objs.push_back((obj_dir / (n + ".obj")).string());
             std::vector<std::string> drv_libs = { "ntoskrnl.lib", "hal.lib", "bufferoverflowfastfailk.lib" };
             if (!wdk_lib.empty()) drv_libs.push_back(wdk_lib + "\\km\\x64");
-            std::string drv_flags = "/DRIVER /SUBSYSTEM:NATIVE /ENTRY:GsDriverEntry /MACHINE:X64 /INCREMENTAL:NO";
+            std::string drv_flags = "/DRIVER /SUBSYSTEM:NATIVE /ENTRY:GsDriverEntry /MACHINE:X64 /INCREMENTAL:NO /RELEASE /OPT:REF /OPT:ICF";
             if (!link_with(name + ".sys", drv_objs, drv_libs, drv_flags))
+                result = 1;
+        }
+        // Release DLL: DllMain / .def present -> <name>.dll linked in release
+        // flavor (objects already come from the /MD /O2 /DNDEBUG compile pass;
+        // the link adds /RELEASE /OPT:REF /OPT:ICF like the exe and sys links).
+        // Independent of the sys and exe links above.
+        if (want_dll)
+        {
+            std::vector<std::string> dll_objs;
+            for (auto const& c : app_cpp)
+                dll_objs.push_back((obj_dir / (c.filename().string() + ".obj")).string());
+            std::error_code dec;
+            for (auto const& o : std::filesystem::directory_iterator(obj_dir, dec))
+                if (o.is_regular_file() && o.path().extension() == ".obj"
+                    && o.path().filename() != "std.obj" && o.path().filename() != "main.obj")
+                    dll_objs.push_back(o.path().string());
+            if (std::filesystem::exists(obj_dir / "std.obj"))
+                dll_objs.push_back((obj_dir / "std.obj").string());
+            std::string dll_flags =
+                "/DLL /SUBSYSTEM:WINDOWS /MACHINE:X64 /INCREMENTAL:NO /RELEASE /OPT:REF /OPT:ICF";
+            if (!def_file.empty())
+                dll_flags += " /DEF:\"" + def_file.string() + "\"";
+            if (!link_with(name + ".dll", dll_objs, {}, dll_flags))
                 result = 1;
         }
         // App exe: main.ixx bootstrap + user .cpp + all module objects ->
         // <name>.exe (the linker pulls only referenced modules, which
         // covers the app's own component module like WinUIGallery.App).
-        else if (has_main)
+        // Independent of the sys link above: a project folder that carries
+        // BOTH a driver source and a main.ixx app must produce both the
+        // <name>.sys and the <name>.exe in one pass (the old 'else if'
+        // silently dropped the exe whenever a driver was present).
+        if (want_exe && has_main)
         {
             std::vector<std::string> app_objs;
             if (std::filesystem::exists(obj_dir / "main.obj"))
@@ -4891,7 +5456,7 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
         }
         // Console quick-test: a .cpp with plain main() -> <name>.exe linked
         // against the std module object.
-        else if (!app_cpp.empty())
+        else if (want_exe && !app_cpp.empty())
         {
             bool has_console_main = false;
             {
@@ -4914,9 +5479,27 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
                         objs.push_back(o.path().string());
                 if (std::filesystem::exists(obj_dir / "std.obj"))
                     objs.push_back((obj_dir / "std.obj").string());
-                if (!link_with(name + ".exe", objs, {}, "/SUBSYSTEM:CONSOLE /MACHINE:X64 /INCREMENTAL:NO /RELEASE /OPT:REF /OPT:ICF"))
+                // WinRT projections pull winrt_base (WindowsCreateString,
+                // Ro* activation): link the same import libs the wWinMain
+                // path uses, else every WinRT console test dies LNK2019.
+                std::vector<std::string> libs;
+                if (std::filesystem::exists(obj_dir / "winrt_base.obj"))
+                    libs = { "windowsapp.lib", "runtimeobject.lib", "onecore.lib" };
+                if (!link_with(name + ".exe", objs, libs, "/SUBSYSTEM:CONSOLE /MACHINE:X64 /INCREMENTAL:NO /RELEASE /OPT:REF /OPT:ICF"))
                     result = 1;
             }
+            else if (explicit_targets)
+            {
+                std::printf("cppwinc : error -target exe: no main.ixx and no int main() source found in %s\n",
+                            proj_folder.string().c_str());
+                result = 1;
+            }
+        }
+        else if (want_exe && explicit_targets)
+        {
+            std::printf("cppwinc : error -target exe: no main.ixx or .cpp source found in %s\n",
+                        proj_folder.string().c_str());
+            result = 1;
         }
     }
     return result;

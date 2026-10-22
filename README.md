@@ -1,4 +1,4 @@
-# CppWinC — Unified WinRT / Win32 / Driver Projection Compiler for C++23
+# CppWinC — Unified WinUI 3 / WinRT / Win32 / Driver Projection Compiler for C++23
 
 > **DISCLAIMER — NOT A FORK.** `CppWinC` is an independent, original
 > implementation written from scratch against the public Windows Runtime ABI
@@ -12,21 +12,29 @@
 It reads ECMA-335 metadata (`.winmd` files) and emits modern C++23
 **named modules** — no header files, no precompiled headers, no `pch.h`.
 
-It projects three API surfaces from a single compiler:
+It projects four API surfaces from a single compiler:
 
 | API Surface | Metadata Source | Namespaces | Runtime |
 |---|---|---|---|
+| **WinUI 3** | `.winui` XAML views (xaml2winuic / winuic), WASDK | `Microsoft.UI.*` | `winrt_base.ixx` |
 | **WinRT** | System `WinMetadata`, Windows SDK, WASDK/WinUI3 | `Windows.*` | `winrt_base.ixx` |
 | **Win32** | `winversec`-generated `.winmd` | `Windows.Win32.*` | None (plain C++) |
 | **Driver (WDK)** | `winversec`-generated `.winmd` | `Windows.Wdk.*` (shared utilities, RPC, string, network) | None (plain C++) |
 
-WinRT modules import `winrt_base` for the runtime wrapper layer (`hstring`,
-`com_ptr`, coroutines, etc.). Win32 and WDK modules are plain C++ with no
-runtime dependency — direct `extern "C"` linkage, RAII handle wrappers, and
-correct calling conventions.
+WinUI 3 and WinRT modules import `winrt_base` for the runtime wrapper layer
+(`hstring`, `com_ptr`, coroutines, etc.). Win32 and WDK modules are plain C++
+with no runtime dependency — direct `extern "C"` linkage, RAII handle wrappers,
+and correct calling conventions.
 
 ## Headline features
 
+- **WinUI 3 / XAML projection.** Feed `.winui` XAML views (transpiled by
+  [xaml2winuic-compiler](https://github.com/mominshaikhdev/xaml2winuic-compiler)
+  / [winuic-compiler](https://github.com/mominshaikhdev/winuic-compiler)) or
+  Windows App SDK metadata and `cppwinc` projects the WinUI 3 surface
+  (`Microsoft.UI.*` / `Microsoft.UI.Xaml.*`) as C++23 modules — controls,
+  layouts, resources, and typed-event handlers — importable
+  alongside WinRT, Win32, and WDK from the same run (`-winui`).
 - **Any WinRT API — past, present and future.** `cppwinc` is driven
   entirely by metadata: whatever `.winmd` files you feed it, it projects.
   The OS's own `WinMetadata` folder, any Windows SDK version, Windows App
@@ -44,10 +52,11 @@ correct calling conventions.
   as C++23 modules with IRP dispatch semantics, WDF object type attribution,
   and PnP/power state metadata — everything a driver developer needs for
   type-safe kernel-mode and user-mode driver authoring.
-- **Unified WinRT + Win32 + WDK projection.** A single `CppWinC` invocation
-  can project all three surfaces together. Applications import
-  `Windows.Foundation`, `Windows.Win32.FileSystem`, and
-  `Windows.Wdk.BASETSD` from the same compiler run.
+- **Unified WinUI 3 + WinRT + Win32 + WDK projection.** A single `CppWinC`
+  invocation can project all four surfaces together. Applications import
+  `Microsoft.UI.Xaml.Controls`, `Windows.Foundation`,
+  `Windows.Win32.FileSystem`, and `Windows.Wdk.BASETSD` from the same
+  compiler run.
 - **C++23 modules only.** The runtime (`winrt_base`) and every projection
   are emitted as `.ixx` module interface units. Consumers `import` them
   directly — no headers, no IFC build ordering headaches. The standard
@@ -278,7 +287,7 @@ as WDK and projects accordingly. Module names match the namespace from the
 `.winmd` (e.g. `import Windows.Wdk.BASETSD;`, `import Windows.Wdk.STRSAFE;`).
 
 The current WDK `.winmd` covers shared utility headers — type-safe
-integer conversion macros, string safety helpers, RPC/NDR bindings,
+integer conversion macros, string safety helpers, RPC/NDR marshaling,
 network extension helpers, and related low-level APIs. Core WDM/KMDF/UMDF
 driver APIs (`IoCreateDevice`, `WdfDeviceCreate`, etc.) require
 additional winversec coverage of `ntddk.h`, `wdm.h`, `fltKernel.h`,
@@ -368,12 +377,16 @@ TBSi_Context_Create(&params, &context);
 Tbsip_Context_Close(context);
 ```
 
-## Combined WinRT + Win32 + WDK
+## Combined WinUI 3 + WinRT + Win32 + WDK
 
-### Generate all three projections
+### Generate all four projections
 
 ```bat
 cppwinc.exe -input local,Windows.Win32.winmd,Windows.Wdk.winmd -base -output out
+
+:: add WinUI 3 (WASDK `Microsoft.UI.*`): -winui auto-discovers the WASDK
+:: metadata + runtime DLLs and builds it alongside WinRT/Win32/WDK
+cppwinc.exe -input local,Windows.Win32.winmd,Windows.Wdk.winmd -base -winui -output out
 ```
 
 ### Example — WinRT async + Win32 file I/O
@@ -440,19 +453,38 @@ Options:
     -input <spec>        Windows metadata to include - ONE comma-separated list
                          (local, <path-to-winmd-or-folder>, 10.0.x); -winui
                          auto-adds WASDK metadata and finds its runtime DLLs
-    -output <path>       Location of generated projection
+    -output <path>       Location of generated projection (also the default
+                         landing spot for every other switch's output)
     -component [<path>]  Generate component templates and implementation
+                         into <path> (default: the -output folder)
     -name <name>         Specify explicit name for component files
     -verbose             Show detailed progress information
-    -include <prefix>    One or more prefixes to include in input
-    -exclude <prefix>    One or more prefixes to exclude from input
+    -include <list>      Namespace prefixes to include - ONE comma-separated
+                         list or repeated switches (e.g.
+                         -include Windows.Win32.Graphics,Windows.Win32.Storage)
+    -exclude <list>      Namespace prefixes to exclude - same form as
+                         -include; takes precedence over -include
     -base                Generate base module unconditionally
     -std [<path>]        Build the std named module into <path>
-    -winui               Auto-discover WASDK metadata + DLLs, build std, compile all modules
-    -winui_no_compile    Like -winui but skip compilation (generate only)
+    -winui [<path>]      Auto-discover WASDK metadata + DLLs, build std,
+                         compile all modules; optional <path> receives ONLY
+                         the final linked binaries (+ resources.pri, Assets,
+                         bootstrap DLL beside the exe)
+    -winui_no_compile [<path>]
+                         Like -winui but skip compilation (generate only);
+                         same optional <path> outpath support
+    -compile [<path>]    Compile modules (release, parallel across all cores)
+                         + link exe / sys / release dll - see below
+    -target <list>       Link targets for -compile (requires -compile):
+                         comma-separated exe, sys, dll
     -help                Show detailed help with examples
-    -module_include <ns> Only generate modules for the listed namespaces
-    -module_exclude <ns> Skip modules for the listed namespaces
+    -module_include <list>
+                         Only generate modules for the listed namespaces -
+                         ONE comma-separated list or repeated switches
+    -module_exclude <list>
+                         Skip modules for the listed namespaces - same form
+                         as -module_include; takes precedence over
+                         -module_include
 
 Where <spec> is a single comma-separated list of any of:
   path                Path to winmd file or recursively scanned folder
@@ -478,6 +510,100 @@ cppwinc.exe -input Xaml.winmd,Foundation.winmd -base -output out
 ```bat
 cppwinc.exe -input Windows.Win32.winmd -base -output out
 ```
+
+### Generate a component with `-component`
+
+`-component` emits the WinRT component templates and the matching
+implementation sources (activation factory glue: `create_instance`,
+`iface_cache`, `implements_type`, `default_interface`) for an app winmd:
+
+```bat
+:: component files into a dedicated folder (normalized like -output)
+cppwinc.exe -input local,MyApp.winmd -component out\component -name MyApp -output out
+
+:: flag without a path: component files land in the -output folder
+:: (the default — same rule as every other switch's output)
+cppwinc.exe -input local,MyApp.winmd -component -output out
+
+:: -winui generates the component automatically (no -component needed)
+cppwinc.exe -input MyApp.winmd -winui -output .
+```
+
+How `-component` resolves its inputs and outputs:
+
+- **Component source = the LAST user-specified `-input` winmd.** The CLI
+  convention is `-input <OS/Win32 winmd>,...,<app>.winmd` — the app winmd
+  comes last. System metadata (`local`, SDK contracts) never names the
+  component.
+- **`-name <name>`** sets the explicit component file name; without it the
+  app winmd stem is used.
+- **`-component [<path>]`** chooses the destination folder; without a path
+  the component files go to the `-output` folder (the path is resolved
+  against the launch directory exactly like `-output`/`-compile`).
+- Component modules are ordinary `.ixx` modules: they compile with
+  `-compile` (release, all cores) like the rest of the projection, and
+  `-winui` always enables component generation (it also emits `main.ixx`
+  with the WASDK bootstrap).
+
+
+### Authoring a general WinRT component (`-component` for plain APIs)
+
+`-component` is not WinUI-specific — use it to author any WinRT runtime
+class, interface, struct, enum, or delegate (a class library that exposes
+general WinRT APIs). Point it at your own component `.winmd`, placed
+**last** in `-input` after the OS metadata your types reference:
+
+```bat
+:: Author a general WinRT class library from its winmd.
+:: OS metadata first, your component winmd last. -component emits the
+:: projection for your types PLUS the implementation + activation templates.
+:: -name names the component files (default: the winmd stem).
+:: -compile builds everything (release, all cores) in the same run.
+cppwinc.exe -input local,MyTypes.winmd -component out\component -name MyTypes -output out -compile
+
+:: -component without a path: templates land in the -output folder
+cppwinc.exe -input local,MyTypes.winmd -component -name MyTypes -output out
+```
+
+For a general WinRT API surface `-component` emits:
+
+- **Projection modules** for every runtime class, interface, value type,
+  enum, and delegate in your winmd — importable by consumers like any
+  other `winrt.*` module.
+- **Implementation templates** for the authoring side: the CRTP
+  `implements<D, I...>` base, `default_interface`, `iface_cache`, and
+  `implements_type` glue, plus the class skeleton with method stubs to
+  fill in.
+- **Activation-factory registration** so consumers can activate and call
+  the class through `create_instance(class_name)` (the same helper the
+  runtime helpers section documents), resolving the factory, default
+  interface, and interface cache automatically.
+
+Implement the generated method stubs, then build the projection modules
+and the component modules together with `-compile` (release, all cores),
+exactly like the rest of the projection. `-name <name>` overrides the
+component file name, and `-component <path>` chooses where the templates
+land (both default to the `-output` folder / the winmd stem).
+
+
+### MIDL-authored components (`midlrt` + `-component`)
+
+Define the component surface in IDL, compile it to a winmd with the
+Windows SDK's MIDLRT compiler, then hand that winmd to `-component`
+(authored winmd last in `-input`, after the OS metadata it references):
+
+```bat
+:: 1. IDL -> component/authoring winmd (midlrt ships with the Windows SDK)
+midlrt /winrt /metadata_dir "C:\Program Files (x86)\Windows Kits\10\References\10.0.26100.0" MyTypes.idl
+::    -> MyTypes.winmd (activatable classes, factory interfaces, contracts)
+
+:: 2. -component reads it like any other authoring winmd
+cppwinc.exe -input local,MyTypes.winmd -component out\component -name MyTypes -output out -compile
+```
+
+The midlrt metadata drives the projection modules, implementation
+templates, and activation-factory registration - same pipeline as a
+winmd from any other authoring toolchain.
 
 ### Generate a Driver (WDK) projection
 
@@ -505,14 +631,76 @@ link /nologo /out:app.exe app.obj %BUILD_DIR%\winrt_base.obj ^
     %BUILD_DIR%\winrt.Windows.Foundation.obj std.obj windowsapp.lib
 ```
 
+### Build with `-compile` (and `-target`)
+
+`-compile` runs the built-in module compilation + link pass — the same
+machinery `-winui` uses — without WASDK auto-discovery, for winrt / win32 /
+wdk projections and any custom winmd input:
+
+```bat
+:: generate + compile + link in one shot
+cppwinc.exe -input Windows.Win32+Wdk.winmd -output build\proj -compile
+
+:: quick-test an existing projection folder (no -input, no regeneration)
+cppwinc.exe -compile build\proj
+
+:: only the final binaries land here (modules/objs stay with -output/source)cppwinc.exe -input Windows.Win32.winmd -output out -compile out\bin
+
+:: force link targets (comma-separated; requires -compile)
+cppwinc.exe -compile build\proj -target exe,dll
+```
+
+What `-compile` guarantees:
+
+- **Release everywhere.** Modules and `.cpp` sources compile with
+  `/MD /O2 /DNDEBUG`; the exe, sys and dll links all run with
+  `/RELEASE /OPT:REF /OPT:ICF` (`/INCREMENTAL:NO`). There is no debug
+  flavor in this pass.
+- **All cores in parallel.** The topological module build is leveled and
+  compiles every ready module concurrently across `system_core_count()`
+  threads (set `CPPWINC_JOBS=<n>` to override the thread count).
+- **exe + sys + dll in ONE pass.** Link targets are auto-detected from the
+  project sources, and every matching target links independently:
+
+  | target | detected by | output |
+  |--------|-------------|--------|
+  | `<name>.exe` | `main.ixx` present (WinMain app) or a `.cpp` with `int main(` (console) | `<name>.exe` |
+  | `<name>.sys` | any `.cpp` mentioning `DriverEntry` / `WDF_DRIVER_CONFIG` | `<name>.sys` |
+  | `<name>.dll` | any `.cpp` mentioning `DllMain`, or a `.def` file (used as `/DEF:`) | `<name>.dll` |
+
+  A folder carrying a driver source *and* a `main.ixx` app produces both
+  `<name>.sys` and `<name>.exe` from the same run.
+- **`-target exe,sys,dll` overrides auto-detection** (comma-separated,
+  case-insensitive). It requires `-compile`; using it with `-winui`/
+  `-winui_no_compile` or without any build switch is an error. A forced
+  target whose source is missing is an error too (`-target sys` with no
+  `DriverEntry`, `-target exe` with no `main.ixx`/`int main(`).
+- **Output placement.** Intermediates (`.obj`, `.ifc`, logs, `.rsp`) always
+  stay in `<project>\build\obj`. Final binaries go to, in priority order:
+  the `-compile <path>` (or `-winui <path>`) folder — which then contains
+  ONLY the final output — else the `-output` folder, else the project
+  folder (quick-test default).
+- **Mutually exclusive modes.** `-compile` cannot combine with `-winui`
+  or `-winui_no_compile` (those already compile), and `-winui` with
+  `-winui_no_compile`. Each combination fails fast with an error.
+- **Quick-test caveat.** `-compile <folder>` compiles exactly what the
+  folder contains: cross-module imports only resolve when the imported
+  modules exist in the folder (generate the full projection, or list the
+  whole closure with `-module_include`).
+
 ### One-shot build with `-winui`
 
 The `-winui` flag handles everything in one command — auto-discovers
 WASDK metadata and runtime DLLs from NuGet, builds the `std` module,
-generates the projection, and compiles all modules in topological order:
+generates the projection, and compiles all modules in topological order
+(release, all cores):
 
 ```bat
 cppwinc.exe -input MyApp.winmd -winui -output .
+
+:: optional path: ONLY the final binaries (+ resources.pri, Assets,
+:: bootstrap DLL) land there; modules stay in -output
+cppwinc.exe -input MyApp.winmd -winui -output out -winui out\bin
 ```
 
 This automatically:
@@ -563,7 +751,7 @@ The codegen automatically handles type-incompatible properties:
 - `FontFamily` — emits `FontFamily()` default.
 - Hex color values (#RGB, #RRGGBB) — wrapped in `SolidColorBrush` via
   `make_solid_brush(Color{...})` with ARGB conversion.
-- Untyped item bindings (DataTemplate `item.Property`) — skipped for
+- Untyped item property access (DataTemplate `item.Property`) — skipped for
   IInspectable items to avoid type mismatches.
 
 ## Module compilation
@@ -598,7 +786,7 @@ Everything an app needs beyond the metadata projection lives in
 - **Marshaling helpers.**
   - `arg_in<T>` — marshals an input parameter from ABI to projected type.
   - `put_abi<T>` — returns `void**` for COM out-parameters.
-  - `bind_in<T>` — binds an input buffer for marshaling.
+  - `bind_in<T>` — exposes an input buffer for marshaling.
   - `detach_abi<T>` — detaches ownership from a `com_ptr` to raw ABI pointer.
   - `attach_abi<T>` — attaches a raw ABI pointer to a `com_ptr`.
 - **Delegates.** Generated callable constructors for WinRT delegate types.
@@ -635,6 +823,20 @@ Everything an app needs beyond the metadata projection lives in
   - `single_threaded_threadsafe_map<K,V>()` — thread-safe variant.
   - `single_threaded_vector_view<T>(vector<T>)` — creates `IVectorView<T>`.
   - `single_threaded_map_view<K,V>(map)` — creates `IMapView<K,V>`.
+  - `IReserveableVector<T>` — capacity-reservation extension of `IVector<T>`
+    (proposal). Every vector the runtime creates (`single_threaded_vector`,
+    `single_threaded_observable_vector`, `single_threaded_observable_vector`)
+    also implements this interface, so append-heavy callers can preallocate
+    storage before a bulk insert instead of letting the backing store grow
+    and copy repeatedly — the WinRT equivalent of `std::vector::reserve`:
+    - `Reserve(capacity)` — guarantees room for at least `capacity` elements
+      without further reallocation. It is a no-op when `capacity` is less than
+      or equal to the current capacity, never shrinks the vector, preserves
+      all existing elements, and does not change `Size` or insert anything.
+    The interface is QI-able from any projected `IVector<T>`; its IID is
+    **provisional** (no official Microsoft GUID yet) and defined once as
+    `guid_ireserveablevector` in `strings_data.ixx`, ready to be swapped when
+    an official one is assigned.
 - **Cancellable coroutines** — full `IAsyncAction`/`IAsyncOperation<T>`
   implementations with cancellation token support. The runtime manages
   the coroutine state machine, reference counting, and ABI vtable layout.

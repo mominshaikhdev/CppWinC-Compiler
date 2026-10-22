@@ -1170,7 +1170,7 @@ inline bool is_unbindable_value(std::string const& val)
         || val.find("{binding") != std::string::npos;
 }
 
-// §0  PascalCase converter for WinUI projection property/event names
+// 0  PascalCase converter for WinUI projection property/event names
 // Property name remapping: winuic modifier names → WinUI3 API names
 inline std::string resolve_property_name(std::string_view pk)
 {

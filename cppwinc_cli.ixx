@@ -20,20 +20,21 @@ constexpr option options[] =
 {
     { "input", "<spec>", "Windows metadata to include (ONE comma-separated list: local,<path>,10.0.x). -winui auto-adds WASDK metadata + DLLs", 1 },
     { "output", "<path>", "Location of generated projection", 1 },
-    { "component", "[<path>]", "Generate component templates and implementation", 1 },
+    { "component", "[<path>]", "Generate component templates and implementation. Optional <path> = folder receiving the component files (default: the -output folder)", 1 },
     { "name", "<name>", "Specify explicit name for component files", 1 },
     { "verbose", {}, "Show detailed progress information", 0 },
-    { "include", "<prefix>", "One or more prefixes to include in input", 0 },
-    { "exclude", "<prefix>", "One or more prefixes to exclude from input", 0 },
+    { "include", "<list>", "Namespace prefixes to include, as ONE comma-separated list or repeated switches (e.g. -include Windows.Win32.Graphics,Windows.Win32.Storage)", 0 },
+    { "exclude", "<list>", "Namespace prefixes to exclude, as ONE comma-separated list or repeated switches (e.g. -exclude Windows.Win32.DirectWrite,Windows.Win32.Com) - takes precedence over -include", 0 },
     { "base", {}, "Generate base module unconditionally", 0 },
     { "std", "[<path>]", "Build the std named module into <path> (default: output folder)", 1 },
-    { "winui", {}, "Auto-discover WASDK metadata + DLLs; build Microsoft.UI.Xaml projection if runtime DLLs not found", 0 },
-    { "winui_no_compile", {}, "Like -winui but skip compilation (generate only)", 0 },
-    { "compile", "[<path>]", "Compile modules + link app exe / driver sys. With -input: compiles the generated projection. Alone: quick-test — compiles <path>'s .ixx modules + .cpp sources and links <name>.exe/.sys", 1 },
+    { "winui", "[<path>]", "Auto-discover WASDK metadata + DLLs; build Microsoft.UI.Xaml projection if runtime DLLs not found. Optional <path> = folder receiving ONLY the final linked binaries (modules stay in -output)", 1 },
+    { "winui_no_compile", "[<path>]", "Like -winui but skip compilation (generate only); same optional <path> outpath support", 1 },
+    { "compile", "[<path>]", "Compile modules (release: /MD /O2, parallel across all cores) + link exe / sys / release dll. With -input: compiles the generated projection; optional <path> = folder receiving ONLY the final linked binaries. Alone: quick-test - compiles <path>'s .ixx modules + .cpp sources and links <name>.exe/.sys/.dll (intermediates stay in <path>/build)", 1 },
+    { "target", "<list>", "Link targets for -compile (requires -compile): comma-separated exe, sys, dll (default: auto-detect from sources; every matching target links in one pass). Output location: -compile path, else -output, else the project folder", 0 },
     { "help", {}, "Show detailed help with examples", 0 },
     { "?", {}, {}, 0 },
-    { "module_include", "<ns>", "Only generate modules for the listed namespaces", 0 },
-    { "module_exclude", "<ns>", "Skip modules for the listed namespaces", 0 },
+    { "module_include", "<list>", "Only generate modules for the listed namespaces, as ONE comma-separated list or repeated switches (e.g. -module_include Windows.Win32.Graphics,Windows.Win32.Storage)", 0 },
+    { "module_exclude", "<list>", "Skip modules for the listed namespaces, as ONE comma-separated list or repeated switches (e.g. -module_exclude Windows.Win32.Com) - takes precedence over -module_include", 0 },
 };
 
 option const* find_option(std::string_view name)
@@ -188,7 +189,7 @@ struct arg_parser
     // all consumers (driver, compiler, linker) see absolute paths.
     void normalize_path_args()
     {
-        for (std::string const& key : { "output", "component", "std", "compile" })
+        for (std::string const& key : { "output", "component", "std", "compile", "winui", "winui_no_compile" })
         {
             auto it = args.find(key);
             if (it == args.end()) continue;

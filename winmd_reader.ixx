@@ -206,6 +206,9 @@ namespace winmd
         type ret;
         std::vector<type> params;
         std::vector<type> varargs;
+        // FIELD-sig fixed array bound: ELEMENT_TYPE_ARRAY + ArrayShape
+        // (ECMA-335 II.23.2.14). 0 = scalar field.
+        std::uint32_t fixed_arr = 0;
     };
 
     // Custom attribute arguments
@@ -748,6 +751,22 @@ namespace winmd
             }
             ++pos;
             method_sig sig;
+            // Fixed-size array field: ELEMENT_TYPE_ARRAY (0x14) + element
+            // type + ArrayShape { Rank, NumSizes, Size* } (II.23.2.14).
+            if (pos < b.size() && std::to_integer<std::uint8_t>(b[pos]) == 0x14)
+            {
+                ++pos;
+                sig.ret = parse_type(b, pos);
+                auto [rank, n1] = compressed_uint(b, pos); pos = n1;
+                auto [nsz, n2] = compressed_uint(b, pos); pos = n2;
+                for (std::uint32_t i = 0; i < nsz; ++i)
+                {
+                    auto [sz, n3] = compressed_uint(b, pos); pos = n3;
+                    if (i == 0) sig.fixed_arr = sz;
+                }
+                (void)rank;
+                return sig;
+            }
             sig.ret = parse_type(b, pos);
             return sig;
         }
@@ -1197,6 +1216,13 @@ namespace winmd
             return parse_field_sig(b).ret;
         }
 
+        // Full FIELD-sig decode: element type + fixed-array ArrayShape
+        // (parse_field_type drops the shape — struct readers need it).
+        method_sig parse_field_signature(blob b) const
+        {
+            return parse_field_sig(b);
+        }
+
         // Default interface of a runtime class, preserving generic
         // instantiation info: re-reads the DefaultAttribute-marked
         // InterfaceImpl's TypeRef/TypeDef/TypeSpec signature (resolve() on a
@@ -1457,6 +1483,9 @@ namespace winmd
         std::string name;
         type value;
         std::uint32_t flags = 0;
+        // Fixed array element count for `T name[N];` (0 = scalar), decoded
+        // from the FieldSig ELEMENT_TYPE_ARRAY ArrayShape.
+        std::uint32_t arr_n = 0;
     };
 
     export struct property_info
@@ -1549,6 +1578,14 @@ namespace winmd
         bool hresult_return = false;    // HRESULT return type
         bool nt_status_return = false;  // NTStatus return type
         std::string header_source;      // Header attribute (source header file)
+        std::uint32_t ioctl_buffering = 0; // IoctlBuffering: METHOD_* (0-3)
+        bool has_irp_major_function = false; // IrpMajorFunction attribute present
+        std::uint32_t irp_major_function = 0; // IrpMajorFunction value (IRP_MJ_*)
+        bool is_driver_dispatch = false; // DriverDispatch attribute (dispatch callback)
+        std::uint32_t driver_dispatch_major = 0; // DriverDispatch MajorFunction slot
+        std::uint32_t driver_dispatch_minor = 0; // DriverDispatch MinorFunction slot
+        bool callback_optional = false;  // CallbackOptional attribute (nullable callback param)
+        std::string coclass_clsid;       // ComCoClass attribute (CLSID string)
 
         std::string full_name() const
         {
@@ -1848,7 +1885,9 @@ namespace winmd
                 fi.flags = db.get_u32(table_field, f, 0);
                 try
                 {
-                    fi.value = db.parse_field_type(db.get_blob(table_field, f, 2));
+                    auto fsig = db.parse_field_signature(db.get_blob(table_field, f, 2));
+                    fi.value = fsig.ret;
+                    fi.arr_n = fsig.fixed_arr;
                 }
                 catch (...)
                 {
@@ -2168,6 +2207,32 @@ t->interfaces.push_back(it);
                     {
                         if (!args.empty()) t->ioctl_code = (std::uint32_t)args[0].i;
                     }
+                    else if (name.find("IoctlBuffering") != std::string::npos)
+                    {
+                        if (!args.empty()) t->ioctl_buffering = (std::uint32_t)args[0].i;
+                    }
+                    else if (name.find("IrpMajorFunction") != std::string::npos)
+                    {
+                        if (!args.empty())
+                        {
+                            t->irp_major_function = (std::uint32_t)args[0].i;
+                            t->has_irp_major_function = true;
+                        }
+                    }
+                    else if (name.find("DriverDispatch") != std::string::npos)
+                    {
+                        t->is_driver_dispatch = true;
+                        if (args.size() >= 1) t->driver_dispatch_major = (std::uint32_t)args[0].i;
+                        if (args.size() >= 2) t->driver_dispatch_minor = (std::uint32_t)args[1].i;
+                    }
+                    else if (name.find("CallbackOptional") != std::string::npos)
+                    {
+                        t->callback_optional = true;
+                    }
+                    else if (name.find("ComCoClass") != std::string::npos)
+                    {
+                        if (!args.empty() && !args[0].s.empty()) t->coclass_clsid = std::move(args[0].s);
+                    }
                     else if (name.find("InlineFunction") != std::string::npos)
                     {
                         t->is_inline_function = true;
@@ -2193,6 +2258,28 @@ t->interfaces.push_back(it);
                     {
                         if (!args.empty() && !args[0].s.empty())
                             t->header_source = std::move(args[0].s);
+                    }
+                    else if (name.find("Attributes.Guid") != std::string::npos)
+                    {
+                        // Winverse carries the interface IID as a STRING
+                        // positional ("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx").
+                        if (!args.empty() && !args[0].s.empty())
+                        {
+                            unsigned int a = 0, b = 0, c = 0, d[8] = {};
+                            if (::sscanf_s(args[0].s.c_str(),
+                                "%8x-%4x-%4x-%2x%2x-%2x%2x%2x%2x%2x%2x",
+                                &a, &b, &c, &d[0], &d[1], &d[2], &d[3], &d[4],
+                                &d[5], &d[6], &d[7]) == 11)
+                            {
+                                std::uint8_t* g = t->com_iid;
+                                g[0] = a & 0xFF; g[1] = (a >> 8) & 0xFF;
+                                g[2] = (a >> 16) & 0xFF; g[3] = (a >> 24) & 0xFF;
+                                g[4] = b & 0xFF; g[5] = (b >> 8) & 0xFF;
+                                g[6] = c & 0xFF; g[7] = (c >> 8) & 0xFF;
+                                for (int k = 0; k < 8; ++k) g[8 + k] = (std::uint8_t)d[k];
+                                t->has_com_iid = true;
+                            }
+                        }
                     }
                 }
             }
