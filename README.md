@@ -823,8 +823,9 @@ Everything an app needs beyond the metadata projection lives in
   - `single_threaded_threadsafe_map<K,V>()` — thread-safe variant.
   - `single_threaded_vector_view<T>(vector<T>)` — creates `IVectorView<T>`.
   - `single_threaded_map_view<K,V>(map)` — creates `IMapView<K,V>`.
-  - `IReserveableVector<T>` — capacity-reservation extension of `IVector<T>`
-    (proposal). Every vector the runtime creates (`single_threaded_vector`,
+  - `IReserveableVector<T>` — capacity-reservation extension of `IVector<T>`;
+    an extension interface not defined by Microsoft (no official WinRT
+    surface ships it). Every vector the runtime creates (`single_threaded_vector`,
     `single_threaded_observable_vector`, `single_threaded_observable_vector`)
     also implements this interface, so append-heavy callers can preallocate
     storage before a bulk insert instead of letting the backing store grow
