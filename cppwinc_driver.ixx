@@ -1297,9 +1297,10 @@ static void write_win32_com_interface(writer& w, winmd::type_info const& type, t
     if (type.com_interface && type.has_com_iid)
         w.write("inline constexpr % IID_% = { % };\n\n",
             // Globally anchored: inside a flat-C WASDK module (namespace
-            // Microsoft::Windows::AppSDK::X) a bare "Windows::..." resolves
-            // relative to Microsoft::Windows -> C3083/C2039 on every
-            // IID_* constant. Same anchoring as win32_type_cpp_name.
+            // Windows::Win32::AppSDK::X) a bare "Windows::..." reference
+            // walks outward through the enclosing scopes instead of binding
+            // at global scope — C3083/C2039 on every IID_* constant. Same
+            // anchoring as win32_type_cpp_name.
             "::Windows::Win32::GUIDDEF::GUID", cn, guid_brace_bytes(type.com_iid));
 }
 

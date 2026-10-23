@@ -2488,12 +2488,11 @@ t->interfaces.push_back(it);
                         t->name = strip_arity(std::string(db->get_string(table_typedef, r, 1)));
 
                         // Load WindowsRuntime types AND Win32/WDK types
-                        // Win32/WDK types are identified by namespace prefix
-                        // Flat-C WASDK types (Microsoft.Windows.AppSDK.*) are
-                        // non-WindowsRuntime too — future flat-C Windows App SDK
-                        // apis live there and must reach the projection.
-                        bool is_win32_wdk = t->ns.starts_with("Windows.Win32") || t->ns.starts_with("Windows.Wdk")
-                            || t->ns.starts_with("Microsoft.Windows.AppSDK");
+                        // Win32/WDK types are identified by namespace prefix.
+                        // Flat-C Windows App SDK types (Windows.Win32.AppSDK.*)
+                        // are non-WindowsRuntime too and live under that same
+                        // Windows.Win32 prefix, so they reach the projection.
+                        bool is_win32_wdk = t->ns.starts_with("Windows.Win32") || t->ns.starts_with("Windows.Wdk");
                         if (!is_winrt && !is_win32_wdk) continue;
 
                         out.push_back(p1_entry{ r, t->full_name(), std::move(t) });
