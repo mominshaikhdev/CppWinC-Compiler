@@ -5844,4 +5844,10 @@ namespace %
 
     export inline constexpr std::string_view version_string = "1.0.0.0";
     export inline constexpr std::string_view copyright = "MIT License";
+    // Banner identity — "<product> v<version> - <descriptor>", the same shape
+    // winversec announces itself with, so both tools introduce themselves
+    // consistently. Descriptor is the project's own title from README.
+    export inline constexpr std::string_view product_name = "CppWinC Compiler";
+    export inline constexpr std::string_view product_description =
+        "Unified WinUI 3 / WinRT / Win32 / Driver Projection Compiler for C++23";
 }

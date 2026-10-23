@@ -316,9 +316,19 @@ bool build_std_module(std::filesystem::path const& out_dir)
     return true;
 }
 
+// "<product> v<version> - <descriptor>" — mirrors winversec's banner so both
+// compilers announce themselves the same way.
+void print_version_banner()
+{
+    std::printf("%s v%s - %s\n",
+        std::string(cppwinc::strings::product_name).c_str(),
+        std::string(cppwinc::strings::version_string).c_str(),
+        std::string(cppwinc::strings::product_description).c_str());
+}
+
 void print_usage()
 {
-    std::printf("cppwinc v%s\n", std::string(cppwinc::strings::version_string).c_str());
+    print_version_banner();
     std::printf("%s\n", std::string(cppwinc::strings::copyright).c_str());
     std::printf("\n");
     std::printf("  cppwinc.exe [options...]\n\n");
@@ -1544,6 +1554,16 @@ export int run(int const, char**)
         {
             tokens.erase(tokens.begin());
         }
+
+        // No arguments: print the help text and exit, mirroring winversec's
+        // argc<=1 behaviour — an explicit option is required to run a
+        // generation or compile pass, never an implicit full run.
+        if (tokens.empty())
+        {
+            print_usage();
+            return 0;
+        }
+
         arg_parser args{ tokens };
 
         if (args.exists("help") || args.exists("?"))
@@ -1639,7 +1659,7 @@ export int run(int const, char**)
 
         if (settings.verbose)
         {
-            std::printf("cppwinc v%s\n", std::string(cppwinc::strings::version_string).c_str());
+            std::printf("%s v%s\n", std::string(cppwinc::strings::product_name).c_str(), std::string(cppwinc::strings::version_string).c_str());
             for (auto const& file : settings.input)
             {
                 std::printf(" in:  %s\n", file.string().c_str());
