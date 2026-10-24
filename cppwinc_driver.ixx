@@ -773,10 +773,17 @@ static void write_win32_enum(writer& w, winmd::type_info const& type, type_mappe
         if (type.enum_fields[0].second > 2147483647LL ||
             type.enum_fields[0].second < -2147483648LL)
             const_underst = "std::uint32_t";
+        // #undef first: BUFSIZ/EXIT_SUCCESS/FILENAME_MAX/RAND_MAX are CRT
+        // macros visible in this TU — without it the token expands to a
+        // literal before the declaration parses (C2332/C2059). Macros never
+        // cross a module boundary, so importers never see this name anyway.
+        w.write("#undef %\n", mangle_enum_member(type.name));
         w.write("export inline constexpr % % = %;\n\n", const_underst,
             mangle_enum_member(type.name), type.enum_fields[0].second);
         return;
     }
+    // Same macro guard as the singleton-const path above.
+    w.write("#undef %\n", type.name);
     w.write("export enum class % : %\n{\n", type.name, underlying);
     // Keep the first definition of each enumerator name. Some SDK headers
     // define the same enumerator twice (e.g. MSI's SCRIPTFLAGS_REGDATA_APPINFO
@@ -1316,6 +1323,51 @@ static void write_aw_canonical(writer& w, std::string const& ns_cpp,
     w.write("%", cw.str());
 }
 
+// C standard library names that `import std;` already declares in the
+// global scope. Re-declaring them `extern "C"` with winmd-derived
+// parameters collides with the real declaration: C linkage ignores
+// namespaces, so the projection's `void* __Src` (metadata drops const)
+// cannot coexist with <string.h>'s `void const* __Src` -> C2116/C2733 in
+// the module AND in every importer that sees both modules. Emit a
+// using-declaration instead: the namespace keeps the name, the call
+// resolves to the genuine UCRT symbol with correct const/ABI, and /MD's
+// default ucrt.lib already provides it. Every name here is declared by a
+// C standard header (guaranteed part of import std); non-CRT names
+// (Win32/WDK APIs - never declared by std) keep the extern decl.
+static bool crt_global_alias(std::string const& name)
+{
+    static const std::set<std::string> crt = {
+        // string.h / wchar.h — proven C2116/C2733 conflicts
+        "memcmp", "memcpy", "memmove", "strcmp", "strncmp", "strcoll",
+        "strcspn", "strerror", "strlen", "strnlen", "strspn", "strtok",
+        "strxfrm", "wcscmp", "wcscoll", "wcscspn", "wcslen", "wcsnlen",
+        "wcsncmp", "wcsspn", "wcsxfrm",
+        // same families, same const-vs-void* shape (other modules)
+        "strcpy", "strncpy", "strcat", "strncat", "strchr", "strrchr",
+        "strstr", "strpbrk", "wcscpy", "wcsncpy", "wcscat", "wcsncat",
+        "wcschr", "wcsrchr", "wcsstr", "wcspbrk", "wmemcpy", "wmemmove",
+        "wmemset", "wmemcmp", "wmemchr", "wcsrtombs", "mbsrtowcs",
+        // stdio.h — proven conflicts
+        "clearerr", "fclose", "feof", "ferror", "fflush", "fgetc",
+        "fgetpos", "fgets", "fopen", "fputc", "fputs", "fread",
+        "freopen", "fsetpos", "fseek", "ftell", "fwrite", "getc",
+        "perror", "putc", "puts", "remove", "rename", "rewind",
+        "setbuf", "setvbuf", "tmpfile", "ungetc", "fgetwc", "fputwc",
+        "getwc", "putwc", "ungetwc", "fgetws", "fputws", "fwprintf",
+        // stdlib.h — proven conflicts
+        "labs", "atexit", "atof", "atoi", "atol", "bsearch", "qsort",
+        "getenv", "ldiv", "mblen", "mbtowc", "strtod", "strtol",
+        "strtoul", "system", "wctomb", "wcstod", "wcstol", "wcstoul",
+        // time.h/wchar.h/setjmp.h/eh.h — proven conflicts (the projected
+        // params name PROJECTED types — Wdk::TIME::tm, void* instead of
+        // jmp_buf/terminate_handler — so the extern "C" redeclaration
+        // mismatches the import-std-visible CRT declaration: C2116/C2733,
+        // C2382 exception-spec on terminate)
+        "wcsftime", "mbrlen", "mbrtowc", "longjmp", "terminate", "set_terminate",
+    };
+    return crt.count(name) != 0;
+}
+
 static void write_win32_function(writer& w, winmd::type_info const& type, type_mapper const& mapper, winmd::metadata const&, std::set<std::string>& emitted, std::vector<std::pair<std::string, aw_fn_sig>>& aw_acc)
 {
     if (type.methods.empty()) return;
@@ -1360,7 +1412,12 @@ static void write_win32_function(writer& w, winmd::type_info const& type, type_m
         // `export extern "C"`: without the export keyword the function
         // declaration is not visible across the module boundary and every
         // consumer fails with C3861 'identifier not found'.
-        w.write("export extern \"C\" % % %(%);\n", ret, cc, fname, params);
+        // CRT row: `import std;` already declares this name globally —
+        // alias it instead of a conflicting second declaration.
+        if (crt_global_alias(fname))
+            w.write("export using ::%;\n", fname);
+        else
+            w.write("export extern \"C\" % % %(%);\n", ret, cc, fname, params);
         if (!type.import_library.empty()) w.write("// Import library: %\n", type.import_library);
         if (type.last_error) w.write("// SetLastError: true\n");
         if (type.callback_optional) w.write("// Optional callback parameter (may be nullptr)\n");
@@ -1482,10 +1539,17 @@ static void write_wdk_enum(writer& w, winmd::type_info const& type, type_mapper 
         if (type.enum_fields[0].second > 2147483647LL ||
             type.enum_fields[0].second < -2147483648LL)
             const_underst = "std::uint32_t";
+        // #undef first: BUFSIZ/EXIT_SUCCESS/FILENAME_MAX/RAND_MAX are CRT
+        // macros visible in this TU — without it the token expands to a
+        // literal before the declaration parses (C2332/C2059). Macros never
+        // cross a module boundary, so importers never see this name anyway.
+        w.write("#undef %\n", mangle_enum_member(type.name));
         w.write("export inline constexpr % % = %;\n\n", const_underst,
             mangle_enum_member(type.name), type.enum_fields[0].second);
         return;
     }
+    // Same macro guard as the singleton-const path above.
+    w.write("#undef %\n", type.name);
     w.write("export enum class % : %\n{\n", type.name, underlying);
     // Keep the first definition of each enumerator name. Some SDK headers
     // define the same enumerator twice (e.g. MSI's SCRIPTFLAGS_REGDATA_APPINFO
@@ -1609,13 +1673,30 @@ static std::string probe_sdk_lib_dir(std::string const& lib)
             std::string name = lib;
             auto dot = name.rfind('.');
             std::string stem = (dot == std::string::npos) ? name : name.substr(0, dot);
-            for (auto const* sub : { "um", "ucrt", "km" })
+            auto probe_stem = [&](std::string const& s) -> std::string
             {
-                if (std::filesystem::exists(newest / sub / "x64" / (stem + ".lib"), ec))
+                for (auto const* sub : { "um", "ucrt", "km" })
                 {
-                    result = sub;
-                    break;
+                    if (std::filesystem::exists(newest / sub / "x64" / (s + ".lib"), ec))
+                        return sub;
                 }
+                return {};
+            };
+            result = probe_stem(stem);
+            // DLL-name attributions whose SDK import library ships under a
+            // DIFFERENT stem: the WDK's user-mode CRT headers dllimport
+            // "ucrtbase.dll", but the SDK ships that surface as ucrt.lib —
+            // no ucrtbase.lib exists in any tree. Without this alias every
+            // CRT API (malloc/printf/strcmp/fopen...) looked lib-less and
+            // fell into the kernel-stub path, compiling user-mode code to
+            // silently-broken empty stubs (malloc returning nullptr).
+            if (result.empty())
+            {
+                static const std::unordered_map<std::string, std::string> stem_alias = {
+                    { "ucrtbase", "ucrt" },   // ucrtbase.dll -> ucrt.lib
+                };
+                if (auto ait = stem_alias.find(stem); ait != stem_alias.end())
+                    result = probe_stem(ait->second);
             }
         }
     }
@@ -1695,11 +1776,64 @@ static void write_wdk_function(writer& w, winmd::type_info const& type, type_map
                 user_mode_export = (where == "um" || where == "ucrt");
             }
         }
+        // UCRT <stdio.h> inline-only family. printf/fprintf/scanf/fscanf/
+        // sscanf exist ONLY as static inline bodies in the real headers —
+        // they forward to __imp___stdio_common_vfprintf/_vfscanf. NO SDK
+        // import library exports these five names (verified by dumpbin
+        // /linkermember across all 550 um/ucrt/km libs: the only provider is
+        // the static /MT libucrt.lib, which the /MD build this driver links
+        // never pulls) — a link probe of all 78 ucrtbase-attributed names
+        // under the cl /MD default-lib set resolves every one EXCEPT these
+        // five (LNK2019). So the ucrt alias alone would trade a silent stub
+        // for a guaranteed link error: gate them back to the intentional
+        // stub, the same truthful fallback as header-only kernel rows.
+        static const std::set<std::string> ucrt_stdio_inline_only = {
+            "printf", "fprintf", "scanf", "fscanf", "sscanf",
+        };
+        if (user_mode_export && ucrt_stdio_inline_only.count(fname))
+        {
+            std::string stem = type.import_library;
+            auto dot = stem.rfind('.');
+            if (dot != std::string::npos) stem = stem.substr(0, dot);
+            for (auto& c : stem) c = (char)std::tolower((unsigned char)c);
+            if (stem == "ucrtbase" || stem == "ucrt") user_mode_export = false;
+        }
+        // strsafe.h defines its whole public surface as `__inline`
+        // (STRSAFEAPI); win32metadata's per-row ImportLibrary scatters
+        // accidental static-lib providers. Row-local probe of all 35
+        // extern rows (dumpbin /linkermember of each row's OWN
+        // attribution lib): 22 rows' libs do not archive the plain C
+        // symbol — StringCchCopyA is attributed Htmlhelp.Lib, whose only
+        // copy is C++-mangled (?StringCchCopyA@@YAJPEAD_KPEBD@Z), which
+        // cannot satisfy an extern "C" reference (linked with
+        // htmlhelp.lib on the line: LNK2019). Those always fail → the
+        // intentional stub, same rule as the ucrt inline-only family.
+        // The other 13 rows (e.g. StringCchCopyW -> muiload.lib, which
+        // really archives the symbol) keep their externs.
+        if (type.ns == "Windows.Wdk.STRSAFE")
+        {
+            static const std::set<std::string> strsafe_no_link = {
+                "StringLengthWorkerW", "StringValidateDestW", "StringCopyWorkerW",
+                "StringVPrintfWorkerW", "StringCbCopyW", "StringCchPrintfW",
+                "StringCbPrintfW", "StringCchLengthW", "StringValidateDestA",
+                "StringCopyWorkerA", "StringCchCopyA", "StringLengthWorkerA",
+                "StringValidateDestAndLengthA", "StringVPrintfWorkerA",
+                "StringCchCatA", "StringCchVPrintfA", "StringCchPrintfA",
+                "StringCchLengthA", "StringCchVPrintfW", "StringValidateDestAndLengthW",
+                "StringCchCatW", "StringCbLengthW",
+            };
+            if (strsafe_no_link.count(fname)) user_mode_export = false;
+        }
         if (user_mode_export)
         {
             std::string decl_cc = "__stdcall";
             switch (type.calling_convention) { case 1: decl_cc = "__cdecl"; break; case 3: decl_cc = "__thiscall"; break; case 4: decl_cc = "__fastcall"; break; }
-            w.write("export extern \"C\" % % %(%);\n", ret, decl_cc, fname, params);
+            // CRT row: alias the std-visible declaration (see
+            // crt_global_alias) instead of redeclaring it extern "C".
+            if (crt_global_alias(fname))
+                w.write("export using ::%;\n", fname);
+            else
+                w.write("export extern \"C\" % % %(%);\n", ret, decl_cc, fname, params);
             w.write("// Import library: %\n", type.import_library);
             if (type.last_error) w.write("// SetLastError: true\n");
             w.write("\n");
@@ -1975,6 +2109,35 @@ export int run(int const, char**)
             ns_order.reserve(metadata.namespaces().size());
             for (auto const& [ns, info] : metadata.namespaces())
                 ns_order.emplace_back(ns, &info);
+
+            // Umbrella-prefix sanity check. Entries are raw string prefixes
+            // (see the filter in ns_worker below), so a single root name in
+            // the list ("Windows", which prefix-matches Windows.Wdk, Windows.UI,
+            // ... every namespace) silently swallows the whole list and the
+            // run emits all modules — indistinguishable from a broken filter.
+            // Count each entry's namespace hits and shout when one looks like
+            // an umbrella covering a majority of the tree while the caller
+            // clearly asked for a scoped subset.
+            if (!settings.module_include.empty())
+            {
+                std::size_t total_ns = ns_order.size();
+                for (auto const& inc : settings.module_include)
+                {
+                    std::size_t hits = 0;
+                    for (auto const& [ns, info] : ns_order)
+                    {
+                        (void)info;
+                        if (ns.starts_with(inc)) ++hits;
+                    }
+                    if (settings.module_include.size() > 1 && hits * 2 > total_ns)
+                    {
+                        std::printf("cppwinc : warning: -module_include entry '%s' matches %zu of %zu namespaces "
+                                    "(prefix match) and swallows the rest of the list; use the exact "
+                                    "namespace(s) you meant\n",
+                                    inc.c_str(), hits, total_ns);
+                    }
+                }
+            }
 
             // -module_include entries are namespace PREFIXES, matching -include/
             // -exclude (matches() uses starts_with) and the help examples
@@ -3708,6 +3871,7 @@ export int run(int const, char**)
                     if (!in_projection(*t)) continue;
                     std::string underlying = enum_underlying_cpp(t->enum_underlying);
                     if (underlying.empty()) underlying = "std::int32_t";
+                    w.write("#undef %\n", t->name);
                     w.write("export enum class % : %;\n", t->name, underlying);
                 }
                 for (auto const* t : info.structs)
@@ -3786,6 +3950,7 @@ export int run(int const, char**)
                         if (!in_projection(*t)) continue;
                         std::string underlying = enum_underlying_cpp(t->enum_underlying);
                         if (underlying.empty()) underlying = "std::int32_t";
+                        w.write("#undef %\n", t->name);
                         w.write("export enum class % : %;\n", t->name, underlying);
                     }
                     for (auto const* t : nit->second.interfaces)
@@ -6152,9 +6317,38 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
                             // every CamelCase .Lib attribution (RpcRT4.Lib…).
                             std::string tail = lib.size() >= 4 ? lib.substr(lib.size() - 4) : lib;
                             for (auto& c : tail) c = (char)std::tolower((unsigned char)c);
-                            if (lib.size() > 4 && (tail == ".dll" || tail == ".exe"))
+                            if (lib.size() > 4 && (tail == ".dll" || tail == ".exe" || tail == ".drv"))
                                 lib = lib.substr(0, lib.size() - 4) + ".lib";
                             else if (tail != ".lib") continue;
+                            // Same alias as probe_sdk_lib_dir: the WDK CRT
+                            // headers attribute to ucrtbase.dll, whose import
+                            // library the SDK ships as ucrt.lib. Spelled out
+                            // here so the attribution links explicitly instead
+                            // of falling back to the ambient default-lib set.
+                            if (lib == "ucrtbase.lib") lib = "ucrt.lib";
+                            // Static CRT archives are link-line poison for
+                            // this driver's /MD model: some C-runtime rows
+                            // carry a static attribution (libucrt.lib,
+                            // ntstc_libcmt.lib) and passing the archive next
+                            // to /MD's ucrt.lib import library redefines the
+                            // whole CRT surface (LNK2005 exit/_c_exit/wcslen
+                            // ... already defined). The default-lib set the
+                            // /MD compile already pulled in resolves every
+                            // ucrt-attributed symbol, so skip them.
+                            {
+                                std::string lower = lib;
+                                for (auto& c : lower) c = (char)std::tolower((unsigned char)c);
+                                static const std::set<std::string> static_crt_libs = {
+                                    "libucrt.lib", "libucrtd.lib", "libcmt.lib", "libcmtd.lib",
+                                    "libcpmt.lib", "libcpmtd.lib", "ntstc_libcmt.lib", "libcntpr.lib",
+                                };
+                                if (static_crt_libs.count(lower))
+                                {
+                                    if (settings.verbose)
+                                        std::printf("  [link] skip static CRT lib %s (/MD defaults already provide it)\n", lib.c_str());
+                                    continue;
+                                }
+                            }
                             // SDK revisions retire import libraries (combase.lib
                             // was folded into windowsapp.lib in newer kits): an
                             // attribution naming a library the link cannot open is
