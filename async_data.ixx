@@ -376,17 +376,17 @@ namespace cppwinc::strings
 
         export inline void check_sta_blocking_wait()
         {
-            // Header-free: APTTYPE is an int enum — 0=STA, 3=MAINSTA,
-            // 1=MTA (matches the SDK's objidl.h). CoGetApartmentType comes
-            // from the winversec-projected Com module (raw void* ABI).
-            // APTTYPE_MTA = 1
-            std::int32_t apt_type = 1;
-            std::int32_t apt_qualifier = 0;
+            // Header-free: APTTYPE/APTTYPEQUALIFIER are typed enums in the
+            // current projection (older metadata projected them as void*).
+            // The parameter types are deduced from the projected declaration
+            // so both generations compile. The check keeps its historical
+            // convention: APTTYPE_MTA = 1, STA = 0, MAINSTA = 3.
             namespace com_ns = Windows::Win32::Com;
-            // STA = 0, MAINSTA = 3
-            if (com_ns::CoGetApartmentType(reinterpret_cast<void**>(&apt_type),
-                    reinterpret_cast<void**>(&apt_qualifier)) >= 0
-                && (apt_type == 0 || apt_type == 3))
+            using apt_sig = winrt_ptype2<decltype(com_ns::CoGetApartmentType)>;
+            typename apt_sig::a apt_type{};
+            typename apt_sig::b apt_qualifier{};
+            if (com_ns::CoGetApartmentType(&apt_type, &apt_qualifier) >= 0
+                && (static_cast<std::int32_t>(apt_type) == 0 || static_cast<std::int32_t>(apt_type) == 3))
             {
                 throw hresult_error(hr_illegal_method_call, L"A blocking wait on a single-threaded apartment would deadlock.");
             }

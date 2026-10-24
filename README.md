@@ -45,7 +45,8 @@ and correct calling conventions.
   and every Win32 function, struct, enum, constant, COM interface, callback,
   and handle type is projected as a type-safe C++23 module — with full
   SAL-derived buffer semantics, IOCTL structured expansion, import library
-  attribution, and A/W suffix resolution already embedded in the metadata.
+  attribution, and A/W suffix resolution (unsuffixed canonical forwarders
+  to the W variant, emitted by `cppwinc`).
 - **Driver API projection from winversec `.winmd`.** Feed it
   `Windows.Wdk.winmd` or `Windows.Win32+Wdk.winmd` and kernel-mode APIs
   (KMDF, UMDF, WDM, NDIS, storport, miniport, WDF framework) are projected
@@ -92,12 +93,26 @@ import winrt.Windows.Storage;
 using namespace winrt;
 using namespace winrt::Windows::Foundation;
 using namespace winrt::Windows::Storage;
+using namespace winrt::Windows::Storage::Streams;
 
 int main() {
     auto file = StorageFile::GetFileFromPathAsync(L"data.txt").get();
     auto stream = file.OpenReadAsync().get();
-    auto reader = DataReader(stream);
-    reader.LoadAsync(1024).get();
+
+    // OpenReadAsync yields IRandomAccessStreamWithContentType; DataReader's
+    // constructor wants IInputStream - query the inherited interface.
+    void* raw_in = nullptr;
+    winrt::check_hresult(winrt::impl::query_interface(stream.get_abi(), winrt::iid_of<IInputStream>, &raw_in));
+    DataReader reader = DataReader::from_abi(raw_in);
+
+    // DataReaderLoadOperation is a runtime class over the generic
+    // IAsyncOperation<uint32>; query it to block on completion.
+    auto load = reader.LoadAsync(1024);
+    void* raw_load = load.iface<IAsyncOperation<std::uint32_t>>();
+    IUnknown::addref_raw(raw_load);
+    IAsyncOperation<std::uint32_t> load_op = IAsyncOperation<std::uint32_t>::from_abi(raw_load);
+    load_op.get();
+
     auto text = reader.ReadString(reader.UnconsumedBufferLength());
     std::wcout << std::wstring(text) << std::endl;
 }
@@ -112,21 +127,27 @@ import winrt.Windows.Foundation;
 import winrt.Windows.Foundation.Collections;
 
 using namespace winrt;
+using namespace winrt::Windows::Foundation;
 using namespace winrt::Windows::Foundation::Collections;
 
 int main() {
+    // PropertySet is a runtime class; its default interface is the generic
+    // IMap<hstring, IInspectable>, queried out of the class wrapper.
     PropertySet props;
-    props.Insert(L"Width", IInspectable(box_value(800)));
-    props.Insert(L"Height", IInspectable(box_value(600)));
-    props.Insert(L"Title", IInspectable(box_value(L"App")));
+    void* raw = props.iface<IMap<hstring, IInspectable>>();
+    IUnknown::addref_raw(raw);
+    auto map = IMap<hstring, IInspectable>::from_abi(raw);
 
-    for (auto const& [key, value] : props) {
-        auto boxed = value.try_unbox<int32_t>();
-        if (boxed)
-            std::wcout << key << L" = " << *boxed << std::endl;
-        else
-            std::wcout << key << L" = (string)" << std::endl;
-    }
+    map.Insert(L"Width", IInspectable(box_value(800)));
+    map.Insert(L"Height", IInspectable(box_value(600)));
+    map.Insert(L"Title", IInspectable(box_value(hstring(L"CppWinC"))));
+
+    std::cout << "Width = " << unbox_value<int32_t>(map.Lookup(L"Width")) << std::endl;
+    std::cout << "Height = " << unbox_value_at<int32_t>(map, L"Height") << std::endl;
+    std::wcout << L"Title = " << std::wstring(unbox_value<hstring>(map.Lookup(L"Title"))) << std::endl;
+
+    map.Remove(L"Title");
+    std::cout << "size after Remove: " << map.get_Size() << std::endl;
 }
 ```
 
@@ -137,16 +158,15 @@ import std;
 import winrt_base;
 import winrt.Windows.Foundation;
 
-using namespace winrt;
-using namespace winrt::Windows::Foundation;
-
-IAsyncOperation<int> compute_async() {
-    co_await winrt::resume_background();
+// Coroutines return cancellable operations, wrapped into the projected
+// async interface at the API boundary.
+winrt::impl::cancellable_async_operation<int> compute_async() {
+    co_await winrt::impl::resume_background();
     co_return 42;
 }
 
 int main() {
-    auto result = compute_async().get();
+    int result = winrt::attach_cancellable(compute_async()).get();
     std::cout << "Result: " << result << std::endl;
 }
 ```
@@ -158,7 +178,8 @@ int main() {
 and generates type-safe C++23 module projections for all Win32 APIs.
 
 Win32 modules import **no runtime** — plain C++ types with `extern "C"`
-linkage, `__stdcall` calling conventions, and RAII handle wrappers.
+linkage, `__stdcall` calling conventions, and `void*` handles (ownership
+stays with the caller).
 
 ### What is projected
 
@@ -166,7 +187,7 @@ linkage, `__stdcall` calling conventions, and RAII handle wrappers.
 |---|---|---|
 | **File system** | `CreateFile`, `ReadFile`, `WriteFile`, `FindFirstFile` | `Windows.Win32.Storage.FileSystem` |
 | **Registry** | `RegOpenKeyEx`, `RegQueryValueEx`, `RegSetValueEx` | `Windows.Win32.System.Registry` |
-| **Window management** | `CreateWindowEx`, `DefWindowProc`, `GetMessage` | `Windows.Win32.WINUSER` |
+| **Window management** | `CreateWindowEx`, `DefWindowProc`, `GetMessage` | `Windows.Win32.UI.WindowsAndMessaging` |
 | **GDI** | `BitBlt`, `CreateSolidBrush`, `TextOut` | `Windows.Win32.Graphics.Gdi` |
 | **Direct3D 11/12** | `D3D11CreateDevice`, `D3D12CreateDevice` | `Windows.Win32.Graphics.Direct3D11` |
 | **COM** | `CoInitializeEx`, `CoGetMalloc`, `CreateStreamOnHGlobal` | `Windows.Win32.Com` |
@@ -179,14 +200,23 @@ linkage, `__stdcall` calling conventions, and RAII handle wrappers.
 
 ### Projection semantics
 
-- **Handle wrappers.** `HANDLE`, `HWND`, `HKEY`, `HMODULE`, `SC_HANDLE`,
-  `SOCKET` and 20+ handle types project as typed RAII wrappers.
+- **Handles.** `HANDLE`, `HWND`, `HKEY`, `HMODULE`, `SC_HANDLE`, `SOCKET`
+  and friends flatten to `void*` — pass raw pointers and release with the
+  projected `CloseHandle`/`RegCloseKey`-style functions.
 - **Buffer marshaling.** SAL annotations drive automatic buffer marshaling.
 - **Calling convention.** `WINAPI`/`CALLBACK`/`cdecl`/`stdcall` projected
   as `__stdcall`, `__cdecl`, etc.
-- **Import library.** `DllImport`/`ImportLibrary` tell the linker which
-  `.lib` or `.dll` to use.
-- **A/W resolution.** `CreateFileA`/`CreateFileW` resolve to `CreateFile`.
+- **Import library.** `DllImport`/`ImportLibrary` is recorded on every
+  `extern "C"` declaration as a `// Import library:` attribution, and
+  `-compile` quick-tests read those attributions to link the right `.lib`s
+  automatically.
+- **A/W resolution.** every `FooA`/`FooW` pair gets an unsuffixed
+  `export inline` canonical `Foo` that forwards to the W (Unicode) variant —
+  `CreateFile`, `RegOpenKeyEx`, `RegisterClass`. String parameters are
+  re-spelled `wchar_t const*`/`wchar_t*` in the canonical, so `L"..."`
+  arguments bind directly. Where the metadata already synthesized a stub
+  canonical (`GetMessage`), the stub is dropped and the forwarder takes its
+  place.
 - **EnumFlags.** Bitmask enums get `|`, `&`, `~`, `|=`, `&=` operators.
 - **StructLayout/Union.** Sequential, explicit, and union layouts with
   custom packing projected with correct memory layout.
@@ -197,17 +227,23 @@ linkage, `__stdcall` calling conventions, and RAII handle wrappers.
 ```cpp
 import std;
 import Windows.Win32.Storage.FileSystem;
+import Windows.Win32.System;
+import Windows.Win32.Foundation;
 
 int main() {
     using namespace Windows::Win32::Storage::FileSystem;
+    using namespace Windows::Win32::System::SystemServices;
 
-    auto file = CreateFile(L"data.txt", GENERIC_READ, FILE_SHARE_READ,
-        nullptr, OPEN_EXISTING, 0, nullptr);
+    // The canonical CreateFile forwards to CreateFileW, so L"..." binds
+    // to wchar_t const* directly. Win32 constants project as inline
+    // constexpr values in their metadata namespaces.
+    void* file = CreateFile(L"data.txt", GENERIC_READ, FILE_SHARE_READ,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 
     char buf[4096]{};
-    DWORD bytesRead = 0;
-    ReadFile(file.get(), buf, sizeof(buf), &bytesRead, nullptr);
-    CloseHandle(file.get());
+    std::uint32_t bytesRead = 0;
+    ReadFile(file, buf, sizeof(buf), &bytesRead, nullptr);
+    Windows::Win32::Foundation::CloseHandle(file);
 
     std::cout << "Read " << bytesRead << " bytes" << std::endl;
 }
@@ -216,18 +252,24 @@ int main() {
 ### Example — Win32 registry
 
 ```cpp
+import std;
 import Windows.Win32.System.Registry;
+import Windows.Win32.System;
 
 int main() {
     using namespace Windows::Win32::System::Registry;
+    using namespace Windows::Win32::System::SystemServices; // KEY_READ, REG_OPTION_NON_VOLATILE
 
-    HKEY key = nullptr;
-    RegOpenKeyEx(HKEY_CURRENT_USER, L"Software\\MyApp", 0, KEY_READ, &key);
+    // Predefined root keys and access masks project as inline constexpr
+    // values (HKEY_CURRENT_USER == 0x80000001, KEY_READ == 0x00010000).
+    void* hkey_current_user = reinterpret_cast<void*>(static_cast<std::uintptr_t>(HKEY_CURRENT_USER));
+    void* key = nullptr;
+    RegOpenKeyEx(hkey_current_user, L"Software\\MyApp", REG_OPTION_NON_VOLATILE, KEY_READ, &key);
 
     char value[256]{};
-    DWORD size = sizeof(value);
+    std::uint32_t size = sizeof(value);
     RegQueryValueEx(key, L"InstallPath", nullptr, nullptr,
-        reinterpret_cast<BYTE*>(value), &size);
+        reinterpret_cast<std::uint8_t*>(value), &size);
     RegCloseKey(key);
 }
 ```
@@ -235,12 +277,17 @@ int main() {
 ### Example — Win32 window creation
 
 ```cpp
-import Windows.Win32.WINUSER;
+import std;
+import Windows.Win32.UI.WindowsAndMessaging;
 import Windows.Win32.Graphics.Gdi;
 
-using namespace Windows::Win32::WINUSER;
+using namespace Windows::Win32::UI::WindowsAndMessaging;
+using namespace Windows::Win32::Graphics::Gdi;
 
-LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+// Handle/scalar aliases are flattened: HWND is void*, WPARAM is uint64_t,
+// LRESULT is int64_t. WNDCLASSW lives under its metadata name tagWNDCLASSW
+// with void* fields, and WNDPROC is the function-pointer type to cast to.
+std::int64_t __stdcall WndProc(void* hwnd, std::uint32_t msg, std::uint64_t wp, std::int64_t lp) {
     switch (msg) {
     case WM_DESTROY:
         PostQuitMessage(0);
@@ -250,19 +297,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 int main() {
-    WNDCLASSW wc{};
-    wc.lpfnWndProc = WndProc;
-    wc.lpszClassName = L"Win32App";
-    wc.hbrBackground = reinterpret_cast<HBRUSH>(GetStockObject(WHITE_BRUSH));
+    tagWNDCLASSW wc{};
+    wc.lpfnWndProc = reinterpret_cast<WNDPROC>(WndProc);
+    wc.lpszClassName = (void*)L"Win32App";
+    wc.hbrBackground = GetStockObject(WHITE_BRUSH);
     RegisterClass(&wc);
 
-    HWND hwnd = CreateWindowEx(0, L"Win32App", L"Hello Win32",
-        WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
-        800, 600, nullptr, nullptr, GetModuleHandle(nullptr), nullptr);
+    void* hwnd = CreateWindowEx(WS_EX_OVERLAPPEDWINDOW, L"Win32App", L"Hello Win32",
+        WS_OVERLAPPEDWINDOW, static_cast<std::int32_t>(CW_USEDEFAULT),
+        static_cast<std::int32_t>(CW_USEDEFAULT), 800, 600, nullptr, nullptr, nullptr, nullptr);
 
     ShowWindow(hwnd, SW_SHOW);
 
-    MSG msg{};
+    tagMSG msg{};
     while (GetMessage(&msg, nullptr, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
@@ -305,30 +352,41 @@ trees (`Include\wdf\{kmdf,umdf}`: `WdfDeviceCreate` and friends).
 ### Example — Type-safe integer conversions (BASETSD)
 
 ```cpp
+import std;
 import Windows.Wdk.BASETSD;
 
-using namespace Windows::Wdk::BASETSD;
+int main() {
+    using namespace Windows::Wdk::BASETSD;
 
-void* handle = /* ... */;
-int32_t value = HandleToLong(handle);
-void* restored = LongToHandle(value);
+    void* handle = nullptr;
+    std::int32_t value = HandleToLong(handle);
+    void* restored = LongToHandle(value);
 
-uintptr_t ptr = /* ... */;
-int32_t as_int = PtrToInt(ptr);
-void* from_int = IntToPtr(as_int);
+    // PtrToInt/IntToPtr work on void* in this projection.
+    void* ptr = nullptr;
+    std::int32_t as_int = PtrToInt(ptr);
+    void* from_int = IntToPtr(as_int);
+    (void)restored; (void)from_int;
+}
 ```
 
 ### Example — String safety (STRSAFE)
 
 ```cpp
+import std;
 import Windows.Wdk.STRSAFE;
 
-using namespace Windows::Wdk::STRSAFE;
+int main() {
+    using namespace Windows::Wdk::STRSAFE;
 
-char dest[256]{};
-const char* src = "Hello, kernel!";
-StringCbCopy(dest, sizeof(dest), src);
-StringCatN(dest, sizeof(dest), " suffix", 7);
+    // The A/W canonicals take the W (wchar_t) spellings: destination
+    // buffer, its size, and a mutable source string.
+    wchar_t dest[256]{};
+    wchar_t src[] = L"Hello from CppWinC";
+    StringCchCopy(dest, 256, src);
+    StringCbCopy(dest, sizeof(dest), src);
+    std::wcout << dest << std::endl;
+}
 ```
 
 ### Example — Network extensions (PACKET / RING)
@@ -347,33 +405,43 @@ using namespace Windows::Wdk::RING;
 ### Example — RPC client (RPCDCE)
 
 ```cpp
+import std;
 import Windows.Wdk.RPCDCE;
+import Windows.Wdk.RPC;
+import Windows.Wdk.RPCNTERR;
 
-using namespace Windows::Win32::RPCDCE;
+int main() {
+    using namespace Windows::Wdk::RPCDCE;
+    using namespace Windows::Wdk::RPC;
+    using namespace Windows::Wdk::RPCNTERR;
 
-RPC_BINDING_BINDING binding = nullptr;
-RPC_STATUS status = RpcBindingFromStringBinding(
-    L"ncalrpc:[endpoint]", &binding);
-if (status == 0) {
-    // Use binding...
-    RpcBindingFree(&binding);
+    RPC_BINDING_HANDLE binding = nullptr;
+    // RPC_STATUS projects as std::int32_t, RPC_BINDING_HANDLE as void*;
+    // the unsuffixed RpcBindingFromStringBinding is the metadata canonical.
+    RPC_STATUS status = RpcBindingFromStringBinding(
+        reinterpret_cast<std::uint8_t*>(const_cast<char*>("ncalrpc:[endpoint]")), &binding, nullptr);
+    if (status == RPC_S_OK) {
+        RpcBindingFree(nullptr, &binding);
+    }
 }
 ```
 
 ### Example — TPM base services (TBS)
 
 ```cpp
+import std;
 import Windows.Wdk.TBS;
 
-using namespace Windows::Wdk::TBS;
+int main() {
+    using namespace Windows::Wdk::TBS;
 
-TBS_HCONTEXT context = 0;
-TBS_CONTEXT_PARAMS2 params{};
-params.version = 2;
-params.requestedExecution = TBS_COMMAND_LOCALITY_ZERO;
-TBSi_Context_Create(&params, &context);
-// Submit TPM commands...
-Tbsip_Context_Close(context);
+    void* context = nullptr;
+    tdTBS_CONTEXT_PARAMS params{};
+    params.version = 2;
+    Tbsi_Context_Create(&params, &context); // note: projected name is Tbsi_, not the TBSi_ macro alias
+    // Submit TPM commands...
+    Tbsip_Context_Close(context);
+}
 ```
 
 ## Combined WinUI 3 + WinRT + Win32 + WDK
@@ -395,28 +463,29 @@ import std;
 import winrt_base;
 import winrt.Windows.Foundation;
 import Windows.Win32.Storage.FileSystem;
+import Windows.Win32.System;
+import Windows.Win32.Foundation;
 
-using namespace winrt;
-using namespace winrt::Windows::Foundation;
+// The projection's coroutine machinery: a cancellable coroutine wrapped into
+// the projected IAsyncAction interface at the API boundary.
+winrt::impl::cancellable_async_action SaveDataAsync(std::wstring const& path, std::string const& data) {
+    co_await winrt::impl::resume_background();
 
-IAsyncAction SaveDataAsync(std::wstring const& path, std::string const& data) {
-    co_await winrt::resume_background();
+    using namespace ::Windows::Win32::Storage::FileSystem;
+    using namespace ::Windows::Win32::System::SystemServices;
+    void* file = CreateFile(path.c_str(), GENERIC_WRITE, 0,
+        nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == reinterpret_cast<void*>(static_cast<std::intptr_t>(-1))) co_return; // INVALID_HANDLE_VALUE
 
-    using namespace Windows::Win32::Storage::FileSystem;
-    auto file = CreateFile(path.c_str(), GENERIC_WRITE, 0,
-        nullptr, CREATE_ALWAYS, 0, nullptr);
-
-    if (file.get() == INVALID_HANDLE_VALUE) co_return;
-
-    DWORD written = 0;
-    WriteFile(file.get(), data.c_str(), static_cast<DWORD>(data.size()),
+    std::uint32_t written = 0;
+    WriteFile(file, (void*)data.c_str(), static_cast<std::uint32_t>(data.size()),
         &written, nullptr);
-    CloseHandle(file.get());
+    ::Windows::Win32::Foundation::CloseHandle(file);
     co_return;
 }
 
 int main() {
-    auto action = SaveDataAsync(L"output.txt", "Hello from CppWinC!");
+    auto action = winrt::attach_cancellable(SaveDataAsync(L"output.txt", "Hello from CppWinC!"));
     action.get();
 }
 ```
@@ -430,16 +499,17 @@ import Windows.Wdk.BASETSD;
 
 void inspect_device_state() {
     using namespace Windows::Win32::System::Threading;
-    DWORD pid = GetCurrentProcessId();
+    std::uint32_t pid = GetCurrentProcessId();
     std::cout << "PID: " << pid << std::endl;
 }
 
 // WDK type conversions are available from Windows.Wdk.BASETSD
 void convert_handles() {
     using namespace Windows::Wdk::BASETSD;
-    void* handle = /* ... */;
-    int32_t value = HandleToLong(handle);
+    void* handle = nullptr;
+    std::int32_t value = HandleToLong(handle);
     void* restored = LongToHandle(value);
+    (void)restored;
 }
 ```
 
@@ -793,14 +863,15 @@ Everything an app needs beyond the metadata projection lives in
   A delegate is a `com_ptr` wrapping a callback; the projection generates
   a `call()` method and comparison operators.
 - **Coroutines.**
-  - `IAsyncAction` — coroutine type for async operations with no return value.
-  - `IAsyncOperation<T>` — coroutine type for async operations returning `T`.
-  - `IAsyncActionWithProgress<P>` / `IAsyncOperationWithProgress<T,P>` —
-    progress-reporting variants.
-  - `resume_background()` — resumes coroutine on a thread-pool thread.
-  - ` resume_after(duration)` — resumes after a time delay.
-  - ` single_threaded_observable_vector<T>()` — creates an observable vector.
+  - Coroutines return `winrt::impl::cancellable_async_action` /
+    `cancellable_async_operation<T>`; `winrt::attach_cancellable(...)` wraps
+    them into the projected `IAsyncAction` / `IAsyncOperation<T>` (whose
+    `.get()` blocks for a result).
+  - `winrt::impl::resume_background()` — resumes the coroutine on a
+    thread-pool thread.
   - Full `co_await` support: `auto x = co_await async_op;` works seamlessly.
+  - `fire_and_forget` — fire-and-forget coroutine return type.
+  - `winrt::when_all(...)` / `winrt::when_any(...)` — async combinators.
 - **Boxing / unboxing.**
   - `box_value(T)` — boxes a value type into `IInspectable`.
   - `unbox_value<T>(IInspectable)` — unboxes back to `T`.
@@ -816,13 +887,12 @@ Everything an app needs beyond the metadata projection lives in
   - `winrt::hresult_access_denied`, `hresult_invalid_argument`, etc. —
     typed exception classes for common error codes.
 - **Collections.**
-  - `single_threaded_vector<T>()` — creates `IVector<T>`.
-  - `single_threaded_observable_vector<T>()` — creates
-    `IObservableVector<T>`.
-  - `single_threaded_map<K,V>()` — creates `IMap<K,V>`.
-  - `single_threaded_threadsafe_map<K,V>()` — thread-safe variant.
-  - `single_threaded_vector_view<T>(vector<T>)` — creates `IVectorView<T>`.
-  - `single_threaded_map_view<K,V>(map)` — creates `IMapView<K,V>`.
+  - `single_threaded_vector<T>()` / `single_threaded_observable_vector<T>()`
+    — creates `IObservableVector<T>`.
+  - `single_threaded_map<K,V>()` / `single_threaded_observable_map<K,V>()`
+    — creates `IObservableMap<K,V>`.
+  - `unbox_value_at<T>(map, key)` — reads a boxed value out of an
+    `IMap<hstring, IInspectable>` by key.
   - `IReserveableVector<T>` — capacity-reservation extension of `IVector<T>`;
     an extension interface not defined by Microsoft (no official WinRT
     surface ships it). Every vector the runtime creates (`single_threaded_vector`,

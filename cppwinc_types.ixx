@@ -100,6 +100,14 @@ std::vector<std::string> mangle_ns_segments(std::string const& ns)
 inline bool win32_handle_alias(std::string_view name)
 {
     if (name.empty()) return false;
+    // HRESULT is the ONE H-prefixed SCALAR (typedef long HRESULT) — not a
+    // handle. The H* heuristic below exists for DECLARE_HANDLE opaque
+    // pointers (HWND, HINSTANCE, ...); without this guard it swallowed
+    // HRESULT too, so the AliasTarget=I4 on the winmd row was discarded
+    // (`at_code && !win32_handle_alias(name)`) and every module emitted
+    // `using HRESULT = void*;` instead of std::int32_t — while NTSTATUS/
+    // LONG/RPC_STATUS (no H prefix) projected correctly.
+    if (name == "HRESULT") return false;
     if (name.starts_with("H")) return true;  // HINSTANCE, HWND, HMENU, ...
     static const std::set<std::string_view, std::less<>> aliases = {
         "HANDLE", "SC_HANDLE", "SOCKET", "HINTERNET", "HCRYPTPROV",
@@ -480,6 +488,15 @@ std::string module_name_for_namespace(std::string const& ns)
 std::set<winmd::type_info const*> g_type_closure;
 bool g_type_closure_active = false;
 
+// Namespaces pulled into the selection by the transitive-closure pass
+// (-include / -module_include, see cppwinc_driver.ixx). in_projection()
+// prunes TYPES by the raw -include prefixes, which would leave every
+// pulled dependency namespace EMPTY — the module gets emitted but none of
+// its types survive (C2039 "'POINTL' is not a member of
+// 'Windows::Win32::WINDEF'" for a Gdi-only include). The closure stamps
+// each namespace it pulls in here so those types stay in the projection.
+std::set<std::string, std::less<>> g_closure_namespaces;
+
 bool in_projection(winmd::type_info const& type)
 {
     if (type.internal_)
@@ -495,7 +512,8 @@ bool in_projection(winmd::type_info const& type)
         return false;
     }
     std::string full = type.full_name();
-    if (!settings.include.empty() && !matches(settings.include, full))
+    if (!settings.include.empty() && !matches(settings.include, full)
+        && !g_closure_namespaces.contains(type.ns))
     {
         return false;
     }

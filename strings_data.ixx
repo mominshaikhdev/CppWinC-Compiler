@@ -45,6 +45,11 @@ import Windows.Win32.ACTIVATION;
 import Windows.Win32.Com;
 import Windows.Win32.ERRHANDLINGAPI;
 import Windows.Win32.Foundation;
+// FILETIME and friends: the body below spells Windows::Win32::LMACCESS::FILETIME
+// (the owner namespace winversec attributes FILETIME to), so the module must be
+// imported or every use fails with C2039. Kept even when the projection has no
+// LMACCESS namespace: write_output_file remaps it to the SCC owner when one exists.
+import Windows.Win32.LMACCESS;
 import Windows.Win32.ROAPI;
 import Windows.Win32.ROERRORAPI;
 import Windows.Win32.STRINGAPISET;
@@ -4898,6 +4903,20 @@ com_ns::CoTaskMemFree(m_data);
 
     // chrono
 
+    // The projected Win32 parameter types move between metadata generations:
+    // FILETIME was owned by Windows::Win32::LMACCESS in older winmds and by
+    // Windows::Wdk::MINWINDEF in the current one, and APTTYPE projected as
+    // void* then as a typed enum. Deduce the exact types straight off the
+    // projected declarations so this template survives any regrouping of
+    // the winmd's SCC owners. (x64: __stdcall is ignored, so the plain
+    // function-pointer spellings below match the projected signatures.)
+    template <typename F> struct winrt_ptype1;
+    template <typename R, typename P> struct winrt_ptype1<R(P*)> { using type = P; };
+    template <typename R, typename P> struct winrt_ptype1<R(*)(P*)> { using type = P; };
+    template <typename F> struct winrt_ptype2;
+    template <typename R, typename A, typename B> struct winrt_ptype2<R(A*, B*)> { using a = A; using b = B; };
+    template <typename R, typename A, typename B> struct winrt_ptype2<R(*)(A*, B*)> { using a = A; using b = B; };
+
     export struct clock
     {
         using duration = std::chrono::duration<std::int64_t, std::ratio<1, 10'000'000>>;
@@ -4909,7 +4928,7 @@ com_ns::CoTaskMemFree(m_data);
         static time_point now() noexcept
         {
             namespace sys_ns = Windows::Win32::SYSINFOAPI;
-            using file_time_abi = Windows::Win32::LMACCESS::FILETIME;
+            using file_time_abi = typename winrt_ptype1<decltype(sys_ns::GetSystemTimePreciseAsFileTime)>::type;
             file_time_abi ft{};
             sys_ns::GetSystemTimePreciseAsFileTime(&ft);
             return time_point(duration(((std::int64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime));
@@ -4918,15 +4937,18 @@ com_ns::CoTaskMemFree(m_data);
 
     export using file_time = clock::time_point;
 
-    export inline file_time from_file_time(Windows::Win32::LMACCESS::FILETIME const& value) noexcept
+    // FILETIME exactly as the projection spells it for GetSystemTimePreciseAsFileTime.
+    using file_time_abi = typename winrt_ptype1<decltype(Windows::Win32::SYSINFOAPI::GetSystemTimePreciseAsFileTime)>::type;
+
+    export inline file_time from_file_time(file_time_abi const& value) noexcept
     {
         return file_time(clock::duration(((std::int64_t)value.dwHighDateTime << 32) | value.dwLowDateTime));
     }
 
-    export inline Windows::Win32::LMACCESS::FILETIME to_file_time(file_time const& value) noexcept
+    export inline file_time_abi to_file_time(file_time const& value) noexcept
     {
         auto ticks = value.time_since_epoch().count();
-        Windows::Win32::LMACCESS::FILETIME result{};
+        file_time_abi result{};
         result.dwLowDateTime = (std::uint32_t)(ticks & 0xFFFFFFFF);
         result.dwHighDateTime = (std::uint32_t)(ticks >> 32);
         return result;
@@ -5422,12 +5444,17 @@ com_ns::CoTaskMemFree(m_data);
 
         export inline bool is_sta_thread() noexcept
         {
-            // APTTYPE is a plain C enum the winmd does not carry; its
-            // documented values are MTA=0, STA=1, NA=3, MAINSTA=2.
-            std::int32_t type = 0;
-            std::int32_t qualifier = 0;
-            return Windows::Win32::Com::CoGetApartmentType(reinterpret_cast<void**>(&type),
-                reinterpret_cast<void**>(&qualifier)) >= 0 && (type == 1 || type == 2);
+            // APTTYPE/APTTYPEQUALIFIER are typed enums in the current
+            // projection; the documented values are STA=1, MAINSTA=2
+            // (MTA=3, NA=4). The exact parameter types are deduced from the
+            // projected declaration so older (void*) and newer (enum) winmds
+            // both compile.
+            namespace com_ns = Windows::Win32::Com;
+            using apt_sig = winrt_ptype2<decltype(com_ns::CoGetApartmentType)>;
+            typename apt_sig::a type{};
+            typename apt_sig::b qualifier{};
+            return com_ns::CoGetApartmentType(&type, &qualifier) >= 0 &&
+                (static_cast<std::int32_t>(type) == 1 || static_cast<std::int32_t>(type) == 2);
         }
     }
 

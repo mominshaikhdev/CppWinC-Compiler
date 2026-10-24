@@ -755,6 +755,28 @@ static void write_win32_enum(writer& w, winmd::type_info const& type, type_mappe
         w.write("// IOCTL code: % (buffering method %)\n", type.ioctl_code, type.ioctl_buffering);
     std::string underlying = enum_underlying_cpp(type.enum_underlying);
     if (underlying.empty()) underlying = "std::int32_t";
+    // Singleton "const enums": winversec materializes every numeric #define
+    // constant (GENERIC_READ, KEY_READ, WM_DESTROY, the predefined HKEY_*
+    // roots, ...) as a one-member enum — the metadata-native constant shape.
+    // Render those as plain exported constants; an enum class whose only
+    // spelling would be GENERIC_READ::GENERIC_READ is unusable. IOCTL/IRP
+    // singletons keep their enum form (carrying the decode comments).
+    if (type.enum_fields.size() == 1 && type.enum_fields[0].first == type.name
+        && !type.ioctl_code && !type.has_irp_major_function)
+    {
+        // GENERIC_READ (0x80000000) and the predefined HKEY_* roots
+        // (0x80000001) don't fit the default int32 underlying — a literal
+        // wider than its declared type is ill-formed (C2397). The
+        // materializer tags every constant field U4, so widen when the
+        // value needs it.
+        std::string const_underst = underlying;
+        if (type.enum_fields[0].second > 2147483647LL ||
+            type.enum_fields[0].second < -2147483648LL)
+            const_underst = "std::uint32_t";
+        w.write("export inline constexpr % % = %;\n\n", const_underst,
+            mangle_enum_member(type.name), type.enum_fields[0].second);
+        return;
+    }
     w.write("export enum class % : %\n{\n", type.name, underlying);
     // Keep the first definition of each enumerator name. Some SDK headers
     // define the same enumerator twice (e.g. MSI's SCRIPTFLAGS_REGDATA_APPINFO
@@ -1206,7 +1228,95 @@ static void for_each_call_pattern(std::string const& line, F&& fn)
     }
 }
 
-static void write_win32_function(writer& w, winmd::type_info const& type, type_mapper const& mapper, winmd::metadata const&, std::set<std::string>& emitted)
+// One emitted function signature, retained for the A/W canonical pass.
+struct aw_fn_sig
+{
+    std::string ret;
+    std::string params_text;                                   // rendered "type name, ..."
+    std::vector<std::pair<std::string, std::string>> params;   // (type, name)
+    bool is_stub = false;                                      // deferred inline stub
+};// A/W canonical wrappers. The Windows SDK ships Unicode APIs as paired
+// FooA/FooW entry points; the projection emits both, so callers would have
+// to know the metadata's spelling to call anything. For every A/W pair in a
+// namespace, emit one unsuffixed wrapper that forwards to the W (Unicode)
+// variant — `CreateFile`, `RegOpenKeyEx`, `RegisterClass`. The wrapper is
+// `export inline`: a plain inline is invisible across the module boundary
+// and every consumer fails C3861.
+// Skipped when the canonical name is already a real function in the
+// namespace; a metadata-synthesized canonical STUB (winversec's GetMessage
+// `return {};`) does not count — the stub is suppressed below and the
+// forwarder takes its place.
+// String parameters keep a wide spelling in the canonical wrapper: the
+// metadata flattens LPCWSTR/LPTSTR parameters to void*, which a bare L"..."
+// argument does not convert to, so the wrapper takes wchar_t const* /
+// wchar_t* and casts at the forwarding call.
+// When emit_deferred_stubs is set (win32 writer, which defers its inline
+// stubs to here), every collected stub that no canonical replaced is
+// emitted after the canonicals, keeping its module-internal definition.
+static void write_aw_canonical(writer& w, std::string const& ns_cpp,
+    std::vector<std::pair<std::string, aw_fn_sig>> const& aw_fns,
+    bool emit_deferred_stubs = false)
+{
+    std::set<std::string> canonical_bases;
+    // Canonical wrappers are BUFFERED and flushed after the deferred stubs:
+    // a wrapper's qualified forward call (::Ns::FooW) needs FooW already
+    // declared in this module, and the deferred pass is what declares it
+    // (a bare forward before the declaration fails C2039 "not a member").
+    writer cw;
+    for (auto const& [a_name, a_sig] : aw_fns)
+    {
+        // Keyed on the A half: name must end in 'A' with a name char before.
+        if (a_name.size() < 2 || a_name.back() != 'A') continue;
+        if (!std::isalpha(static_cast<unsigned char>(a_name[a_name.size() - 2]))) continue;
+        std::string base = a_name.substr(0, a_name.size() - 1);
+        std::string wide_name = base + "W";
+        aw_fn_sig const* wide = nullptr;
+        for (auto const& [n, s] : aw_fns) if (n == wide_name) { wide = &s; break; }
+        if (!wide) continue;
+        bool canonical_taken = false;
+        for (auto const& [n, s] : aw_fns) if (n == base && !s.is_stub) { canonical_taken = true; break; }
+        if (canonical_taken) continue;
+        if (a_sig.ret != wide->ret) continue;
+        if (a_sig.params.size() != wide->params.size()) continue;
+
+        std::string cparams, cargs;
+        for (std::size_t i = 0; i < wide->params.size(); ++i)
+        {
+            std::string ptype = wide->params[i].first;
+            std::string const& atype = a_sig.params[i].first;
+            std::string const& pname = wide->params[i].second;
+            bool retyped = false;
+            // Narrow string in A + void* in W is the metadata's
+            // (narrow-string, wide-string) parameter pair — spell it wide.
+            if (ptype == "void*" && atype == "std::int8_t const*") { ptype = "wchar_t const*"; retyped = true; }
+            else if (ptype == "void*" && atype == "std::int8_t*") { ptype = "wchar_t*"; retyped = true; }
+            if (i) { cparams += ", "; cargs += ", "; }
+            cparams += ptype + " " + pname;
+            cargs += (retyped ? "(void*)" : "") + pname;
+        }
+        cw.write("// A/W canonical wrapper -> %\n", wide_name);
+        if (wide->ret == "void")
+            cw.write("export inline void % (%)\n{\n    ::%::%(%);\n}\n\n", base, cparams, ns_cpp, wide_name, cargs);
+        else
+            cw.write("export inline % % (%)\n{\n    return ::%::%(%);\n}\n\n", wide->ret, base, cparams, ns_cpp, wide_name, cargs);
+        canonical_bases.insert(base);
+    }
+    if (emit_deferred_stubs)
+    {
+        for (auto const& [n, s] : aw_fns)
+        {
+            if (!s.is_stub) continue;
+            if (canonical_bases.count(n)) continue;  // replaced by the forwarder
+            if (s.ret == "void")
+                w.write("export inline void % (%)\n{\n}\n\n", n, s.params_text);
+            else
+                w.write("export inline % % (%)\n{\n    return {};\n}\n\n", s.ret, n, s.params_text);
+        }
+    }
+    w.write("%", cw.str());
+}
+
+static void write_win32_function(writer& w, winmd::type_info const& type, type_mapper const& mapper, winmd::metadata const&, std::set<std::string>& emitted, std::vector<std::pair<std::string, aw_fn_sig>>& aw_acc)
 {
     if (type.methods.empty()) return;
     std::string cc = "__stdcall";
@@ -1226,11 +1336,14 @@ static void write_win32_function(writer& w, winmd::type_info const& type, type_m
         std::string ret = mapper.map(method.ret);
         std::string params;
         std::set<std::string> seen;
+        std::vector<std::pair<std::string, std::string>> sig_params;
         for (std::size_t p = 0; p < method.params.size(); ++p)
         {
             if (p) params += ", ";
             std::string pname = sanitize_param_name(method.params[p].name, seen);
-            params += param_type_cpp(mapper, method.params[p]) + " " + pname;
+            std::string ptype = param_type_cpp(mapper, method.params[p]);
+            params += ptype + " " + pname;
+            sig_params.push_back({ std::move(ptype), pname });
         }
         std::string sig_key = fname;
         if (!emitted.insert(sig_key).second) continue;
@@ -1239,27 +1352,20 @@ static void write_win32_function(writer& w, winmd::type_info const& type, type_m
         // after macro expansion the inline copy wins the row). A mapped
         // import library means the export exists - emit the extern decl so
         // consumers (winrt_base) link it, not the empty stub.
-        if (type.is_inline_function && type.import_library.empty())
-        {
-            // A void stub must not `return {};` (C2562 'void' function
-            // returning a value).
-            if (ret == "void")
-                w.write("inline % %(%)\n{\n}\n\n", ret, fname, params);
-            else
-                w.write("inline % %(%)\n{\n    return {};\n}\n\n", ret, fname, params);
-        }
-        else
-        {
-            // `export extern "C"`: without the export keyword the function
-            // declaration is not visible across the module boundary and every
-            // consumer fails with C3861 'identifier not found'.
-            w.write("export extern \"C\" % % %(%);\n", ret, cc, fname, params);
-            if (!type.import_library.empty()) w.write("// Import library: %\n", type.import_library);
-            if (type.last_error) w.write("// SetLastError: true\n");
-            if (type.callback_optional) w.write("// Optional callback parameter (may be nullptr)\n");
-            if (type.is_driver_dispatch) w.write("// DRIVER_DISPATCH callback\n");
-            w.write("\n");
-        }
+        bool is_stub = type.is_inline_function && type.import_library.empty();
+        aw_acc.push_back({ fname, { ret, params, std::move(sig_params), is_stub } });
+        // Deferred to the namespace-supplements pass: it emits the stub after
+        // the A/W canonical wrappers, which may replace it outright.
+        if (is_stub) continue;
+        // `export extern "C"`: without the export keyword the function
+        // declaration is not visible across the module boundary and every
+        // consumer fails with C3861 'identifier not found'.
+        w.write("export extern \"C\" % % %(%);\n", ret, cc, fname, params);
+        if (!type.import_library.empty()) w.write("// Import library: %\n", type.import_library);
+        if (type.last_error) w.write("// SetLastError: true\n");
+        if (type.callback_optional) w.write("// Optional callback parameter (may be nullptr)\n");
+        if (type.is_driver_dispatch) w.write("// DRIVER_DISPATCH callback\n");
+        w.write("\n");
     }
 }
 
@@ -1363,6 +1469,23 @@ static void write_wdk_enum(writer& w, winmd::type_info const& type, type_mapper 
         w.write("// IOCTL code: % (buffering method %)\n", type.ioctl_code, type.ioctl_buffering);
     std::string underlying = enum_underlying_cpp(type.enum_underlying);
     if (underlying.empty()) underlying = "std::int32_t";
+    // Singleton "const enums" -> exported constants (see write_win32_enum).
+    if (type.enum_fields.size() == 1 && type.enum_fields[0].first == type.name
+        && !type.ioctl_code && !type.has_irp_major_function)
+    {
+        // GENERIC_READ (0x80000000) and the predefined HKEY_* roots
+        // (0x80000001) don't fit the default int32 underlying — a literal
+        // wider than its declared type is ill-formed (C2397). The
+        // materializer tags every constant field U4, so widen when the
+        // value needs it.
+        std::string const_underst = underlying;
+        if (type.enum_fields[0].second > 2147483647LL ||
+            type.enum_fields[0].second < -2147483648LL)
+            const_underst = "std::uint32_t";
+        w.write("export inline constexpr % % = %;\n\n", const_underst,
+            mangle_enum_member(type.name), type.enum_fields[0].second);
+        return;
+    }
     w.write("export enum class % : %\n{\n", type.name, underlying);
     // Keep the first definition of each enumerator name. Some SDK headers
     // define the same enumerator twice (e.g. MSI's SCRIPTFLAGS_REGDATA_APPINFO
@@ -1450,7 +1573,57 @@ static void write_wdk_struct(writer& w, winmd::type_info const& type, type_mappe
     }
 }
 
-static void write_wdk_function(writer& w, winmd::type_info const& type, type_mapper const& mapper, winmd::metadata const&, std::set<std::string>& emitted)
+// Which SDK lib tree carries an import library — "um", "ucrt", "km", or
+// "" (not shipped by the SDK). Drives write_wdk_function's stub-vs-extern
+// decision: a lib found only under the kernel tree (ntoskrnl.lib,
+// storport.lib, wdfldr.lib) can never be linked into a user-mode binary —
+// importing a .sys/.exe image breaks the process load — while the WDK's
+// user-callable headers resolve to um/ libraries (rpcdce.h -> rpcrt4.lib,
+// tbs.h -> tbs.lib) that must link exactly like Win32. The attribution may
+// spell the DLL (wdfldr.dll), a driver image (ntoskrnl.exe) or the lib
+// itself (rpcrt4.lib); the lib stem is probed in all three spellings.
+// Cached per lib name; scans the newest SDK like the compile driver does.
+static std::string probe_sdk_lib_dir(std::string const& lib)
+{
+    static std::unordered_map<std::string, std::string> cache;
+    if (auto it = cache.find(lib); it != cache.end()) return it->second;
+    std::string result;
+    std::error_code ec;
+    std::filesystem::path kits;
+    if (const char* pf = std::getenv("ProgramFiles(x86)"))
+        kits = std::filesystem::path(pf) / "Windows Kits" / "10" / "Lib";
+    else if (const char* pf = std::getenv("ProgramFiles"))
+        kits = std::filesystem::path(pf) / "Windows Kits" / "10" / "Lib";
+    if (!kits.empty())
+    {
+        std::filesystem::path newest;
+        for (auto const& e : std::filesystem::directory_iterator(kits, ec))
+        {
+            if (!e.is_directory(ec)) continue;
+            std::string fname = e.path().filename().string();
+            if (fname.empty() || !std::isdigit(static_cast<unsigned char>(fname.front()))) continue;
+            if (newest.empty() || fname > newest.filename().string()) newest = e.path();
+        }
+        if (!newest.empty())
+        {
+            std::string name = lib;
+            auto dot = name.rfind('.');
+            std::string stem = (dot == std::string::npos) ? name : name.substr(0, dot);
+            for (auto const* sub : { "um", "ucrt", "km" })
+            {
+                if (std::filesystem::exists(newest / sub / "x64" / (stem + ".lib"), ec))
+                {
+                    result = sub;
+                    break;
+                }
+            }
+        }
+    }
+    cache.emplace(lib, result);
+    return result;
+}
+
+static void write_wdk_function(writer& w, winmd::type_info const& type, type_mapper const& mapper, winmd::metadata const&, std::set<std::string>& emitted, std::vector<std::pair<std::string, aw_fn_sig>>& aw_acc)
 {
     if (type.methods.empty()) return;
     wdk_driver_model model = classify_driver_model(type);
@@ -1463,8 +1636,11 @@ static void write_wdk_function(writer& w, winmd::type_info const& type, type_map
     case wdk_driver_model::umdf: lib_name = "wdfumdf.dll"; break;
     default: lib_name = "ntoskrnl.exe"; cc = "__stdcall"; break;
     }
-    if (type.ns.starts_with("Windows.Win32") && !type.import_library.empty())
+    if (!type.import_library.empty())
     {
+        // Truthful body comment on whatever stub survives: the projection
+        // now attributes kernel rows too (km scan / driver fill), so show
+        // the real library rather than the model default.
         lib_name = type.import_library;
     }
     static const std::set<std::string> skip_names = {
@@ -1485,21 +1661,40 @@ static void write_wdk_function(writer& w, winmd::type_info const& type, type_map
         std::string ret = mapper.map(method.ret);
         std::string params;
         std::set<std::string> seen;
+        std::vector<std::pair<std::string, std::string>> sig_params;
         for (std::size_t p = 0; p < method.params.size(); ++p)
         {
             if (p) params += ", ";
             std::string pname = sanitize_param_name(method.params[p].name, seen);
-            params += param_type_cpp(mapper, method.params[p]) + " " + pname;
+            std::string ptype = param_type_cpp(mapper, method.params[p]);
+            params += ptype + " " + pname;
+            sig_params.push_back({ std::move(ptype), pname });
         }
+        aw_acc.push_back({ fname, { ret, params, std::move(sig_params), false } });
         if (type.is_driver_dispatch) w.write("// DRIVER_DISPATCH callback\n");
         if (type.callback_optional) w.write("// Optional callback parameter (may be nullptr)\n");
-        // User-mode Win32 API with a real import library: the symbol exists
-        // in the DLL, so emit the real extern decl - an inline stub is
-        // invisible across the module boundary and consumers fail C2039
-        // (winrt_base's ss::FormatMessageW / ss::LocalFree). Mirrors
-        // write_win32_function's rule; Wdk namespaces / rows without an
-        // import library keep the intentional kernel stub below.
-        bool user_mode_export = type.ns.starts_with("Windows.Win32") && !type.import_library.empty();
+        // User-mode API with a real import library: the symbol exists in the
+        // DLL, so emit the real extern decl - an inline stub is invisible
+        // across the module boundary and consumers fail C2039 (winrt_base's
+        // ss::FormatMessageW / ss::LocalFree). Mirrors write_win32_function's
+        // rule for Windows.Win32.* rows. WDK namespaces and
+        // Windows.Win32.Kernel.* used to ALWAYS stub, discarding correct
+        // attributions for the WDK headers that export user-callable APIs
+        // (rpcdce.h -> rpcrt4.lib, tbs.h -> tbs.lib). The SDK lib tree
+        // decides now: um/ or ucrt/ attribution links for real; kernel-tree
+        // libs and unattributed rows keep the intentional kernel stub —
+        // linking a .sys/.exe image into a user-mode binary breaks its load.
+        bool user_mode_export = false;
+        if (!type.import_library.empty())
+        {
+            if (type.ns.starts_with("Windows.Win32") && !type.ns.starts_with("Windows.Win32.Kernel"))
+                user_mode_export = true;
+            else
+            {
+                std::string where = probe_sdk_lib_dir(type.import_library);
+                user_mode_export = (where == "um" || where == "ucrt");
+            }
+        }
         if (user_mode_export)
         {
             std::string decl_cc = "__stdcall";
@@ -1512,9 +1707,9 @@ static void write_wdk_function(writer& w, winmd::type_info const& type, type_map
         else
         {
             if (cc.empty())
-                w.write("inline % %(%) {\n", ret, fname, params);
+                w.write("export inline % %(%) {\n", ret, fname, params);
             else
-                w.write("inline % % %(%)\n{\n", ret, cc, fname, params);
+                w.write("export inline % % %(%)\n{\n", ret, cc, fname, params);
             if (ret == "void")
                 w.write("    // %\n}\n\n", lib_name);
             else
@@ -1934,18 +2129,22 @@ export int run(int const, char**)
                 wdk_namespaces.insert(acc.wdk.begin(), acc.wdk.end());
             }
 
-            // -module_include must be self-consistent. A selected namespace's
-            // signatures reference types owned by other modules, and an
-            // "export import" line is emitted only for a module that was
-            // actually generated — so a filter that leaves those owners out
-            // emits the reference with no import, which is guaranteed-broken
-            // output (C2039 'tagDEC is not a member of global namespace',
-            // C2230 'could not find module'). Pull the transitive dependency
-            // closure of the selected set into the selection. Full runs
-            // select everything already, so this is a no-op there, and
-            // -winui's type-level closure runs afterwards and still prunes to
-            // what the app needs. Namespaces the user excluded stay out.
-            if (!settings.module_include.empty())
+            // -module_include / -include must be self-consistent. A selected
+            // namespace's signatures reference types owned by other modules,
+            // and an "export import" line is emitted only for a module that
+            // was actually generated — so a filter that leaves those owners
+            // out emits the reference with no import, which is guaranteed-
+            // broken output (C2039 'tagDEC is not a member of global
+            // namespace', C2230 'could not find module'). Pull the transitive
+            // dependency closure of the selected set into the selection.
+            // (Both filters need this: -include prunes selection by namespace
+            // prefix before this point, so without the closure a Gdi-only
+            // include never generated WINDEF — the module of a struct field's
+            // type — and failed C2039 on POINTL.) Full runs select everything
+            // already, so this is a no-op there, and -winui's type-level
+            // closure runs afterwards and still prunes to what the app needs.
+            // Namespaces the user excluded stay out.
+            if (!settings.module_include.empty() || !settings.include.empty())
             {
                 std::set<std::string, std::less<>> selected(module_ns.begin(), module_ns.end());
                 std::vector<std::string> queue(module_ns.begin(), module_ns.end());
@@ -1968,6 +2167,10 @@ export int run(int const, char**)
                         if (settings.module_exclude.contains(d)) continue;
                         if (!metadata.namespaces().contains(d)) continue;
                         selected.insert(d);
+                        // Types are pruned per-type by the raw -include
+                        // prefixes (in_projection); register the pulled
+                        // namespace so its types survive too.
+                        g_closure_namespaces.insert(d);
                         queue.push_back(d);
                     }
                 }
@@ -2945,6 +3148,38 @@ export int run(int const, char**)
         // { member ns -> ".P<n>" sub-name }. ns_owner maps to group owners,
         // never to .P names, so emit_module must consult this instead.
         std::map<std::string, std::map<std::string, std::string>, std::less<>> p_chunk_members;
+        // Every module name this run will actually emit: each namespace's group
+        // module plus each split-member re-export shell, under the same
+        // needed_modules pruning the job loop below applies. Import emission
+        // gates on this set (not only on emitted_modules): in FILTERED runs the
+        // needed-phase appends dependency namespaces AFTER the explicit -include
+        // set, so their jobs may run later than their consumers' — gating on
+        // already-started jobs dropped those import edges and every consumer
+        // failed C3083/C2039/C2230 on the cross-module types it referenced
+        // (e.g. -include Windows.Win32.Graphics.Gdi produced a Gdi module that
+        // never imported WINDEF).
+        std::set<std::string, std::less<>> planned_modules;
+        for (auto const& ns : module_ns)
+        {
+            std::string owner = ns_owner[ns];
+            auto model = classify_namespace(ns);
+            std::string group_name = (model == ns_projection_model::win32 || model == ns_projection_model::wdk)
+                ? sanitize_module_name(owner)
+                : "winrt." + owner;
+            if (settings.winui)
+            {
+                if (!needed_modules.empty() && !needed_modules.contains(group_name)) continue;
+            }
+            else if (model != ns_projection_model::win32 && model != ns_projection_model::wdk)
+            {
+                if (!needed_modules.empty() && !needed_modules.contains(group_name)) continue;
+            }
+            planned_modules.insert(group_name);
+            // Split members of a multi-namespace group also get a tiny
+            // re-export shell module named after the namespace itself.
+            std::string shell_name = sanitize_module_name(ns);
+            if (shell_name != group_name) planned_modules.insert(shell_name);
+        }
         for (auto const& ns : module_ns)
         {
             std::string owner = ns_owner[ns];
@@ -2991,13 +3226,26 @@ export int run(int const, char**)
             auto mit = groups.find(owner);
             if (mit != groups.end())
             {
-                // The SCC-group job owns ALL its member namespaces — in every
-                // mode. Selective -winui used to shrink this to a single
-                // namespace, which left the group root module nearly empty
-                // while per-namespace siblings recreated the import cycles
-                // the merge exists to break. Per-namespace import names are
+                // The SCC-group job owns its member namespaces — in every
+                // mode — but ONLY the ones of its own projection model.
+                // A merged group can span models (a WDK cycle through the
+                // root namespace pulls Windows.Wdk.* into the same SCC as
+                // WinRT namespaces): giving the winrt-model job the WDK
+                // members emitted Windows::Wdk::BTHDDI a second time under
+                // the winrt:: prefix, which cannot compile (wrong model,
+                // C2079/C2371/C2039) and duplicates the clean wdk-model
+                // twin job that already owns them. Each twin takes exactly
+                // its model's members; per-namespace import names are
                 // served by the re-export shells.
-                members.assign(mit->second.begin(), mit->second.end());
+                bool job_w32 = (model == ns_projection_model::win32 ||
+                                model == ns_projection_model::wdk);
+                for (auto const& mem : mit->second)
+                {
+                    auto mem_model = classify_namespace(mem);
+                    bool mem_w32 = (mem_model == ns_projection_model::win32 ||
+                                    mem_model == ns_projection_model::wdk);
+                    if (mem_w32 == job_w32) members.push_back(mem);
+                }
             }
             else
             {
@@ -3183,6 +3431,11 @@ export int run(int const, char**)
             emitted_modules.insert(job.module_name);
         }
 
+        // Decide full-vs-selective BEFORE the winrt_base bookkeeping insert
+        // (needed_modules stays empty in full-mode runs until then; the shim
+        // loop below must see the true full-mode state).
+        bool full_mode = needed_modules.empty();
+
         // Always include winrt_base for WinRT modules
         for (auto const& job : jobs)
         {
@@ -3226,8 +3479,12 @@ export int run(int const, char**)
             
             // Full-mode runs keep every module: emit re-export shells for all
             // absorbed namespaces. Selective mode only emits the ones the
-            // project actually imports.
-            if (!needed_modules.empty() && !needed_modules.contains(reexport_name)) continue;
+            // project actually imports. Full-vs-selective must be decided by
+            // the state BEFORE the winrt_base bookkeeping insert below (which
+            // made needed_modules permanently non-empty and silently skipped
+            // every shell — e.g. winrt.Windows.Storage — leaving consumers
+            // unable to import absorbed namespaces).
+            if (!full_mode && !needed_modules.contains(reexport_name)) continue;
             if (emitted_modules.contains(reexport_name)) continue;
             emitted_modules.insert(reexport_name);
             
@@ -3247,9 +3504,7 @@ export int run(int const, char**)
             rw.write("export module %;\n", reexport_name);
             rw.write("export import %;\n", owner_module);
             write_output_file(output_folder / (reexport_name + ".ixx"), rw.str());
-        }
-
-        // bodies of component-interface methods that reference a
+        }        // bodies of component-interface methods that reference a
         // component class: emitted into the impl module after the class
         // definition (the projection module only forward-declares the
         // class, so these cannot compile there). Mutex-guarded because
@@ -3388,7 +3643,8 @@ export int run(int const, char**)
                 // needed_modules.empty() is wrong: winrt_base is always
                 // inserted below, so the set is never empty and full-mode
                 // runs silently skipped every cross-module import.)
-                bool dep_ok = emitted_modules.contains(dep_module_name);
+                bool dep_ok = emitted_modules.contains(dep_module_name)
+                    || planned_modules.contains(dep_module_name);
                 // Compare the SANITIZED dep name against this module's name:
                 // `d != owner` compared the raw namespace (BITS2.5) with the
                 // mangled module name (BITS2_5), so digit-led namespaces
@@ -3667,7 +3923,49 @@ export int run(int const, char**)
                         if (!t->coclass_clsid.empty())
                             w.write("// COM coclass CLSID %\n", t->coclass_clsid);
                         if (is_valid_alias_name(t->name))
-                            w.write("export using % = void*;\n\n", t->name);
+                        {
+                            // Scalar typedef aliases (DWORD, BOOL, RPC_STATUS,
+                            // UINT ...) carry AliasTarget = ECMA element type
+                            // code; without it the field-less row is
+                            // indistinguishable from an opaque handle, which
+                            // flattens to void* by design (README).
+                            std::uint8_t at_code = 0; std::uint32_t at_ptr = 0;
+                            if (!t->alias_target.empty())
+                            {
+                                std::size_t bar = t->alias_target.find('|');
+                                std::string at_c = t->alias_target.substr(0, bar);
+                                for (char ac : at_c)
+                                {
+                                    if (ac < '0' || ac > '9') { at_code = 0; break; }
+                                    at_code = static_cast<std::uint8_t>(at_code * 10 + (ac - '0'));
+                                }
+                                if (bar != std::string::npos)
+                                {
+                                    for (std::size_t pi = bar + 1;
+                                         pi < t->alias_target.size() && at_ptr < 4; ++pi)
+                                    {
+                                        char pc = t->alias_target[pi];
+                                        if (pc < '0' || pc > '9') break;
+                                        at_ptr = at_ptr * 10 + static_cast<std::uint32_t>(pc - '0');
+                                    }
+                                }
+                            }
+                            std::string at_cpp;
+                            if (at_code && !win32_handle_alias(t->name))
+                            {
+                                // Map through the type mapper (not primitive_cpp)
+                                // for the context-correct C spelling: ET::Char is
+                                // wchar_t in Win32/WDK modules, not char16_t.
+                                winmd::type at_t{};
+                                at_t.kind = at_code;
+                                at_cpp = mapper.map(at_t);
+                                for (std::uint32_t s = 0; s < at_ptr && s < 4; ++s) at_cpp += '*';
+                            }
+                            if (!at_cpp.empty() && at_cpp != "void")
+                                w.write("export using % = %;\n\n", t->name, at_cpp);
+                            else
+                                w.write("export using % = void*;\n\n", t->name);
+                        }
                     }
                     // Flat functions are deferred to a second pass below:
                     // a merged Win32 module spans several namespaces and a
@@ -3703,7 +4001,49 @@ export int run(int const, char**)
                         if (!t->coclass_clsid.empty())
                             w.write("// COM coclass CLSID %\n", t->coclass_clsid);
                         if (is_valid_alias_name(t->name))
-                            w.write("export using % = void*;\n\n", t->name);
+                        {
+                            // Scalar typedef aliases (DWORD, BOOL, RPC_STATUS,
+                            // UINT ...) carry AliasTarget = ECMA element type
+                            // code; without it the field-less row is
+                            // indistinguishable from an opaque handle, which
+                            // flattens to void* by design (README).
+                            std::uint8_t at_code = 0; std::uint32_t at_ptr = 0;
+                            if (!t->alias_target.empty())
+                            {
+                                std::size_t bar = t->alias_target.find('|');
+                                std::string at_c = t->alias_target.substr(0, bar);
+                                for (char ac : at_c)
+                                {
+                                    if (ac < '0' || ac > '9') { at_code = 0; break; }
+                                    at_code = static_cast<std::uint8_t>(at_code * 10 + (ac - '0'));
+                                }
+                                if (bar != std::string::npos)
+                                {
+                                    for (std::size_t pi = bar + 1;
+                                         pi < t->alias_target.size() && at_ptr < 4; ++pi)
+                                    {
+                                        char pc = t->alias_target[pi];
+                                        if (pc < '0' || pc > '9') break;
+                                        at_ptr = at_ptr * 10 + static_cast<std::uint32_t>(pc - '0');
+                                    }
+                                }
+                            }
+                            std::string at_cpp;
+                            if (at_code && !win32_handle_alias(t->name))
+                            {
+                                // Map through the type mapper (not primitive_cpp)
+                                // for the context-correct C spelling: ET::Char is
+                                // wchar_t in Win32/WDK modules, not char16_t.
+                                winmd::type at_t{};
+                                at_t.kind = at_code;
+                                at_cpp = mapper.map(at_t);
+                                for (std::uint32_t s = 0; s < at_ptr && s < 4; ++s) at_cpp += '*';
+                            }
+                            if (!at_cpp.empty() && at_cpp != "void")
+                                w.write("export using % = %;\n\n", t->name, at_cpp);
+                            else
+                                w.write("export using % = void*;\n\n", t->name);
+                        }
                     }
                     // Flat functions deferred (see the Win32 branch above).
                 }
@@ -3904,12 +4244,17 @@ export int run(int const, char**)
                     auto const& info = metadata.namespaces().find(m)->second;
                     mapper.set_proj_model(1);
                     w.write("namespace %\n{\n", win32_ns_cpp(m));
+                    // Accumulated across every function-grouping class of
+                    // this namespace: an A/W pair can be split between two
+                    // metadata wrapper types, so pairing happens here, once
+                    // the whole namespace has been emitted.
+                    std::vector<std::pair<std::string, aw_fn_sig>> aw_fns;
                     if (job.model == ns_projection_model::win32)
                     {
                         for (auto const* t : info.classes)
                         {
                             if (!in_projection(*t)) continue;
-                            write_win32_function(w, *t, mapper, metadata, flat_functions_emitted);
+                            write_win32_function(w, *t, mapper, metadata, flat_functions_emitted, aw_fns);
                         }
                     }
                     else
@@ -3918,9 +4263,12 @@ export int run(int const, char**)
                         {
                             if (!in_projection(*t)) continue;
                             if (t->methods.empty()) continue;
-                            write_wdk_function(w, *t, mapper, metadata, flat_functions_emitted);
+                            write_wdk_function(w, *t, mapper, metadata, flat_functions_emitted, aw_fns);
                         }
                     }
+                    // Unsuffixed wrapper for every A/W pair in this namespace;
+                    // the win32 writer also defers its inline stubs to here.
+                    write_aw_canonical(w, win32_ns_cpp(m), aw_fns, job.model == ns_projection_model::win32);
                     w.write("}\n\n");
                 }
             }
@@ -5457,6 +5805,53 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
         // always stay in <project>/build/obj.
         std::filesystem::path final_dir = final_out.empty() ? proj_folder : std::filesystem::path(final_out);
         std::filesystem::create_directories(final_dir);
+        // Locate an import library on the same LIB directories the link
+        // searches (MSVC toolchain lib + SDK um/ucrt/km x64). Every link
+        // flavor passes import libraries by bare name (windowsapp.lib,
+        // runtimeobject.lib, onecore.lib, ntoskrnl.lib, the "// Import
+        // library:" attributions, ...); SDK revisions rename or retire
+        // libraries (combase.lib was folded into windowsapp.lib), so bare
+        // names resolve to full paths up front instead of trusting the
+        // ambient LIB. Returns "" when no directory carries the library.
+        auto locate_lib = [&](std::string const& lib) -> std::string
+        {
+            std::error_code pec;
+            auto probe = [&](std::string const& dir) -> std::string
+            {
+                if (dir.empty()) return {};
+                std::filesystem::path p = std::filesystem::path(dir) / lib;
+                return std::filesystem::exists(p, pec) ? p.string() : std::string{};
+            };
+            std::string found = probe(toolchain_lib);
+            if (found.empty() && !sdk_lib.empty())
+            {
+                found = probe(sdk_lib + "\\um\\x64");
+                if (found.empty()) found = probe(sdk_lib + "\\ucrt\\x64");
+                if (found.empty()) found = probe(sdk_lib + "\\km\\x64");
+            }
+            return found;
+        };
+        // Required WinRT libs: full path when locatable, bare name as a
+        // last resort so the linker's own diagnostic still fires, plus an
+        // explicit warning so a retired SDK lib is never a silent mystery.
+        auto resolve_lib = [&](std::string const& lib) -> std::string
+        {
+            std::string full = locate_lib(lib);
+            if (full.empty())
+            {
+                std::printf("cppwinc : warning: %s not found in toolchain/SDK lib directories\n", lib.c_str());
+                return lib;
+            }
+            return full;
+        };
+        auto resolve_winrt_libs = [&]()
+        {
+            std::vector<std::string> out;
+            for (std::string const& n : { "windowsapp.lib", "runtimeobject.lib", "onecore.lib" })
+                out.push_back(resolve_lib(n));
+            return out;
+        };
+
         auto link_with = [&](std::string const& out_file, std::vector<std::string> const& objs,
                              std::vector<std::string> const& libs, std::string const& flags)
         {
@@ -5467,6 +5862,28 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
             {
                 std::ofstream rsp(rsp_path, std::ios::binary);
                 for (auto const& o : objs) rsp << "\"" << o << "\"\n";
+                // Emit explicit /LIBPATH: for the C++ runtime and SDK lib dirs.
+                // The link must resolve msvcprt.lib / msvcprt[d].lib (MSVC
+                // toolset) and ucrt.lib (SDK ucrt) independent of the ambient
+                // LIB env var — which is unset outside a VS dev prompt. Relying
+                // on it made every harness link fail LNK1104 "cannot open
+                // msvcprt.lib" on machines without a launched dev shell. Passing
+                // the search paths on the command line makes the driver
+                // self-contained.
+                {
+                    std::error_code pdec;
+                    auto push_libpath = [&](std::string const& dir)
+                    {
+                        if (!dir.empty() && std::filesystem::is_directory(dir, pdec))
+                            rsp << "/LIBPATH:\"" << dir << "\"\n";
+                    };
+                    push_libpath(toolchain_lib); // MSVC toolset: msvcprt.lib, msvcrt.lib
+                    if (!sdk_lib.empty())
+                    {
+                        push_libpath(sdk_lib + "\\ucrt\\x64"); // ucrt.lib (C runtime)
+                        push_libpath(sdk_lib + "\\um\\x64");   // um import libs
+                    }
+                }
                 for (auto const& l : libs)
                 {
                     // Directory entries are search paths, not input files:
@@ -5477,7 +5894,23 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
                     if (std::filesystem::is_directory(l, dec))
                         rsp << "/LIBPATH:\"" << l << "\"\n";
                     else
-                        rsp << "\"" << l << "\"\n";
+                    {
+                        // Auto-locate bare import-library names (kernel32.lib,
+                        // attribution libs, ...) against the toolchain/SDK lib
+                        // directories so every link flavor resolves them without
+                        // depending on the ambient LIB. Entries that already
+                        // carry a path pass through untouched.
+                        std::string path = l;
+                        if (l.find_first_of("\\/:") == std::string::npos)
+                        {
+                            std::string full = locate_lib(l);
+                            if (!full.empty())
+                                path = std::move(full);
+                            else if (settings.verbose)
+                                std::printf("  [link] %s not located; passing the bare name to the linker\n", l.c_str());
+                        }
+                        rsp << "\"" << path << "\"\n";
+                    }
                 }
                 rsp << flags << "\n";
             }
@@ -5608,7 +6041,12 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
                 "/DLL /SUBSYSTEM:WINDOWS /MACHINE:X64 /INCREMENTAL:NO /RELEASE /OPT:REF /OPT:ICF";
             if (!def_file.empty())
                 dll_flags += " /DEF:\"" + def_file.string() + "\"";
-            if (!link_with(name + ".dll", dll_objs, {}, dll_flags))
+            // A WinRT component dll needs the same umbrella import libs the
+            // exe links use (Ro*/HSTRING live in windowsapp.lib).
+            std::vector<std::string> dll_libs;
+            if (std::filesystem::exists(obj_dir / "winrt_base.obj"))
+                dll_libs = resolve_winrt_libs();
+            if (!link_with(name + ".dll", dll_objs, dll_libs, dll_flags))
                 result = 1;
         }
         // App exe: main.ixx bootstrap + user .cpp + all module objects ->
@@ -5632,7 +6070,7 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
                     app_objs.push_back(o.path().string());
             if (std::filesystem::exists(obj_dir / "std.obj"))
                 app_objs.push_back((obj_dir / "std.obj").string());
-            std::vector<std::string> app_libs = { "windowsapp.lib", "runtimeobject.lib", "onecore.lib" };
+            std::vector<std::string> app_libs = resolve_winrt_libs();
             std::string bootstrap = locate_wasdk_bootstrap_lib(settings.verbose);
             if (!bootstrap.empty()) app_libs.push_back(bootstrap);
             // The generated bootstrap defines wWinMain (wide entry); the CRT
@@ -5649,10 +6087,18 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
         {
             bool has_console_main = false;
             {
-                std::ifstream mf(app_cpp.front());
-                std::string mline;
-                while (std::getline(mf, mline))
-                    if (mline.find("int main(") != std::string::npos) { has_console_main = true; break; }
+                // Scan EVERY app source, not just the first: directory
+                // iteration order is arbitrary, so a main() in any file
+                // (e.g. main.cpp listed after the ex_*.cpp examples) must
+                // count for the console-exe link.
+                for (auto const& c : app_cpp)
+                {
+                    std::ifstream mf(c);
+                    std::string mline;
+                    while (std::getline(mf, mline))
+                        if (mline.find("int main(") != std::string::npos) { has_console_main = true; break; }
+                    if (has_console_main) break;
+                }
             }
             if (has_console_main)
             {
@@ -5673,7 +6119,58 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
                 // path uses, else every WinRT console test dies LNK2019.
                 std::vector<std::string> libs;
                 if (std::filesystem::exists(obj_dir / "winrt_base.obj"))
-                    libs = { "windowsapp.lib", "runtimeobject.lib", "onecore.lib" };
+                    libs = resolve_winrt_libs();
+                // Win32/WDK quick-tests: the extern "C" declarations carry a
+                // "// Import library: X.lib" attribution in the generated
+                // modules. Collect the distinct names and link them — the
+                // console path otherwise passed NO import libs and every
+                // Win32 call died LNK2019 (RegOpenKeyExW, CreateWindowExW...).
+                {
+                    std::set<std::string> seen_libs;
+                    std::error_code iec;
+                    for (auto const& lf : std::filesystem::directory_iterator(proj_folder, iec))
+                    {
+                        if (!lf.is_regular_file() || lf.path().extension() != ".ixx") continue;
+                        std::ifstream imf(lf.path());
+                        std::string iline;
+                        while (std::getline(imf, iline))
+                        {
+                            auto pos = iline.find("// Import library: ");
+                            if (pos == std::string::npos) continue;
+                            std::string lib = iline.substr(pos + 19);
+                            while (!lib.empty() && (lib.back() == '\r' || lib.back() == '\n' || lib.back() == ' ')) lib.pop_back();
+                            // The attribution sometimes carries the DLL name
+                            // from the import descriptor (kernel32.dll); the
+                            // linker wants the import library (kernel32.lib).
+                            // The attribution carries whatever spelling the
+                            // projection wrote: a DLL name (kernel32.dll), a
+                            // driver image (ntoskrnl.exe) or an on-disk lib
+                            // name (SDK ships rpcrt4.lib AND RpcRT4.Lib).
+                            // The linker wants the import LIBRARY and the
+                            // tail test must be case-insensitive — a
+                            // case-sensitive ".lib" check silently dropped
+                            // every CamelCase .Lib attribution (RpcRT4.Lib…).
+                            std::string tail = lib.size() >= 4 ? lib.substr(lib.size() - 4) : lib;
+                            for (auto& c : tail) c = (char)std::tolower((unsigned char)c);
+                            if (lib.size() > 4 && (tail == ".dll" || tail == ".exe"))
+                                lib = lib.substr(0, lib.size() - 4) + ".lib";
+                            else if (tail != ".lib") continue;
+                            // SDK revisions retire import libraries (combase.lib
+                            // was folded into windowsapp.lib in newer kits): an
+                            // attribution naming a library the link cannot open is
+                            // a hard LNK1181, so probe the same LIB directories the
+                            // link searches and skip what is no longer shipped —
+                            // the umbrella import libs already carry those symbols.
+                            if (locate_lib(lib).empty())
+                            {
+                                if (settings.verbose)
+                                    std::printf("  [link] skip retired attribution lib %s (not in SDK/toolchain)\n", lib.c_str());
+                                continue;
+                            }
+                            if (seen_libs.insert(lib).second) libs.push_back(lib);
+                        }
+                    }
+                }
                 if (!link_with(name + ".exe", objs, libs, "/SUBSYSTEM:CONSOLE /MACHINE:X64 /INCREMENTAL:NO /RELEASE /OPT:REF /OPT:ICF"))
                     result = 1;
             }

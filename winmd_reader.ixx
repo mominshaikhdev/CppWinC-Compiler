@@ -1586,6 +1586,10 @@ namespace winmd
         std::uint32_t driver_dispatch_minor = 0; // DriverDispatch MinorFunction slot
         bool callback_optional = false;  // CallbackOptional attribute (nullable callback param)
         std::string coclass_clsid;       // ComCoClass attribute (CLSID string)
+        std::string alias_target;        // AliasTarget attribute: ECMA element
+                                         // type code of a scalar typedef alias
+                                         // (DWORD -> "9"/U4, RPC_STATUS -> "8"/I4);
+                                         // empty = opaque/unknown alias
 
         std::string full_name() const
         {
@@ -2240,6 +2244,14 @@ t->interfaces.push_back(it);
                     else if (name.find("DriverType") != std::string::npos)
                     {
                         if (!args.empty()) t->driver_type = (std::uint32_t)args[0].i;
+                    }
+                    else if (name.find("AliasTarget") != std::string::npos)
+                    {
+                        // Scalar typedef alias target (ECMA element type code as
+                        // a string positional): lets the projection spell
+                        // `using DWORD = std::uint32_t;` instead of guessing
+                        // void* from the field-less row.
+                        if (!args.empty() && !args[0].s.empty()) t->alias_target = std::move(args[0].s);
                     }
                     else if (name.find("StructLayout") != std::string::npos)
                     {
