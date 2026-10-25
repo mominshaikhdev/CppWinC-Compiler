@@ -354,7 +354,10 @@ void print_usage()
     std::printf("  10.0.12345.0        Windows SDK metadata for a specific version\n");
     std::printf("\n  -winui / -winui_no_compile auto-discover the WASDK metadata (NuGet cache)\n");
     std::printf("  and auto-locate the WASDK runtime DLLs - no wasdk input needed.\n");
-    std::printf("e.g. -input local,MyApp.winmd -winui_no_compile\n");
+    std::printf("  Both REQUIRE a winversec-produced Windows.Win32.winmd in -input: the\n");
+    std::printf("  generated main.ixx bootstrap projects PACKAGE_VERSION, MddBootstrap*,\n");
+    std::printf("  LoadLibraryExW from it instead of including Windows headers.\n");
+    std::printf("e.g. -input MyApp.winmd,Windows.Win32.winmd -winui_no_compile\n");
 }
 
 void process_args(arg_parser const& args)

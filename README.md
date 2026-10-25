@@ -567,8 +567,9 @@ Where <spec> is a single comma-separated list of any of:
 :: OS metadata plus a folder of extra winmd files (e.g. WASDK/WinUI3)
 cppwinc.exe -input local,<path\to\winmd-folder> -base -output out
 
-:: WinUI app - -winui finds WASDK metadata + DLLs automatically
-cppwinc.exe -input local,MyApp.winmd -winui
+:: WinUI app - WASDK metadata + DLLs are found automatically; the winversec
+:: Windows.Win32.winmd is still required for the main.ixx bootstrap
+cppwinc.exe -input MyApp.winmd,Windows.Win32.winmd -winui
 
 :: Multiple winmd files, comma-separated
 cppwinc.exe -input Xaml.winmd,Foundation.winmd -base -output out
@@ -594,8 +595,9 @@ cppwinc.exe -input local,MyApp.winmd -component out\component -name MyApp -outpu
 :: (the default — same rule as every other switch's output)
 cppwinc.exe -input local,MyApp.winmd -component -output out
 
-:: -winui generates the component automatically (no -component needed)
-cppwinc.exe -input MyApp.winmd -winui -output .
+:: -winui generates the component automatically (no -component needed);
+:: the winversec Windows.Win32.winmd is required for the bootstrap
+cppwinc.exe -input MyApp.winmd,Windows.Win32.winmd -winui -output .
 ```
 
 How `-component` resolves its inputs and outputs:
@@ -714,7 +716,9 @@ cppwinc.exe -input Windows.Win32+Wdk.winmd -output build\proj -compile
 :: quick-test an existing projection folder (no -input, no regeneration)
 cppwinc.exe -compile build\proj
 
-:: only the final binaries land here (modules/objs stay with -output/source)cppwinc.exe -input Windows.Win32.winmd -output out -compile out\bin
+:: only the final binaries land here (modules/objs stay with -output/source)
+
+cppwinc.exe -input Windows.Win32.winmd -output out -compile out\bin
 
 :: force link targets (comma-separated; requires -compile)
 cppwinc.exe -compile build\proj -target exe,dll
@@ -766,11 +770,11 @@ generates the projection, and compiles all modules in topological order
 (release, all cores):
 
 ```bat
-cppwinc.exe -input MyApp.winmd -winui -output .
+cppwinc.exe -input MyApp.winmd,Windows.Win32.winmd -winui -output .
 
 :: optional path: ONLY the final binaries (+ resources.pri, Assets,
 :: bootstrap DLL) land there; modules stay in -output
-cppwinc.exe -input MyApp.winmd -winui -output out -winui out\bin
+cppwinc.exe -input MyApp.winmd,Windows.Win32.winmd -winui -output out -winui out\bin
 ```
 
 This automatically:
@@ -784,11 +788,38 @@ This automatically:
 6. Generates view modules from `.winui` data (App, MainWindow, pages).
 7. Emits `main.ixx` with WASDK bootstrap (`MddBootstrapInitialize2`).
 8. Generates `.ixx` modules, splitting large namespaces (e.g. `Microsoft.UI.Xaml`
-   with 94K+ methods) into balanced chunks (`P1`, `P2`, ...).
-9. Compiles all modules using direct `cl.exe` invocation with auto-detected
-   MSVC toolchain, SDK, and WASDK include paths.
+   with 94K+ methods) into balanced chunks (`P1`, `P2`, ...).9. Compiles all modules using direct `cl.exe` invocation with auto-detected
+MSVC toolchain, SDK, and WASDK include paths.
 
 No hardcoded paths — works on any Windows machine with Visual Studio and NuGet.
+
+#### System metadata and module selection
+
+Both switches add system metadata automatically, so `-input local` is
+unneeded: WASDK winmds from the NuGet cache, then the newest Windows SDK
+`UnionMetadata` folder, falling back to `%WinDir%\System32\WinMetadata` (what
+`local` resolves to) only when that folder is absent.
+
+Emission is selective - only modules reachable from this run's view modules,
+`main.ixx` and `winrt_base` are generated; unneeded `winrt.*` modules are
+deleted afterwards. Win32/WDK modules resolve through their own namespace's
+dependencies, keeping a `-winui` build small. `-winui_no_compile` yields the
+same pruned set without compiling; a plain `-input`/`-compile` build is not
+pruned at all.
+
+> [!IMPORTANT]
+> **A winversec-produced `Windows.Win32.winmd` in `-input` is required.**
+> Both switches fail fast without one, since `main.ixx` projects the
+> bootstrap's Win32 calls (`PACKAGE_VERSION`, `MddBootstrap*`,
+> `LoadLibraryExW`) from metadata rather than Windows headers:
+>
+> ```bat
+> winversec.exe -no_drivers -include_wasdk -output Windows.Win32.winmd
+> cppwinc.exe -input winuic_out\MyApp.winmd,Windows.Win32.winmd -winui -output out
+> ```
+>
+> Without these switches the file is projected like any other `-input`.
+
 
 #### Component module structs
 

@@ -56,6 +56,10 @@ import Windows.Win32.STRINGAPISET;
 import Windows.Win32.SYSINFOAPI;
 import Windows.Win32.WINSTRING;
 import Windows.Win32.System.SystemServices;
+// win32 constants used by the runtime body (CP_UTF8, E_FAIL) come from
+// winversec-projected modules like every other Win32 symbol.
+import Windows.Win32.WINNLS;
+import Windows.Wdk.WINERROR;
 
 namespace winrt
 {
@@ -138,26 +142,11 @@ namespace winrt
     export constexpr std::int32_t hr_not_implemented = 0x80004001;
     export constexpr std::int32_t hr_access_denied_value = 0x80070005;
 
-    // Win32 constants that carry no winversec projection (header-only
-    // macros) are defined here from their documented SDK values. Declared
-    // BEFORE hresult_error: what() converts via win32::cp_utf8 and a
-    // later declaration would be use-before-declaration inside the class.
-    namespace win32
-    {
-        inline constexpr std::uint32_t cp_utf8 = 65001;
-        inline constexpr std::uint32_t format_message_allocate_buffer = 0x00000100;
-        inline constexpr std::uint32_t format_message_from_system = 0x00001000;
-        inline constexpr std::uint32_t format_message_ignore_inserts = 0x00000200;
-        inline constexpr std::int32_t co_e_not_initialized = static_cast<std::int32_t>(0x800401F0);
-        inline constexpr std::int32_t e_bounds = static_cast<std::int32_t>(0x8000000B);
-        inline constexpr std::int32_t e_changed_state = static_cast<std::int32_t>(0x8000000C);
-        inline constexpr std::int32_t e_illegal_method_call = static_cast<std::int32_t>(0x8000000E);
-        inline constexpr std::int32_t error_not_found = static_cast<std::int32_t>(0x80070490);
-        inline constexpr std::uint32_t infinite_wait = 0xFFFFFFFF;
-        inline constexpr std::int32_t facility_win32 = 0x80070000;
-        inline constexpr std::uint32_t lang_neutral = 0;
-        inline constexpr std::int32_t e_fail = static_cast<std::int32_t>(0x80004005);
-    }
+    // Win32 constants are sourced from winversec-projected modules, not
+    // hardcoded: CP_UTF8 (Windows.Win32.WINNLS), FORMAT_MESSAGE_* and
+    // LANG_NEUTRAL (Windows.Win32.System::SystemServices), E_FAIL
+    // (Windows.Wdk.WINERROR) — all imported above, so the values always
+    // match the metadata the projection was generated from.
 
     export class hresult_error : public std::exception
     {
@@ -179,11 +168,11 @@ namespace winrt
             // CHAR projects as std::int8_t (signed char) in the winversec
             // metadata; utf8.data() is char* — same size/ABI, explicit cast
             // required for the const-removed signature.
-            int size = sa::WideCharToMultiByte(win32::cp_utf8, 0, m_message.c_str(), (int)m_message.size(), nullptr, 0, nullptr, nullptr);
+            int size = sa::WideCharToMultiByte(static_cast<std::uint32_t>(Windows::Win32::WINNLS::CP_UTF8), 0, m_message.c_str(), (int)m_message.size(), nullptr, 0, nullptr, nullptr);
             utf8.assign(size, '\0');
             if (size)
             {
-                sa::WideCharToMultiByte(win32::cp_utf8, 0, m_message.c_str(), (int)m_message.size(), reinterpret_cast<std::int8_t*>(utf8.data()), size, nullptr, nullptr);
+                sa::WideCharToMultiByte(static_cast<std::uint32_t>(Windows::Win32::WINNLS::CP_UTF8), 0, m_message.c_str(), (int)m_message.size(), reinterpret_cast<std::int8_t*>(utf8.data()), size, nullptr, nullptr);
             }
             return utf8.c_str();
         }
@@ -334,8 +323,8 @@ namespace winrt
             namespace ss = Windows::Win32::System::SystemServices;
             // FORMAT_MESSAGE_ALLOCATE_BUFFER: the API writes the allocated
             // string pointer through lpBuffer — C callers pass (LPWSTR)&buffer.
-            ss::FormatMessageW(win32::format_message_allocate_buffer | win32::format_message_from_system | win32::format_message_ignore_inserts,
-                nullptr, static_cast<std::uint32_t>(value), win32::lang_neutral,
+            ss::FormatMessageW(ss::FORMAT_MESSAGE_ALLOCATE_BUFFER | ss::FORMAT_MESSAGE_FROM_SYSTEM | ss::FORMAT_MESSAGE_IGNORE_INSERTS,
+                nullptr, static_cast<std::uint32_t>(value), static_cast<std::uint32_t>(ss::LANG_NEUTRAL),
                 reinterpret_cast<wchar_t*>(&buffer), 0, nullptr);
             if (buffer)
             {
@@ -951,7 +940,7 @@ namespace winrt
             }
             // No PropertyValue factory on this system: fail loudly instead of
             // faulting on a null vtable at the call site.
-            check_hresult(win32::e_fail);
+            check_hresult(static_cast<std::int32_t>(Windows::Wdk::WINERROR::E_FAIL));
             return nullptr;
         }
 
@@ -4352,11 +4341,11 @@ com_ns::CoTaskMemFree(m_data);
             return {};
         }
         namespace sa = Windows::Win32::STRINGAPISET;
-        int size = sa::WideCharToMultiByte(win32::cp_utf8, 0, value.data(), (int)value.size(), nullptr, 0, nullptr, nullptr);
+        int size = sa::WideCharToMultiByte(static_cast<std::uint32_t>(Windows::Win32::WINNLS::CP_UTF8), 0, value.data(), (int)value.size(), nullptr, 0, nullptr, nullptr);
         std::string result(size, '\0');
         if (size)
         {
-            sa::WideCharToMultiByte(win32::cp_utf8, 0, value.data(), (int)value.size(), reinterpret_cast<std::int8_t*>(result.data()), size, nullptr, nullptr);
+            sa::WideCharToMultiByte(static_cast<std::uint32_t>(Windows::Win32::WINNLS::CP_UTF8), 0, value.data(), (int)value.size(), reinterpret_cast<std::int8_t*>(result.data()), size, nullptr, nullptr);
         }
         return result;
     }
@@ -4368,11 +4357,11 @@ com_ns::CoTaskMemFree(m_data);
             return {};
         }
         namespace sa = Windows::Win32::STRINGAPISET;
-        int size = sa::MultiByteToWideChar(win32::cp_utf8, 0, reinterpret_cast<const std::int8_t*>(value.data()), (int)value.size(), nullptr, 0);
+        int size = sa::MultiByteToWideChar(static_cast<std::uint32_t>(Windows::Win32::WINNLS::CP_UTF8), 0, reinterpret_cast<const std::int8_t*>(value.data()), (int)value.size(), nullptr, 0);
         std::wstring result(size, L'\0');
         if (size)
         {
-            sa::MultiByteToWideChar(win32::cp_utf8, 0, reinterpret_cast<const std::int8_t*>(value.data()), (int)value.size(), result.data(), size);
+            sa::MultiByteToWideChar(static_cast<std::uint32_t>(Windows::Win32::WINNLS::CP_UTF8), 0, reinterpret_cast<const std::int8_t*>(value.data()), (int)value.size(), result.data(), size);
         }
         return result;
     }
