@@ -1913,9 +1913,23 @@ namespace winmd
                             blob vb = db.get_blob(table_constant, c, 2);
                             if (vb.size() >= 1)
                             {
-                                if (vb.size() >= 4)
+                                if (vb.size() >= 8)
+                                {
+                                    // U8/I8 constants (WINDOWSAPPSDK_RUNTIME_
+                                    // VERSION_UINT64 = 0x0002000500040000):
+                                    // all 8 LE bytes — the old >=4 branch read
+                                    // only the low 32 and silently mangled
+                                    // every 64-bit constant.
+                                    value = (std::int64_t)read_u64_raw_in(vb);
+                                }
+                                else if (vb.size() >= 4)
                                 {
                                     value = (std::int64_t)read_u32_raw_in(vb);
+                                }
+                                else if (vb.size() >= 2)
+                                {
+                                    value = (std::uint16_t)(std::to_integer<std::uint8_t>(vb[0]) |
+                                            ((std::uint16_t)std::to_integer<std::uint8_t>(vb[1]) << 8));
                                 }
                                 else
                                 {
@@ -2390,6 +2404,16 @@ t->interfaces.push_back(it);
                    ((std::uint32_t)(std::to_integer<std::uint8_t>(b[1])) << 8) |
                    ((std::uint32_t)(std::to_integer<std::uint8_t>(b[2])) << 16) |
                    ((std::uint32_t)(std::to_integer<std::uint8_t>(b[3])) << 24);
+        }
+
+        static std::uint64_t read_u64_raw_in(blob b)
+        {
+            if (b.size() < 8) return 0;
+            return (std::uint64_t)read_u32_raw_in(b) |
+                   ((std::uint64_t)(std::uint32_t)(std::to_integer<std::uint8_t>(b[4])) |
+                    ((std::uint64_t)(std::to_integer<std::uint8_t>(b[5])) << 8) |
+                    ((std::uint64_t)(std::to_integer<std::uint8_t>(b[6])) << 16) |
+                    ((std::uint64_t)(std::to_integer<std::uint8_t>(b[7])) << 24)) << 32;
         }
 
         type_info const* find(std::string const& full_name) const

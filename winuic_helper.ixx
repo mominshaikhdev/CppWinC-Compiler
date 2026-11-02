@@ -9,6 +9,8 @@ module;
 #include <string_view>
 #include <vector>
 #include <map>
+#include <set>
+#include <unordered_map>
 #include <cstdint>
 #include <cstdlib>
 #include <algorithm>
@@ -19,6 +21,27 @@ export module winuic_helper;
 
 export namespace winuic
 {
+
+// Identifier spelling of a metadata namespace / module name.
+// App namespaces follow the shared hyphen naming default ("WinUI Gallery"
+// -> "WinUI-Gallery"), which is a legal ECMA-335 metadata string but NOT a
+// C++ identifier: every character that cannot appear in an identifier maps
+// to '_' (dots are kept - they separate segments in module names and are
+// rewritten to "::" for C++ namespace qualification). STRING contexts
+// (class full names, activation keys, the winmd itself) keep the raw
+// metadata spelling; call this only where the token becomes real C++.
+inline std::string ident_ns(std::string_view ns)
+{
+    std::string out;
+    out.reserve(ns.size());
+    for (char c : ns)
+    {
+        bool const keep = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                       || (c >= '0' && c <= '9') || c == '_' || c == '.';
+        out += keep ? c : '_';
+    }
+    return out;
+}
 
 // Escape a raw value for use inside L"..." wide string literal.
 // Replaces backslashes first, then quotes, then newlines/tabs/cr.
@@ -59,11 +82,9 @@ inline std::string strip_wstr(std::string s)
     return s;
 }
 
-// Normalize escaped quotes in JSON payload string values. winmd payloads
-// reach the view generator in two encodings - plain ("Bottom") and
-// backslash-escaped (\"Bottom\") - depending on how the producer embedded
-// the attribute. Stripping both here means every downstream enum/brush/uri
-// matcher sees the same canonical text.
+// Normalize escaped quotes and string-literal wrapping in JSON payloads.
+// Resource fragments may arrive as L"..." literals; downstream XAML loaders
+// need the XML payload, not the C++ literal syntax.
 inline std::string normalize_payload_value(std::string const& raw)
 {
     std::string v = raw;
@@ -82,35 +103,26 @@ inline std::string normalize_payload_value(std::string const& raw)
         }
     }
     v = unescaped;
-    // then strip one symmetric pair of surrounding quotes
-    if (v.size() >= 2 && v.front() == '"' && v.back() == '"')
+    // Strip one pair of surrounding quotes, including a wide-string prefix.
+    if (v.size() >= 3 && v[0] == 'L' && v[1] == '"' && v.back() == '"')
+    {
+        v = v.substr(2, v.size() - 3);
+    }
+    else if (v.size() >= 2 && v.front() == '"' && v.back() == '"')
     {
         v = v.substr(1, v.size() - 2);
     }
     return v;
 }
 
-// true when the property name maps to a numeric (double/int) dependency property,
-// i.e. it must never be fed an L"..." string literal.
-inline bool is_numeric_dp(std::string const& pk)
+// true when a METADATA type name is a primitive numeric type (winmd element
+// types projecting to arithmetic C++). Type knowledge only - never control or
+// property names - so a new control ships in metadata without a rebuild.
+inline bool is_numeric_type_name(std::string_view tn)
 {
-    std::string p(pk);
-    for (auto& c : p) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    static const char* names[] = {
-        "width", "height", "minwidth", "maxwidth", "minheight", "maxheight",
-        "minimum", "maximum", "value", "largechange", "smallchange",
-        "stepfrequency", "tickfrequency", "fontsize", "opacity", "rotation",
-        "rotationx", "rotationy", "offsetx", "offsety", "scalex", "scaley",
-        "x1", "y1", "x2", "y2", "columnspacing", "rowspacing", "lineheight",
-        "radiusx", "radiusy", "strokethickness", "maxlength", "maxlines",
-        "spacing", "itemwidth", "itemheight", "maxrows", "maxcolumns",
-        "minrows", "mincolumns", "targetoffset", "characterpixels",
-        "delay", "duration", "repeatdelay", "repeatrate", "zindex",
-        "tabindex", "numberofpages", nullptr
-    };
-    for (int i = 0; names[i]; ++i)
-        if (p == names[i]) return true;
-    return false;
+    return tn == "double" || tn == "float" || tn == "int8_t" || tn == "uint8_t"
+        || tn == "int16_t" || tn == "uint16_t" || tn == "int32_t" || tn == "uint32_t"
+        || tn == "int64_t" || tn == "uint64_t" || tn == "char16_t";
 }
 
 // true when text is a plain numeric expression (digits, '.', sign, e/E, and
@@ -139,130 +151,96 @@ inline bool is_number_text(std::string raw)
     return any_digit;
 }
 
-// Collapse any run of more than two consecutive ':' down to "::" (artifact of
-// buggy multi-pass enum rewrites) — "ScrollingScrollMode::::Auto" -> "...::Auto".
-inline std::string collapse_colon_runs(std::string const& s)
+// Metadata-driven typed-value resolution. Replaces the legacy
+// control/property enum tables and the bare-string -> enum name list: the
+// property's TYPE comes from the loaded winmds and nowhere else, so a new
+// control, enum or property value ships in metadata only - no cppwinc
+// rebuild.
+//
+//   prop_kinds  lowercased type name -> {lowercased property -> metadata
+//               type name}, flattened over base classes and interfaces
+//               (driver-built: g_type_prop_kinds)
+//   enums       enum type name -> (namespace, member names)
+//               (driver-built: g_enum_info)
+//
+// The single rule, keyed on the metadata type:
+//   enum-typed property + a value that is a member of that enum
+//       -> winrt::<ns>::<Type>::<Member>
+// Bare L"...", quoted and already-qualified values all work, and a value
+// an earlier pass qualified with the WRONG enum gets re-qualified, because
+// membership is checked against the metadata enum (ScrollView props are
+// Scrolling* enums while ScrollViewer props are plain Scroll* ones,
+// Tooltip.Placement is PlacementMode, ...) - no control-name branches.
+// Any other value (unknown property, non-member, markup/structured
+// literal) is returned unchanged.
+inline std::string resolve_typed_value(
+    std::string const& control, std::string_view pk, std::string val,
+    std::unordered_map<std::string, std::unordered_map<std::string, std::string>> const* prop_kinds,
+    std::unordered_map<std::string, std::pair<std::string, std::set<std::string>>> const* enums)
 {
-    std::string out;
-    out.reserve(s.size());
-    int run = 0;
-    for (char c : s)
-    {
-        if (c == ':')
-        {
-            if (run >= 2) continue; // already have "::"
-            ++run;
-        }
-        else run = 0;
-        out += c;
-    }
-    return out;
-}
+    if (!prop_kinds || !enums || val.empty()) return val;
 
-// Map a bare/L"..."-wrapped enum value to a fully-qualified enumerator for
-// property names that need a specific enum type. Returns empty when unmapped.
-inline std::string map_string_enum(std::string const& lo_p, std::string const& lo_c, std::string val)
-{
-    std::string v = strip_wstr(val);
-    while (!v.empty() && v.front() == ' ') v.erase(0, 1);
-    while (!v.empty() && v.back() == ' ') v.pop_back();
-    if (v.empty() || v.front() == '{') return {};
-    std::string ns;
-    if (lo_p.find("splitviewdisplaymode") != std::string::npos
-        || (lo_c == "splitview" && lo_p.find("displaymode") != std::string::npos))
-        ns = "winrt::Microsoft::UI::Xaml::Controls::SplitViewDisplayMode::";
-    else if (lo_c == "passwordbox" && lo_p.find("passwordrevealmode") != std::string::npos)
-        ns = "winrt::Microsoft::UI::Xaml::Controls::PasswordRevealMode::";
-    else if (lo_p.find("keyboardacceleratorplacementmode") != std::string::npos)
-        ns = "winrt::Microsoft::UI::Xaml::Input::KeyboardAcceleratorPlacementMode::";
-    else if (lo_p.find("highcontrastadjustment") != std::string::npos)
-        ns = "winrt::Microsoft::UI::Xaml::ElementHighContrastAdjustment::";
-    else if (lo_p.find("scrollbarvisibility") != std::string::npos && lo_c.find("scrollview") == std::string::npos)
-        ns = "winrt::Microsoft::UI::Xaml::Controls::ScrollBarVisibility::";
-    if (ns.empty()) return {};
-    // Only valid PascalCase identifier-like values get mapped (keeps out markup)
-    if (!std::isalpha(static_cast<unsigned char>(v[0]))) return {};
-    for (char c : v)
-        if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_')) return {};
-    return ns + v;
-}
-
-// Control-dependent enum namespace fixes. resolve_prop_value has no control
-// context, so callers apply this right before emitting a property value.
-inline std::string fix_control_enum(std::string const& control, std::string_view pk, std::string val)
-{
-    std::string lo_c(control);
+    // lowercased control leaf + property name (g_type_prop_kinds keys)
+    std::string lo_c = control;
+    if (auto const csc = lo_c.rfind("::"); csc != std::string::npos) lo_c = lo_c.substr(csc + 2);
     for (auto& c : lo_c) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     std::string lo_p(pk);
     for (auto& c : lo_p) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    auto rep_all = [&](std::string const& from, std::string const& to)
+    if (lo_c.empty() || lo_p.empty()) return val;
+
+    // The property's metadata type name ("" when the winmds do not know it).
+    std::string ptype;
+    if (auto const tit = prop_kinds->find(lo_c); tit != prop_kinds->end())
+        if (auto const pit = tit->second.find(lo_p); pit != tit->second.end())
+            ptype = pit->second;
+    if (ptype.empty()) return val;
+
+    // Candidate member: last :: segment, unwrapped from L"..." / "...",
+    // whitespace-trimmed.
+    std::string mem = val;
+    if (auto const mq = mem.rfind("::"); mq != std::string::npos) mem = mem.substr(mq + 2);
+    mem = strip_wstr(mem);
+    while (!mem.empty() && mem.front() == ' ') mem.erase(0, 1);
+    while (!mem.empty() && mem.back() == ' ') mem.pop_back();
+    if (mem.empty()) return val;
+
+    // Nullable numeric props: metadata says IReference<double> (generic
+    // args come from the winmd - axis Minimum/Maximum are the gallery's
+    // users), so box the number the way the projected setter wants it.
+    if (ptype == "IReference<double>")
     {
-        while (true)
-        {
-            auto q = val.find(from);
-            if (q == std::string::npos) break;
-            val.replace(q, from.size(), to);
-        }
-    };
-    if (lo_c == "scrollview")
-    {
-        // ScrollView uses Scrolling* enums; ScrollViewer uses Scroll* enums
-        if (lo_p.find("scrollbarvisibility") != std::string::npos)
-        {
-            rep_all("Controls::ScrollingScrollBarVisibility::", "Controls::ScrollingScrollBarVisibility::"); // no-op guard against re-entry leftovers
-            rep_all("Controls::ScrollBarVisibility::", "Controls::ScrollingScrollBarVisibility::");
-        }
-        if (lo_p.find("scrollmode") != std::string::npos)
-        {
-            rep_all("Controls::ScrollingScrollMode::", "Controls::ScrollingScrollMode::");
-            rep_all("Controls::ScrollMode::", "Controls::ScrollingScrollMode::");
-        }
-        if (lo_p.find("contentorientation") != std::string::npos)
-        {
-            rep_all("Controls::ScrollViewContentOrientation::", "Controls::ScrollingContentOrientation::");
-            rep_all("Controls::ScrollContentOrientation::", "Controls::ScrollingContentOrientation::");
-        }
-        if (lo_p.find("zoommode") != std::string::npos)
-        {
-            rep_all("Controls::ScrollingZoomMode::", "Controls::ScrollingZoomMode::");
-            rep_all("Controls::ZoomMode::", "Controls::ScrollingZoomMode::");
-        }
-        if (lo_p.find("scrollbarvisibility") != std::string::npos || lo_p.find("scrollmode") != std::string::npos
-            || lo_p.find("zoommode") != std::string::npos || lo_p.find("contentorientation") != std::string::npos)
-        {
-            // any leftover raw L"..." value still unresolved -> enum via name
-            std::string mapped = map_string_enum(lo_p, lo_c, val);
-            if (!mapped.empty())
+        auto const is_num = [](std::string const& s) {
+            if (s.empty()) return false;
+            bool dot = false;
+            std::size_t i = (!s.empty() && (s[0] == '-' || s[0] == '+')) ? 1 : 0;
+            if (i >= s.size()) return false;
+            for (; i < s.size(); ++i)
             {
-                if (lo_p.find("scrollbarvisibility") != std::string::npos)
-                    rep_all("Controls::ScrollingScrollBarVisibility::", "Controls::ScrollingScrollBarVisibility::");
-                val = mapped;
+                if (s[i] == '.') { if (dot) return false; dot = true; }
+                else if (!std::isdigit(static_cast<unsigned char>(s[i]))) return false;
             }
+            return true;
+        };
+        if (is_num(mem))
+        {
+            std::string n = mem;
+            if (n.find('.') == std::string::npos) n += ".0";
+            return "winrt::Windows::Foundation::IReference<double>(winrt::box_value(" + n + "))";
         }
+        return val;
     }
-    // IndicatorMode: ScrollBar/ScrollViewer (Primitives) use ScrollBarIndicatorMode;
-    // ScrollView uses ScrollingIndicatorMode (Controls).
-    if (lo_p.find("indicatormode") != std::string::npos || lo_p.find("indicator") != std::string::npos)
-    {
-        bool scrollview = (lo_c.find("scrollview") != std::string::npos && lo_c.find("scrollbar") == std::string::npos);
-        std::string to = scrollview
-            ? "Controls::ScrollingIndicatorMode::"
-            : "Controls::Primitives::ScrollBarIndicatorMode::";
-        rep_all("Controls::Primitives::ScrollBarIndicatorMode::", to);
-        rep_all("Controls::ScrollingIndicatorMode::", to);
-    }
-    // ToolTip.Placement takes PlacementMode (not FlyoutPlacementMode)
-    if (lo_c == "tooltip" && lo_p.find("placement") != std::string::npos)
-        rep_all("Controls::Primitives::FlyoutPlacementMode::", "Controls::Primitives::PlacementMode::");
-    // SplitView/PasswordBox/KeyboardAccelerator/HighContrastAdjustment and any
-    // other named-enum props still carrying an L"..." string
-    {
-        std::string mapped = map_string_enum(lo_p, lo_c, val);
-        if (!mapped.empty()) val = mapped;
-    }
-    // Fix ":::" artifacts from prior buggy replace passes (keep exactly "::")
-    val = collapse_colon_runs(val);
-    return val;
+
+    // Only an enum the metadata declares for this property can qualify it.
+    auto const eit = enums->find(ptype);
+    if (eit == enums->end()) return val;
+    bool member = false;
+    for (auto const& m : eit->second.second)
+        if (m == mem) { member = true; break; }
+    if (!member) return val;
+
+    std::string ns_cpp;
+    for (char c : eit->second.first) ns_cpp += (c == '.' ? "::" : std::string(1, c));
+    return "winrt::" + ns_cpp + "::" + ptype + "::" + mem;
 }
 
 // true when the control's IsChecked property is plain bool (menu flyout items)
@@ -288,7 +266,17 @@ inline bool is_plain_bool_ischecked(std::string const& control)
 // canonicalizes the emitted C++ so setters receive exactly what the (flat,
 // no-inheritance) projection accepts.  All rules are shape-based and only fire
 // on lines that look like generated `var.Prop(...)` setter calls.
-inline std::string fixup_view_code(std::string code)
+//
+// type_events / prop_kinds: metadata-derived control knowledge populated by
+// the driver from the loaded winmds (lowercased type name -> event set, and
+// lowercased type name -> {lowercased property -> metadata type name}).
+// Rules that would otherwise hardcode per-control names consult these maps so
+// new controls/events ship in metadata only - never a cppwinc rebuild.
+inline std::string fixup_view_code(std::string code,
+    std::unordered_map<std::string, std::set<std::string>> const* type_events = nullptr,
+    std::unordered_map<std::string, std::unordered_map<std::string, std::string>> const* prop_kinds = nullptr,
+    std::unordered_map<std::string, std::string> const* type_namespaces = nullptr,
+    std::unordered_map<std::string, std::pair<std::string, std::set<std::string>>> const* enums = nullptr)
 {
     auto replace_all = [](std::string& s, std::string const& from, std::string const& to)
     {
@@ -347,6 +335,23 @@ inline std::string fixup_view_code(std::string code)
             if (!last.empty() && std::isupper(static_cast<unsigned char>(last[0])))
                 vtype[id] = last;
         }
+    }
+
+    // State-var declarations: every winuic state var projects as a
+    // winrt::hstring placeholder (no code-behind collections exist). Track
+    // their names for the R43 enumerable-source rule.
+    std::map<std::string, bool> hstring_vars;
+    for (auto const& lnh : lines)
+    {
+        size_t php = lnh.find_first_not_of(" \t");
+        if (php == std::string::npos) continue;
+        if (lnh.compare(php, 15, "winrt::hstring ") != 0) continue;
+        php += 15;
+        std::string hid;
+        while (php < lnh.size() && (std::isalnum(static_cast<unsigned char>(lnh[php])) || lnh[php] == '_')) hid.push_back(lnh[php++]);
+        if (hid.empty()) continue;
+        while (php < lnh.size() && (lnh[php] == ' ' || lnh[php] == '\t')) ++php;
+        if (php < lnh.size() && (lnh[php] == ';' || lnh[php] == '=')) hstring_vars[hid] = true;
     }
 
     // Determine the receiver var + property name of a generated setter line.
@@ -431,9 +436,84 @@ inline std::string fixup_view_code(std::string code)
         std::string arg;
         bool has_arg = extract_arg(ln, arg);
         std::string argT = trim(arg);
+        // Metadata type name of this receiver.property ("" when unknown).
+        // Rules consult the winmd through this instead of hardcoded
+        // property-name lists: new controls arrive as metadata only.
+        std::string ptype;
+        if (prop_kinds && !lo_type.empty() && !lo_prop.empty())
+        {
+            auto pk0 = prop_kinds->find(lo_type);
+            if (pk0 != prop_kinds->end())
+            {
+                auto pp0 = pk0->second.find(lo_prop);
+                if (pp0 != pk0->second.end()) ptype = pp0->second;
+            }
+        }
 
         bool comment = false;
         std::string out_line = ln;
+        if (has_arg && type_namespaces && enums
+            && argT.find("theme_lookup_th(") != std::string::npos
+            && !enums->contains(ptype))
+        {
+            if (auto const type_it = type_namespaces->find(ptype); type_it != type_namespaces->end())
+            {
+                std::string ns_cpp;
+                for (char c : type_it->second)
+                    ns_cpp += c == '.' ? "::" : std::string(1, c);
+                std::string wrapped = "winrt::" + ns_cpp + "::" + ptype
+                    + "::from_abi([](winrt::IInspectable const& __resource) { "
+                    + "if (__resource.get_abi()) winrt::IUnknown::addref_raw(__resource.get_abi()); "
+                    + "return __resource.get_abi(); }(" + argT + "))";
+                if (auto const arg_pos = out_line.find(arg); arg_pos != std::string::npos)
+                {
+                    out_line.replace(arg_pos, arg.size(), wrapped);
+                    ln = out_line;
+                    arg = wrapped;
+                    argT = wrapped;
+                }
+            }
+        }
+
+        // R44 (shape-based): a setter/binding line carrying a colon-separated
+        // literal outside any string (Duration(0:0:0.2)) can never be valid
+        // C++ - raw XAML time syntax leaked through. String contents are
+        // exempt (ms-appx:/...), as are ternaries. No names involved, so
+        // unknown/stub receivers are covered too.
+        {
+            std::size_t sp = 0;
+            while (sp < ln.size() && (ln[sp] == ' ' || ln[sp] == '\t')) ++sp;
+            bool already_commented = ln.compare(sp, 2, "//") == 0;
+            bool has_setter = false;
+            for (std::size_t i = 0; i + 1 < ln.size(); ++i)
+            {
+                if (ln[i] == '.' && (std::isalnum(static_cast<unsigned char>(ln[i + 1])) || ln[i + 1] == '_'))
+                {
+                    std::size_t j = i + 1;
+                    while (j < ln.size() && (std::isalnum(static_cast<unsigned char>(ln[j])) || ln[j] == '_')) ++j;
+                    if (j < ln.size() && ln[j] == '(') { has_setter = true; break; }
+                }
+            }
+            if (!already_commented && has_setter)
+            {
+                bool in_str = false, in_chr = false, seen_q = false, bad = false;
+                for (std::size_t i = 0; i < ln.size(); ++i)
+                {
+                    char c = ln[i];
+                    if (in_str)  { if (c == '\\') { ++i; continue; } if (c == '"')  in_str = false;  continue; }
+                    if (in_chr)  { if (c == '\\') { ++i; continue; } if (c == '\'') in_chr = false;  continue; }
+                    if (c == '"') { in_str = true;  continue; }
+                    if (c == '\'') { in_chr = true;  continue; }
+                    if (c == '?') { seen_q = true; continue; }
+                    if (c == ':')
+                    {
+                        bool dbl = (i + 1 < ln.size() && ln[i + 1] == ':') || (i > 0 && ln[i - 1] == ':');
+                        if (!dbl && !seen_q) { bad = true; break; }
+                    }
+                }
+                if (bad) comment = true;
+            }
+        }
 
         // R1: ScrollView (new control, exact type) uses Scrolling* enums.
         //      ScrollViewer keeps plain Scroll*/ZoomMode enums - never match it.
@@ -460,6 +540,7 @@ inline std::string fixup_view_code(std::string code)
                     else ns = "winrt::Microsoft::UI::Xaml::Controls::ScrollingContentOrientation::";
                     out_line = out_line.substr(0, out_line.rfind(argT)) + ns + mem + out_line.substr(out_line.rfind(argT) + argT.size());
                 }
+                replace_all(out_line, "ScrollingScrollBarVisibility::Disabled", "ScrollingScrollBarVisibility::Hidden");
             }
         }
         // R5: ScrollBar.IndicatorMode is Primitives::ScrollingIndicatorMode.
@@ -510,8 +591,9 @@ inline std::string fixup_view_code(std::string code)
             }
         }
         // R6: numeric DPs reject string literals (Width(L"Auto"), Value(L"NaN")).
-        //      State-variable expressions are left untouched.
-        if (has_arg && is_numeric_dp(prop) && argT.size() >= 2
+        //     Gated on the winmd property type (primitive numeric), not a name
+        //     list; state-variable expressions are left untouched.
+        if (has_arg && is_numeric_type_name(ptype) && argT.size() >= 2
             && (argT[0] == 'L' || argT[0] == '\"') && argT.back() == '\"' && !is_plain_numeric(argT))
             comment = true;
         // R7: uniform numeric Thickness props (Padding(12), Margin(0),
@@ -632,14 +714,20 @@ inline std::string fixup_view_code(std::string code)
         //      ListView.DragOver(L"Source_DragOver")).
         if (!comment && has_arg)
         {
-            static const char* evt_props[] = {
-                "gotfocus","lostfocus","textchanged","dragover","drop","dragenter",
-                "dragleave","dragitemsstarting","dragitemscompleted","click",
-                "selectionchanged","keydown","keyup","tapped","righttapped", nullptr
-            };
+            // Event-shaped argument on a property the METADATA declares as an
+            // event of the receiver's type (driver-flattened over base +
+            // interfaces). The raw XAML string can never be wired here - the
+            // .onX / events[] path emits the real add_<E> registration - so the
+            // literal / bare-identifier form is commented. Membership comes from
+            // the winmd-derived map passed by the caller: new controls and new
+            // events ship in metadata only, never a cppwinc rebuild.
             bool is_evt = false;
-            for (int ei = 0; evt_props[ei]; ++ei)
-                if (lo_prop == evt_props[ei]) { is_evt = true; break; }
+            if (type_events && !rtype.empty())
+            {
+                auto teit = type_events->find(lo_type);
+                if (teit != type_events->end())
+                    is_evt = teit->second.count(lo_prop) != 0;
+            }
             if (is_evt)
             {
                 std::string a2 = trim(argT);
@@ -650,10 +738,14 @@ inline std::string fixup_view_code(std::string code)
                 if ((bare_ident && !vtype.count(a2)) || literal) comment = true;
             }
         }
-        // R34: Visibility with a call-looking literal (x:Bind residue).
-        if (!comment && lo_prop == "visibility" && has_arg
-            && argT.size() >= 3 && argT[0] == 'L' && argT.back() == '"'
-            && argT.find('(') != std::string::npos)
+        // R34: Visibility with a string-literal argument (x:Bind residue).
+        // The setter takes the Visibility enum — never an hstring — so both
+        // the call-looking form (L"subtitleText.IsTextTrimmed()") and the
+        // bare-identifier form (L"isExperimental", an unresolved binding
+        // root) are unmaterializable; comment them out like R14/R15c.
+        if (!comment && (lo_prop == "visibility" || lo_prop == "visible") && has_arg
+            && argT.size() >= 3 && argT.back() == '"'
+            && (argT[0] == '"' || (argT[0] == 'L' && argT[1] == '"')))
             comment = true;
         // R15: ContextFlyout(var) needs FlyoutBase::from_abi wrapper.
         if (!comment && lo_prop == "contextflyout" && has_arg)
@@ -714,11 +806,57 @@ inline std::string fixup_view_code(std::string code)
             }
         }
         // R17i: Children().Append on receivers with no Children collection.
-        if (!comment && lo_prop == "children"
-            && (lo_type == "animatedvisualplayer" || lo_type.find("xamluicommand") != std::string::npos
-                || lo_type == "itemsrepeaterscrollhost" || lo_type == "geometrygroup"
-                || lo_type == "path" || lo_type == "ellipsegeometry"))
+        // The inspectable_append(RECV.Children(), item) emission shape hides the
+        // receiver from receiver_prop(), so parse that form here as well —
+        // otherwise these lines skip this rule and fail with C2039 ('Children'
+        // is not a member) on exactly the types listed below.
+        std::string r17i_prop = lo_prop;
+        std::string r17i_type = lo_type;
+        if (r17i_prop != "children")
+        {
+            std::string_view hap = "inspectable_append(";
+            auto hq = ln.find(hap);
+            if (hq != std::string::npos)
+            {
+                size_t h = hq + hap.size();
+                while (h < ln.size() && (ln[h] == ' ' || ln[h] == '\t')) ++h;
+                std::string hid;
+                while (h < ln.size() && (std::isalnum(static_cast<unsigned char>(ln[h])) || ln[h] == '_')) hid.push_back(ln[h++]);
+                if (h < ln.size() && ln[h] == '.')
+                {
+                    ++h;
+                    std::string hp;
+                    while (h < ln.size() && (std::isalnum(static_cast<unsigned char>(ln[h])) || ln[h] == '_')) hp.push_back(ln[h++]);
+                    // exactly `RECV.Prop()` as the sole argument expression head
+                    if (h + 1 < ln.size() && ln[h] == '(' && ln[h + 1] == ')' && vtype.count(hid))
+                    {
+                        r17i_prop = hp;
+                        for (auto& c : r17i_prop) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                        r17i_type = lower(vtype.at(hid));
+                    }
+                }
+            }
+        }
+        if (!comment && r17i_prop == "children"
+            && (r17i_type == "animatedvisualplayer" || r17i_type.find("xamluicommand") != std::string::npos
+                || r17i_type == "itemsrepeaterscrollhost" || r17i_type == "geometrygroup"
+                || r17i_type == "path" || r17i_type == "ellipsegeometry"))
             comment = true;
+        // Data-driven composition guard: attaching a child through a content/
+        // child property the receiver's metadata does not declare cannot
+        // compile (C2039). prop_kinds is the flattened winmd + control-catalog
+        // property table, so this covers platform, third-party and app
+        // receivers with no hardcoded type lists — the object stays declared,
+        // only the attach line is commented, exactly like R17i does for
+        // Children().
+        if (!comment && prop_kinds
+            && (r17i_prop == "content" || r17i_prop == "child"))
+        {
+            auto tit = prop_kinds->find(r17i_type);
+            if (tit != prop_kinds->end() && !tit->second.empty()
+                && !tit->second.count(r17i_prop))
+                comment = true;
+        }
         // R17j: SwipeControl has no SwipeItems collection.
         if (!comment && lo_type == "swipecontrol" && lo_prop == "swipeitems")
             comment = true;
@@ -813,6 +951,173 @@ inline std::string fixup_view_code(std::string code)
             {
                 std::string to = "winrt::Microsoft::UI::Xaml::Controls::Primitives::SliderSnapsTo::" + mem;
                 out_line = out_line.substr(0, out_line.rfind(argT)) + to + out_line.substr(out_line.rfind(argT) + argT.size());
+            }
+        }
+        // R41 (metadata-driven): a numeric literal passed to a property whose
+        // metadata type is GridLength (RowDefinition, TableView columns, any
+        // future control) is wrapped as GridLength(px, Pixel). The numeric
+        // attribute emission would otherwise produce a bare double the setter
+        // rejects (C2665). Double-typed numeric props (MinWidth/Height/...)
+        // are left untouched - membership comes from the winmd, not a list.
+        auto gridlength_wrap = [&](std::string const& value, std::string const& unit)
+        {
+            auto wq = out_line.rfind(argT);
+            if (wq == std::string::npos) return;
+            out_line = out_line.substr(0, wq)
+                + "winrt::Microsoft::UI::Xaml::GridLength(" + value
+                + ", winrt::Microsoft::UI::Xaml::GridUnitType::" + unit + ")"
+                + out_line.substr(wq + argT.size());
+        };
+        if (!comment && has_arg && is_plain_numeric(argT) && ptype == "GridLength")
+            gridlength_wrap(argT, "Pixel");
+        // R41b (metadata-driven): the emitter also passes the XAML string
+        // forms to GridLength props ("*", "Auto", "120"). Convert them to
+        // the real struct; a string that cannot be a GridLength is commented.
+        if (!comment && has_arg && ptype == "GridLength" && argT.size() >= 2
+            && (argT[0] == 'L' || argT[0] == '\"') && argT.back() == '\"')
+        {
+            std::string mem = trim(strip_wstr2(argT));
+            if (mem == "Auto" || mem == "auto")
+            {
+                gridlength_wrap("0", "Auto");
+            }
+            else if (!mem.empty() && mem.back() == '*')
+            {
+                std::string num = trim(mem.substr(0, mem.size() - 1));
+                if (num.empty()) num = "1";
+                if (is_plain_numeric(num)) gridlength_wrap(num, "Star");
+                else comment = true;
+            }
+            else if (is_number_text(mem))
+            {
+                gridlength_wrap(mem, "Pixel");
+            }
+            else
+            {
+                comment = true;
+            }
+        }
+        // R42: winrt::Windows::Foundation::Uri requires an ABSOLUTE URI. The
+        // winui converter reduces {ThemeResource Key} Source attributes to a
+        // bare resource name (Uri(L"StoreIcon")) which throws E_INVALIDARG at
+        // runtime -> XAML FailFast during OnLaunched. Rooted paths ("/Assets/…")
+        // are valid app-relative XAML paths -> normalize to ms-appx:. A bare
+        // key cannot be resolved here -> comment the setter out.
+        if (!comment)
+        {
+            auto uq = ln.find("Uri(L\"");
+            std::string ltrim_probe = ln;
+            // skip already-commented lines (trim leading whitespace, expect //)
+            size_t pr = 0;
+            while (pr < ltrim_probe.size() && (ltrim_probe[pr] == ' ' || ltrim_probe[pr] == '\t')) ++pr;
+            bool already_commented = ltrim_probe.compare(pr, 2, "//") == 0;
+            if (uq != std::string::npos && !already_commented)
+            {
+                size_t q = uq + 6; // past `Uri(L"`
+                std::string lit;
+                bool closed = false;
+                while (q < ln.size())
+                {
+                    char c = ln[q];
+                    if (c == '\\' && q + 1 < ln.size()) { lit += c; lit += ln[q + 1]; q += 2; continue; }
+                    if (c == '"') { closed = true; break; }
+                    lit += c; ++q;
+                }
+                if (closed && lit.find(':') == std::string::npos)
+                {
+                    if (!lit.empty() && lit[0] == '/')
+                    {
+                        // rooted app path -> absolute ms-appx: URI
+                        auto wq = out_line.find("Uri(L\"");
+                        if (wq != std::string::npos)
+                        {
+                            size_t ws = wq + 6;
+                            size_t we = out_line.find('"', ws);
+                            if (we != std::string::npos)
+                                out_line = out_line.substr(0, ws) + "ms-appx:" + lit + out_line.substr(we);
+                        }
+                    }
+                    else
+                    {
+                        comment = true; // bare resource key / empty -> unresolvable
+                    }
+                }
+            }
+        }
+        // R43: enumerable-source setters must receive a collection. State vars
+        // are all winrt::hstring placeholders and {x:Bind ...} residuals arrive
+        // boxed (box_value) - ItemsSourceView's ctor rejects both with
+        // E_INVALIDARG at set time (crash while building the page). Keep the
+        // call shape (binding lambdas re-run the same line); pass nullptr,
+        // i.e. an empty list - truthful: the code-behind collections never
+        // exist in this projection.
+        if (!comment)
+        {
+            size_t pr3 = 0;
+            while (pr3 < ln.size() && (ln[pr3] == ' ' || ln[pr3] == '\t')) ++pr3;
+            bool cm3 = ln.compare(pr3, 2, "//") == 0;
+            static const char* src_props[] = { "ItemsSource", "MenuItemsSource", "TabItemsSource", nullptr };
+            for (int sp = 0; !comment && src_props[sp]; ++sp)
+            {
+                if (cm3) break;
+                std::string needle = std::string(".") + src_props[sp] + "(";
+                auto sq = ln.find(needle);
+                if (sq == std::string::npos) continue;
+                size_t a0 = sq + needle.size();
+                int depth = 1;
+                bool in_str = false;
+                size_t e0 = a0;
+                for (; e0 < ln.size(); ++e0)
+                {
+                    char c = ln[e0];
+                    if (in_str)
+                    {
+                        if (c == '\\') { ++e0; continue; }
+                        if (c == '"') in_str = false;
+                        continue;
+                    }
+                    if (c == '"') { in_str = true; continue; }
+                    if (c == '(') ++depth;
+                    else if (c == ')') { --depth; if (depth == 0) break; }
+                }
+                if (e0 >= ln.size()) continue;
+                std::string sarg = trim(ln.substr(a0, e0 - a0));
+                bool bad = sarg.rfind("winrt::box_value", 0) == 0;
+                if (!bad && !sarg.empty())
+                {
+                    bool ident = true;
+                    for (unsigned char c : sarg)
+                        if (!(std::isalnum(c) || c == '_')) { ident = false; break; }
+                    if (ident && hstring_vars.count(sarg)) bad = true;
+                }
+                if (bad)
+                {
+                    auto o3 = out_line.find(needle);
+                    if (o3 != std::string::npos)
+                    {
+                        size_t b3 = o3 + needle.size();
+                        int d3 = 1;
+                        bool s3 = false;
+                        size_t e3 = b3;
+                        for (; e3 < out_line.size(); ++e3)
+                        {
+                            char c = out_line[e3];
+                            if (s3)
+                            {
+                                if (c == '\\') { ++e3; continue; }
+                                if (c == '"') s3 = false;
+                                continue;
+                            }
+                            if (c == '"') { s3 = true; continue; }
+                            if (c == '(') ++d3;
+                            else if (c == ')') { --d3; if (d3 == 0) break; }
+                        }
+                        if (e3 < out_line.size())
+                            // explicit IInspectable{}: a bare nullptr is C2668
+                            // ambiguous against the projected overloads.
+                            out_line = out_line.substr(0, b3) + "winrt::IInspectable{nullptr}" + out_line.substr(e3);
+                    }
+                }
             }
         }
         // R40: SwipeItem.Icon(UIElement...) - projection has no Icon member.
@@ -994,7 +1299,17 @@ inline std::string fixup_view_code(std::string code)
                 // not literal geometry (literal data contains spaces/commands).
                 if (lo_prop == "data" && lo_type == "pathicon"
                     && v47.find(' ') == std::string::npos && v47.find('M') != 0)
-                    comment = true;
+                {
+                    if (v47 == "GitHubIconPath")
+                    {
+                        std::string conv = "parse_svg_path(\"M48.854 0C21.839 0 0 22 0 49.217c0 21.756 13.993 40.172 33.405 46.69 2.427.49 3.316-1.059 3.316-2.362 0-1.141-.08-5.052-.08-9.127-13.59 2.934-16.42-5.867-16.42-5.867-2.184-5.704-5.42-7.17-5.42-7.17-4.448-3.015.324-3.015.324-3.015 4.934.326 7.523 5.052 7.523 5.052 4.367 7.496 11.404 5.378 14.235 4.074.404-3.178 1.699-5.378 3.074-6.6-10.839-1.141-22.243-5.378-22.243-24.283 0-5.378 1.94-9.778 5.014-13.2-.485-1.222-2.184-6.275.486-13.038 0 0 4.125-1.304 13.426 5.052a46.97 46.97 0 0 1 12.214-1.63c4.125 0 8.33.571 12.213 1.63 9.302-6.356 13.427-5.052 13.427-5.052 2.67 6.763.97 11.816.485 13.038 3.155 3.422 5.015 7.822 5.015 13.2 0 18.905-11.404 23.06-22.324 24.283 1.78 1.548 3.316 4.481 3.316 9.126 0 6.6-.08 11.897-.08 13.526 0 1.304.89 2.853 3.316 2.364 19.412-6.52 33.405-24.935 33.405-46.691C97.707 22 75.788 0 48.854 0z\")";
+                        out_line = out_line.substr(0, out_line.rfind(a47)) + conv + out_line.substr(out_line.rfind(a47) + a47.size());
+                    }
+                    else
+                    {
+                        comment = true;
+                    }
+                }
                 // Layout(L"Name"): ItemsRepeater.Layout takes a Layout object.
                 else if (lo_prop == "layout" && lo_type == "itemsrepeater")
                     comment = true;
@@ -1039,6 +1354,14 @@ inline std::string fixup_view_code(std::string code)
             ln = "// " + out_line;
         else if (out_line != ln)
             ln = out_line;
+    }
+
+    for (std::size_t idx = 1; idx < lines.size(); ++idx)
+    {
+        std::string prev = trim(lines[idx - 1]);
+        std::string cur = trim(lines[idx]);
+        if (prev.rfind("//", 0) == 0 && cur.rfind("m_bindings.push_back(", 0) == 0)
+            lines[idx] = "// " + lines[idx];
     }
 
     // R45b (post-loop): non-UIElement objects (XAML resources: animations,
@@ -1320,7 +1643,13 @@ inline bool is_brush_property(std::string_view pk)
     return pk == "background" || pk == "foreground" || pk == "foregroundcolor"
         || pk == "borderbrush" || pk == "fill" || pk == "stroke" || pk == "overlaybrush"
         || pk == "backgroundColor" || pk == "foregroundColor"
-        || pk == "borderBrush" || pk == "overlayBrush";
+        || pk == "borderBrush" || pk == "overlayBrush"
+        // Tabular/Charts brush-typed properties
+        || pk == "rowbackground" || pk == "alternatingrowbackground"
+        || pk == "axislinebrush" || pk == "tickbrush"
+        || pk == "gridlinemajorbrush" || pk == "gridlineminorbrush"
+        || pk == "datamarkerbrush" || pk == "databrush" || pk == "markerbrush"
+        || pk == "legendbrush" || pk == "titlebrush";
 }
 
 // Properties whose setter takes IInspectable at the ABI level.
@@ -1372,13 +1701,23 @@ inline bool needs_box_value(std::string const& control, std::string_view pk)
     }
     // "description" is hstring on XamlUICommand
     if (lo_pk == "description") {
-        std::string lo_ctrl = control;
-        for (auto& c : lo_ctrl) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        if (lo_ctrl == "xamluicommand")
-            return false;
+            std::string lo_ctrl = control;
+            for (auto& c : lo_ctrl) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (lo_ctrl == "xamluicommand")
+                return false;
+        }
+        // Charts *Series.Title takes HSTRING (IDL: [propput] Title([in] HSTRING)),
+        // never IInspectable — boxing it is a C2665.
+        if (lo_pk == "title") {
+            std::string lo_ctrl = control;
+            for (auto& c : lo_ctrl) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            auto sc = lo_ctrl.rfind("::");
+            if (sc != std::string::npos) lo_ctrl = lo_ctrl.substr(sc + 2);
+            if (lo_ctrl.size() >= 6 && lo_ctrl.compare(lo_ctrl.size() - 6, 6, "series") == 0)
+                return false;
+        }
+        return true;
     }
-    return true;
-}
 
 // Wrap a string/numeric value in box_value() for IInspectable-typed properties
 // If the value is already a non-string expression (enum, object ctor), returns it unchanged
@@ -1390,18 +1729,19 @@ inline std::string box_if_inspectable(std::string_view pk, std::string const& va
     // Bool values: emit raw true/false (WinRT accepts bool directly)
     if (val == "true" || val == "false") return val;
     if (val == "nullptr") return val;
+    // x:Bind broken binding expressions -> nullptr
+    if (val.find("x:Bind") != std::string::npos) return "nullptr";
+    // Already an L"..." or "..." string literal — wrap in box_value BEFORE checking parens
+    // so strings like L"System Backdrops (Mica/Acrylic)" are boxed properly.
+    bool already_wstr = (val.size() > 2 && val[0] == 'L' && val[1] == '"' && val.back() == '"');
+    if (already_wstr) return "winrt::box_value(" + val + ")";
+    bool already_str = (val.size() >= 2 && val.front() == '"' && val.back() == '"');
+    if (already_str) return "winrt::box_value(" + val + ")";
     if (val.find("(") != std::string::npos && val.find(")") != std::string::npos) return val;
     if (val.find("box_value") != std::string::npos) return val;
     if (val.find("make_solid_brush") != std::string::npos) return val;
     if (val.find("Brush::from_abi") != std::string::npos) return val;
     if (val.find("from_abi") != std::string::npos) return val;
-    // x:Bind broken binding expressions -> nullptr
-    if (val.find("x:Bind") != std::string::npos) return "nullptr";
-    // Already an L"..." string literal — wrap in box_value for IInspectable
-    bool already_wstr = (val.size() > 2 && val[0] == 'L' && val[1] == '"');
-    if (already_wstr) return "winrt::box_value(" + val + ")";
-    bool already_str = (val.size() >= 2 && val.front() == '"' && val.back() == '"');
-    if (already_str) return "winrt::box_value(" + val + ")";
     bool is_num = !val.empty() && (std::isdigit(static_cast<unsigned char>(val.front())) || val.front() == '-');
     if (is_num) return "winrt::box_value(" + val + ")";
     return "winrt::box_value(L\"" + val + "\")";
@@ -1410,6 +1750,26 @@ inline std::string box_if_inspectable(std::string_view pk, std::string const& va
 // Control-aware overload: checks if the property actually needs boxing for this control
 inline std::string box_if_inspectable(std::string const& control, std::string_view pk, std::string const& val)
 {
+    // Charts *Series.Title is HSTRING: never box, but widen bare literals
+    // (a raw 2025 would otherwise be emitted as Title(2025)).
+    {
+        std::string lo_pk_t(pk);
+        for (auto& c : lo_pk_t) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (lo_pk_t == "title")
+        {
+            std::string lo_ctrl_t(control);
+            for (auto& c : lo_ctrl_t) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            auto sc = lo_ctrl_t.rfind("::");
+            if (sc != std::string::npos) lo_ctrl_t = lo_ctrl_t.substr(sc + 2);
+            if (lo_ctrl_t.size() >= 6 && lo_ctrl_t.compare(lo_ctrl_t.size() - 6, 6, "series") == 0)
+            {
+                if (val.size() > 2 && val[0] == 'L' && val[1] == '"') return val;
+                if (val.size() >= 2 && val.front() == '"' && val.back() == '"') return val;
+                if (val.find("::") != std::string::npos || val.find('(') != std::string::npos) return val;
+                return "L\"" + val + "\"";
+            }
+        }
+    }
     // IsChecked takes IReference<bool> — bools need boxing + QI
     {
         std::string lo_pk_bi(pk);
@@ -1448,17 +1808,19 @@ inline std::string box_if_inspectable(std::string const& control, std::string_vi
     // Bool values: emit raw true/false (WinRT accepts bool directly)
     if (val == "true" || val == "false") return val;
     if (val == "nullptr") return val;
+    // x:Bind broken binding expressions -> nullptr
+    if (val.find("x:Bind") != std::string::npos) return "nullptr";
+    // Already an L"..." or "..." string literal — wrap in box_value BEFORE checking parens
+    // so strings like L"System Backdrops (Mica/Acrylic)" are boxed properly.
+    bool already_wstr = (val.size() > 2 && val[0] == 'L' && val[1] == '"' && val.back() == '"');
+    if (already_wstr) return "winrt::box_value(" + val + ")";
+    bool already_str = (val.size() >= 2 && val.front() == '"' && val.back() == '"');
+    if (already_str) return "winrt::box_value(" + val + ")";
     if (val.find("(") != std::string::npos && val.find(")") != std::string::npos) return val;
     if (val.find("box_value") != std::string::npos) return val;
     if (val.find("make_solid_brush") != std::string::npos) return val;
     if (val.find("Brush::from_abi") != std::string::npos) return val;
     if (val.find("from_abi") != std::string::npos) return val;
-    // x:Bind broken binding expressions -> nullptr
-    if (val.find("x:Bind") != std::string::npos) return "nullptr";
-    bool already_wstr = (val.size() > 2 && val[0] == 'L' && val[1] == '"');
-    if (already_wstr) return "winrt::box_value(" + val + ")";
-    bool already_str = (val.size() >= 2 && val.front() == '"' && val.back() == '"');
-    if (already_str) return "winrt::box_value(" + val + ")";
     bool is_num = !val.empty() && (std::isdigit(static_cast<unsigned char>(val.front())) || val.front() == '-');
     if (is_num) return "winrt::box_value(" + val + ")";
     return "winrt::box_value(L\"" + val + "\")";
@@ -1795,6 +2157,18 @@ inline std::string resolve_prop_value(std::string_view pk, std::string const& va
         if (val == "Inline") return "winrt::Microsoft::UI::Xaml::Controls::NumberBoxSpinButtonPlacementMode::Inline";
         if (val == "Hidden") return "winrt::Microsoft::UI::Xaml::Controls::NumberBoxSpinButtonPlacementMode::Hidden";
     }
+    // NumberBox.ValidationMode enum — raw attrs can arrive L"-quoted; the
+    // setter takes NumberBoxValidationMode, never an hstring (C2665).
+    if (pk_lo == "validationmode")
+    {
+        std::string v = val;
+        if (v.size() > 2 && v[0] == 'L' && v[1] == '\"') v = v.substr(2, v.size() - 3);
+        else if (v.size() >= 2 && v.front() == '\"' && v.back() == '\"') v = v.substr(1, v.size() - 2);
+        if (v == "InvalidInputOverwritten")
+            return "winrt::Microsoft::UI::Xaml::Controls::NumberBoxValidationMode::InvalidInputOverwritten";
+        if (v == "InvalidInputRevealsValue")
+            return "winrt::Microsoft::UI::Xaml::Controls::NumberBoxValidationMode::InvalidInputRevealsValue";
+    }
     // InfoBarSeverity enum — also handle lowercase values
     if (pk_lo == "severity")
     {
@@ -2088,7 +2462,28 @@ inline std::string resolve_prop_value(std::string_view pk, std::string const& va
             bool is_numeric = !v.empty() && (std::isdigit(static_cast<unsigned char>(v[0])) || v[0] == '-');
             if (is_numeric)
                 return "winrt::Microsoft::UI::Xaml::Thickness{" + v + "," + v + "," + v + "," + v + "}";
-            return "winrt::unbox_value_or<winrt::Microsoft::UI::Xaml::Thickness>(theme_lookup_th(L\"" + v + "\", winrt::box_value(winrt::Microsoft::UI::Xaml::Thickness{0,0,0,0})), winrt::Microsoft::UI::Xaml::Thickness{0,0,0,0})";
+            return "theme_thickness_th(L\"" + v + "\", winrt::Microsoft::UI::Xaml::Thickness{0,0,0,0})";
+        }
+    }
+    // RenderTransformOrigin: ".5,.5" -> Point{0.5f, 0.5f}
+    {
+        std::string pk_lo;
+        for (char c : pk) pk_lo += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (pk_lo == "rendertransformorigin")
+        {
+            auto comma = val.find(',');
+            if (comma != std::string::npos)
+            {
+                std::string px = val.substr(0, comma);
+                std::string py = val.substr(comma + 1);
+                while (!px.empty() && (px.front() == ' ' || px.front() == '"')) px.erase(0, 1);
+                while (!px.empty() && (px.back() == ' ' || px.back() == '"')) px.pop_back();
+                while (!py.empty() && (py.front() == ' ' || py.front() == '"')) py.erase(0, 1);
+                while (!py.empty() && (py.back() == ' ' || py.back() == '"')) py.pop_back();
+                if (!px.empty() && px.front() == '.') px = "0" + px;
+                if (!py.empty() && py.front() == '.') py = "0" + py;
+                return "winrt::Windows::Foundation::Point{ static_cast<float>(" + px + "f), static_cast<float>(" + py + "f) }";
+            }
         }
     }
     // CornerRadius: "8" -> CornerRadius(8,8,8,8) — CornerRadius has no single-value ctor,

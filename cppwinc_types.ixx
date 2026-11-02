@@ -6,6 +6,22 @@
 
 std::string ns_cpp(std::string_view ns)
 {
+    // Each dot segment must be a valid C++ identifier. App namespaces
+    // follow the hyphen naming default ("WinUI-Gallery"), so interior
+    // characters that cannot appear in an identifier (a '-' from the
+    // hyphen-joined app name) map to '_' here - C++ sees winrt::
+    // WinUI_Gallery while the metadata / string spelling stays hyphenated.
+    auto const mangle = [](std::string_view seg)
+    {
+        std::string s(seg);
+        for (char& c : s)
+        {
+            bool const keep = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                           || (c >= '0' && c <= '9') || c == '_';
+            if (!keep) c = '_';
+        }
+        return s;
+    };
     std::string result = "winrt::";
     std::string_view rest = ns;
     bool first = true;
@@ -17,7 +33,7 @@ std::string ns_cpp(std::string_view ns)
         {
             result += "::";
         }
-        result += part;
+        result += mangle(part);
         rest = dot == std::string_view::npos ? std::string_view{} : rest.substr(dot + 1);
         first = false;
     }
@@ -473,7 +489,8 @@ std::string module_name_for_namespace(std::string const& ns)
         return ns;
     }
     // WinRT: module name prefixed with "winrt." (e.g. "winrt.Windows.Foundation")
-    return "winrt." + ns;
+    // - mangled so a hyphenated app namespace still yields a valid module name.
+    return "winrt." + winuic::ident_ns(ns);
 }
 
 // selective -winui type closure

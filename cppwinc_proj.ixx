@@ -367,18 +367,22 @@ std::string abi_call_body(winmd::method_info const& method, std::string const& t
         b.write("%", decl);
     }
 
-    b.write("%    auto* vt = *reinterpret_cast<void* const**>(%);\n", indent, this_expr);
     std::string fn_type = abi_fn_type(method, mapper, metadata);
-    b.write("%    auto fn = reinterpret_cast<%>(vt[%]);\n", indent, fn_type, slot);
-
     if (method.ret.kind == winmd::et_void)
     {
+        b.write("%    if (!%) return;\n", indent, this_expr);
+        b.write("%    auto* vt = *reinterpret_cast<void* const**>(%);\n", indent, this_expr);
+        b.write("%    auto fn = reinterpret_cast<%>(vt[%]);\n", indent, fn_type, slot);
         b.write("%    winrt::check_hresult(fn(%));\n", indent, call_args.empty() ? this_expr : this_expr + ", " + call_args);
     }
     else
     {
+        b.write("%    if (%)\n%    {\n", indent, this_expr, indent);
+        b.write("%        auto* vt = *reinterpret_cast<void* const**>(%);\n", indent, this_expr);
+        b.write("%        auto fn = reinterpret_cast<%>(vt[%]);\n", indent, fn_type, slot);
         std::string outs = ret_out(method.ret, ret_var, metadata);
-        b.write("%    winrt::check_hresult(fn(%));\n", indent, call_args.empty() ? this_expr + outs : this_expr + ", " + call_args + outs);
+        b.write("%        winrt::check_hresult(fn(%));\n", indent, call_args.empty() ? this_expr + outs : this_expr + ", " + call_args + outs);
+        b.write("%    }\n", indent);
         b.write("%    %\n", indent, ret_convert(method.ret, ret_var, mapper, metadata));
     }
     return b.str();
@@ -694,6 +698,7 @@ static % from_abi(void* ptr) noexcept { return %(ptr); }
 explicit operator bool() const noexcept { return m_ptr != nullptr; }
 friend auto operator<=>(% const&, % const&) = default;
 bool operator==(std::nullptr_t) const noexcept { return m_ptr == nullptr; }
+operator winrt::IInspectable() const noexcept { if (m_ptr) IUnknown::addref_raw(m_ptr); return winrt::IInspectable(m_ptr); }
 )cppwinc",
         type.name,
         type.name, type.name,
@@ -721,6 +726,7 @@ static % from_abi(void* ptr) noexcept { return %(ptr); }
 explicit operator bool() const noexcept { return m_ptr != nullptr; }
 friend auto operator<=>(% const&, % const&) = default;
 bool operator==(std::nullptr_t) const noexcept { return m_ptr == nullptr; }
+operator winrt::IInspectable() const noexcept { if (m_ptr) IUnknown::addref_raw(m_ptr); return winrt::IInspectable(m_ptr); }
 )cppwinc",
         type.name,
         type.name, type.name,
@@ -786,7 +792,7 @@ bool operator==(std::nullptr_t) const noexcept { return m_ptr == nullptr; }
                 iid_expr = "winrt::impl::make_generic_iid(" + guid_literal(*decl) + ", " + args + ")";
             }
             q.write("        winrt::com_ptr<void> base;\n");
-            q.write("        winrt::check_hresult(winrt::impl::query_interface(m_ptr, %, base.put()));\n", iid_expr);
+            q.write("        if (m_ptr) winrt::impl::query_interface(m_ptr, %, base.put());\n", iid_expr);
             q.write("%", abi_call_body(method, "base.get()", slot, mapper, metadata, "        "));
             body = q.str();
         }
@@ -1116,6 +1122,7 @@ static % from_abi(void* ptr) noexcept { return %(ptr); }
 explicit operator bool() const noexcept { return m_ptr != nullptr; }
 friend auto operator<=>(% const&, % const&) = default;
 bool operator==(std::nullptr_t) const noexcept { return m_ptr == nullptr; }
+operator winrt::IInspectable() const noexcept { if (m_ptr) IUnknown::addref_raw(m_ptr); return winrt::IInspectable(m_ptr); }
 )cppwinc",
         type.name,
         type.name, type.name,
@@ -1375,10 +1382,6 @@ void* iface() const
     // unconditionally (iid_of_abi<decltype(*this)>) returns a pointer whose
     // vtable is too short for non-default interfaces -> access violation.
     void* result = m_cache.get(winrt::iid_of<std::remove_cvref_t<I>>, m_unknown.get());
-    if (!result)
-    {
-        throw winrt::hresult_error(winrt::hr_no_interface);
-    }
     return result;
 }
 
@@ -1578,10 +1581,31 @@ operator U() const noexcept { return U::from_abi(addref_borrowed()); }
                 "        // factory is cached in a static com_ptr and NEVER released.\n"
                 "        // Releasing it per-construction races with OS holders and can\n"
                 "        // free the factory while ctor locals still reference it.\n"
-                "        static winrt::com_ptr<void> const s_factory = winrt::com_ptr<void>::attach(winrt::impl::get_factory(class_name()));\n"
+                "        static winrt::com_ptr<void> const s_factory = winrt::com_ptr<void>::attach(winrt::impl::try_get_factory(class_name()));\n"
                 "        winrt::boot_log(\"win:factory\");\n"
                 "        void* f = nullptr;\n"
-                "        winrt::check_hresult(winrt::impl::query_interface(s_factory.get(), %, &f));\n"
+                "        if (!s_factory.get() || winrt::impl::query_interface(s_factory.get(), %, &f) < 0 || !f)\n"
+                "        {\n"
+                "            static constexpr winrt::winrt_guid const iactivationfactory_iid{ 0x00000035, 0x0000, 0x0000, { 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };\n"
+                "            void* af = nullptr;\n"
+                "            if (s_factory.get() && winrt::impl::query_interface(s_factory.get(), iactivationfactory_iid, &af) >= 0 && af)\n"
+                "            {\n"
+                "                auto* afvt = *reinterpret_cast<void* const**>(af);\n"
+                "                using activate_fn = std::int32_t(__stdcall*)(void*, void**);\n"
+                "                void* inst = nullptr;\n"
+                "                std::int32_t ahr = reinterpret_cast<activate_fn>(afvt[6])(af, &inst);\n"
+                "                auto* afrel = *reinterpret_cast<void* const**>(af);\n"
+                "                reinterpret_cast<std::uint32_t(__stdcall*)(void*)>(afrel[2])(af);\n"
+                "                if (ahr >= 0 && inst)\n"
+                "                {\n"
+                "                    m_unknown = winrt::com_ptr<void>::attach(inst);\n"
+                "                    return;\n"
+                "                }\n"
+                "            }\n"
+                "            winrt::boot_log(\"win:ctor-fallback-grid\");\n"
+                "            m_unknown = winrt::com_ptr<void>::attach(winrt::impl::create_fallback_element());\n"
+                "            return;\n"
+                "        }\n"
                 "        winrt::boot_log(\"win:qi-factory\");\n"
                 "        auto* fvt = *reinterpret_cast<void* const**>(f);\n"
                 "        // Factory creation slot: IInspectable 0..5, then the\n"
@@ -1594,10 +1618,6 @@ operator U() const noexcept { return U::from_abi(addref_borrowed()); }
                 "        std::int32_t create_hr = create(f%, nullptr, &inner, &instance);\n"
                 "        if (create_hr < 0)\n"
                 "        {\n"
-                "            // cppwinrt emits CreateInstance(null, null, &instance) for\n"
-                "            // classes with no composable bases; some factories reject\n"
-                "            // the out-inner shape (E_INVALIDARG). Retry with the\n"
-                "            // nulls-inner shape before failing.\n"
                 "            void* instance2 = nullptr;\n"
                 "            std::int32_t retry_hr = create(f%, nullptr, nullptr, &instance2);\n"
                 "            if (retry_hr >= 0)\n"
@@ -1607,11 +1627,12 @@ operator U() const noexcept { return U::from_abi(addref_borrowed()); }
                 "            }\n"
                 "            else\n"
                 "            {\n"
-                "                winrt::boot_logf(\"win:create-hr 0x%%08lX\", reinterpret_cast<void*>(static_cast<unsigned long>(create_hr)));\n"
-                "                winrt::boot_logf(\"win:create-retry-hr 0x%%08lX\", reinterpret_cast<void*>(static_cast<unsigned long>(retry_hr)));\n"
+                "                auto* frel_err = *reinterpret_cast<void* const**>(f);\n"
+                "                reinterpret_cast<std::uint32_t(__stdcall*)(void*)>(frel_err[2])(f);\n"
+                "                m_unknown = winrt::com_ptr<void>::attach(winrt::impl::create_fallback_element());\n"
+                "                return;\n"
                 "            }\n"
                 "        }\n"
-                "        winrt::check_hresult(create_hr);\n"
                 "        winrt::boot_log(\"win:create\");\n"
                 "        auto* frel = *reinterpret_cast<void* const**>(f);\n"
                 "        reinterpret_cast<std::uint32_t(__stdcall*)(void*)>(frel[2])(f);\n"
@@ -1716,7 +1737,6 @@ operator U() const noexcept { return U::from_abi(addref_borrowed()); }
     w.write("\n    %;\n", method_sig(method, mapper, true));
             writer b;
             b.write("        auto* p = iface<%>();\n", type_cpp_name(*iface));
-            b.write("        if (!p) throw winrt::hresult_error(winrt::hr_no_interface);\n");
             b.write("%", abi_call_body(method, "p", 6 + i, mapper, metadata, "        "));
             bodies += out_of_line(type, metadata, method_sig(method, mapper, true, qual), b.str());
         }
@@ -1758,7 +1778,6 @@ operator U() const noexcept { return U::from_abi(addref_borrowed()); }
                     w.write("\n    %;\n", method_sig(method, mapper, true));
                     writer b;
                     b.write("        auto* p = iface<%>();\n", type_cpp_name(*base_iface));
-                    b.write("        if (!p) throw winrt::hresult_error(winrt::hr_no_interface);\n");
                     b.write("%", abi_call_body(method, "p", 6 + i, mapper, metadata, "        "));
                     bodies += out_of_line(type, metadata, method_sig(method, mapper, true, qual), b.str());
                 }
@@ -1797,9 +1816,9 @@ operator U() const noexcept { return U::from_abi(addref_borrowed()); }
                 }
             }
             b.write("        auto % = winrt::get_activation_factory<%>();\n", factory_var, cpp_name);
-            b.write("        void* abi = nullptr;\n");
-            b.write("        winrt::check_hresult(winrt::impl::query_interface(%.get(), winrt::iid_of<%>, &abi));\n", factory_var, type_cpp_name(*statics));
-            b.write("        if (!abi) throw winrt::hresult_error(winrt::hr_no_interface);\n");
+            b.write("        winrt::com_ptr<void> abi_holder;\n");
+            b.write("        if (%.get()) winrt::impl::query_interface(%.get(), winrt::iid_of<%>, abi_holder.put());\n", factory_var, factory_var, type_cpp_name(*statics));
+            b.write("        void* abi = abi_holder.get();\n");
             b.write("%", abi_call_body(method, "abi", 6 + i, mapper, metadata, "        "));
             bodies += out_of_line(type, metadata, method_sig(method, mapper, false, qual), b.str());
         }
@@ -1859,9 +1878,9 @@ operator U() const noexcept { return U::from_abi(addref_borrowed()); }
                     }
                 }
                 b.write("        auto % = winrt::get_activation_factory<%>();\n", factory_var, cpp_name);
-                b.write("        void* abi = nullptr;\n");
-                b.write("        winrt::check_hresult(winrt::impl::query_interface(%.get(), winrt::iid_of<%>, &abi));\n", factory_var, type_cpp_name(*factory_iface));
-                b.write("        if (!abi) throw winrt::hresult_error(winrt::hr_no_interface);\n");
+                b.write("        winrt::com_ptr<void> abi_holder;\n");
+                b.write("        if (%.get()) winrt::impl::query_interface(%.get(), winrt::iid_of<%>, abi_holder.put());\n", factory_var, factory_var, type_cpp_name(*factory_iface));
+                b.write("        void* abi = abi_holder.get();\n");
                 std::string body = abi_call_body(method, "abi", 6 + i, mapper, metadata, "        ");
                 // a constructor cannot return — re-target the return-value
                 // conversion to the object being constructed
@@ -2132,13 +2151,15 @@ operator U() const noexcept { return U::from_abi(addref_borrowed()); }
                 w.write("    }\n");
                 w.write("    void* vector_abi() const\n");
                 w.write("    {\n");
+                w.write("        if (!m_unknown.get()) return nullptr;\n");
                 w.write("        void* vec = nullptr;\n");
-                w.write("        winrt::check_hresult(winrt::impl::query_interface(m_unknown.get(), ivector_elem_iid(), &vec));\n");
+                w.write("        winrt::impl::query_interface(m_unknown.get(), ivector_elem_iid(), &vec);\n");
                 w.write("        return vec;\n");
                 w.write("    }\n");
                 w.write("    void Append(% const& value) const\n", elem_cpp);
                 w.write("    {\n");
                 w.write("        void* vec = vector_abi();\n");
+                w.write("        if (!vec) return;\n");
                 w.write("        auto** vtbl = *reinterpret_cast<void***>(vec);\n");
                 w.write("        reinterpret_cast<void(__stdcall*)(void*, void*)>(vtbl[13])(vec, winrt::impl::bind_in<%>{value});\n", elem_cpp);
                 w.write("        winrt::IUnknown::release_raw(vec);\n");
@@ -2146,15 +2167,18 @@ operator U() const noexcept { return U::from_abi(addref_borrowed()); }
                 w.write("    % GetAt(std::uint32_t index) const\n", elem_cpp);
                 w.write("    {\n");
                 w.write("        void* vec = vector_abi();\n");
-                w.write("        auto** vtbl = *reinterpret_cast<void***>(vec);\n");
                 w.write("        winrt::impl::arg_in_t<%> r{};\n", elem_cpp);
-                w.write("        reinterpret_cast<std::int32_t(__stdcall*)(void*, std::uint32_t, void*)>(vtbl[6])(vec, index, reinterpret_cast<void*>(&r));\n");
-                w.write("        winrt::IUnknown::release_raw(vec);\n");
+                w.write("        if (vec) {\n");
+                w.write("            auto** vtbl = *reinterpret_cast<void***>(vec);\n");
+                w.write("            reinterpret_cast<std::int32_t(__stdcall*)(void*, std::uint32_t, void*)>(vtbl[6])(vec, index, reinterpret_cast<void*>(&r));\n");
+                w.write("            winrt::IUnknown::release_raw(vec);\n");
+                w.write("        }\n");
                 w.write("        return winrt::impl::collection_element<%>::from_abi(r);\n", elem_cpp);
                 w.write("    }\n");
                 w.write("    void Clear() const\n");
                 w.write("    {\n");
                 w.write("        void* vec = vector_abi();\n");
+                w.write("        if (!vec) return;\n");
                 w.write("        auto** vtbl = *reinterpret_cast<void***>(vec);\n");
                 w.write("        reinterpret_cast<void(__stdcall*)(void*)>(vtbl[15])(vec);\n");
                 w.write("        winrt::IUnknown::release_raw(vec);\n");

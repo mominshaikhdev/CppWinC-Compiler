@@ -14,19 +14,6 @@ void replace_all(std::string& value, std::string_view from, std::string_view to)
     }
 }
 
-// True system core count. GetSystemInfo ignores the CPU-affinity mask that
-// std::thread::hardware_concurrency() respects, so a process accidentally
-// pinned to one core still uses all the machine's cores ("my PC has 4 cores").
-std::size_t system_core_count()
-{
-    SYSTEM_INFO si{};
-    GetSystemInfo(&si);
-    std::size_t n = si.dwNumberOfProcessors;
-    if (n == 0) n = std::thread::hardware_concurrency();
-    if (n < 2) n = 2;
-    return n;
-}
-
 // locate the MSVC toolchain directory (modules\std.ixx lives under it):
 // use the dev-prompt env var when present, otherwise vswhere
 std::filesystem::path locate_msvc_toolchain()
@@ -326,6 +313,23 @@ void print_version_banner()
         std::string(cppwinc::strings::product_description).c_str());
 }
 
+// App/assembly names arrive from folder and winmd file names ("WinUI3-Gallery",
+// "My App"). Spaces are illegal in ECMA-335 identifiers, C++ namespaces and
+// module names, so every projection-facing spelling of an app name joins them
+// with a hyphen once: the winmd stem, the component/module name, the metadata
+// namespace and the linked exe + final .pri all follow it ("WinUI Gallery" ->
+// "WinUI-Gallery"). Existing hyphens are preserved, so the default can be
+// overridden by the namespace switches (-name here, -namespace in winuic):
+// -name My_App stays My_App. The C++ identifier contexts derived from this
+// name (module declarations/imports, namespace qualifiers) mangle the hyphen
+// via winuic::ident_ns - the artifact/file names keep it.
+static std::string sanitize_app_name(std::string s)
+{
+    for (auto& c : s)
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') c = '-';
+    return s;
+}
+
 void print_usage()
 {
     print_version_banner();
@@ -354,10 +358,55 @@ void print_usage()
     std::printf("  10.0.12345.0        Windows SDK metadata for a specific version\n");
     std::printf("\n  -winui / -winui_no_compile auto-discover the WASDK metadata (NuGet cache)\n");
     std::printf("  and auto-locate the WASDK runtime DLLs - no wasdk input needed.\n");
+    std::printf("    optional 'exp' argument: latest experimental winmds only\n");
+    std::printf("    (version dirs tagged -experimental*); default: latest stable\n");
+    std::printf("    (same channels as winversec -include_wasdk [exp])\n");
     std::printf("  Both REQUIRE a winversec-produced Windows.Win32.winmd in -input: the\n");
     std::printf("  generated main.ixx bootstrap projects PACKAGE_VERSION, MddBootstrap*,\n");
     std::printf("  LoadLibraryExW from it instead of including Windows headers.\n");
+    std::printf("  Referenced assets and any LICENSE file found next to the input winmd\n");
+    std::printf("  are automatically copied to the output runtime directory.\n");
     std::printf("e.g. -input MyApp.winmd,Windows.Win32.winmd -winui_no_compile\n");
+}
+
+// True when a .winmd was produced by winuic / xaml2winuic: those embed
+// WinUIAttribute (per view class) and WinUIControlCatalogAttribute
+// (module-level control catalog) custom attributes in their metadata tables.
+// This marker does two jobs: it activates the default WinUI3 pipeline, and it
+// marks the project's OWN metadata apart from third-party control-library
+// winmds passed in the same -input.
+static bool winmd_has_winuic_markers(std::filesystem::path const& path)
+{
+    auto stem = path.filename().replace_extension().string();
+    // winuic output is never named Windows.*/Microsoft.* — skip system and
+    // contract metadata without reading it.
+    if (stem.starts_with("Windows.") || stem.starts_with("Microsoft.")) return false;
+    std::error_code ec;
+    auto sz = std::filesystem::file_size(path, ec);
+    if (ec || sz == 0 || sz > 512ull * 1024 * 1024) return false;
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    std::string buf(static_cast<std::size_t>(sz), '\0');
+    f.read(buf.data(), static_cast<std::streamsize>(sz));
+    auto has = [&](char const* n)
+    {
+        std::size_t nl = std::char_traits<char>::length(n);
+        if (buf.size() < nl) return false;
+        for (std::size_t i = 0; i + nl <= buf.size(); ++i)
+            if (buf.compare(i, nl, n) == 0) return true;
+        return false;
+    };
+    return has("WinUIAttribute") || has("WinUIControlCatalogAttribute");
+}
+
+// Any -input winmd carrying the winuic marker attributes.
+static bool winuic_input_present(arg_parser const& args)
+{
+    for (auto const& spec : args.values("input"))
+        for (auto const& path : resolve_spec(spec))
+            if (path.extension() == ".winmd" && winmd_has_winuic_markers(path))
+                return true;
+    return false;
 }
 
 void process_args(arg_parser const& args)
@@ -373,14 +422,30 @@ void process_args(arg_parser const& args)
     {
         throw winmd::error("-winui and -winui_no_compile are mutually exclusive");
     }
-    bool has_winui = args.exists("winui") || args.exists("winui_no_compile");
-    settings.winui = has_winui;
+    bool const explicit_winui = args.exists("winui") || args.exists("winui_no_compile");
+    bool has_winui = explicit_winui;
     settings.winui_no_compile = args.exists("winui_no_compile");
     settings.compile = args.exists("compile");
-    if (settings.compile && has_winui)
+    settings.debug = args.exists("debug");
+    if (settings.compile && explicit_winui)
     {
         throw winmd::error("-compile and -winui are mutually exclusive (-winui already compiles)");
     }
+    // The WinUI3 pipeline is the DEFAULT behavior, not an opt-in: a winuic /
+    // xaml2winuic-produced .winmd in -input (it carries WinUIAttribute /
+    // WinUIControlCatalogAttribute custom attributes) turns the whole
+    // pipeline on by itself. -winui / -winui_no_compile then only choose
+    // generate+compile vs generate-only — they never gate whether WinUI3
+    // support exists.
+    if (!has_winui && winuic_input_present(args))
+    {
+        has_winui = true;
+        std::printf(settings.winui_no_compile
+            ? "winuic metadata in -input: WinUI3 pipeline active (generate only)\n"
+            : "winuic metadata in -input: WinUI3 pipeline active (generate + compile;"
+              " pass -winui_no_compile to generate only)\n");
+    }
+    settings.winui = has_winui;
     if (has_winui)
     {
         settings.base = true;  // auto-generate winrt_base.ixx
@@ -388,20 +453,39 @@ void process_args(arg_parser const& args)
         auto nuget = nuget_packages_root();
         if (!nuget.empty())
         {
+            // WASDK channel for this run: -winui exp / -winui_no_compile exp
+            // = experimental packages only; without it = latest stable.
+            // Applies to BOTH the winmd pick and the runtime-DLL pick (they
+            // come from the same package, so they stay on one channel).
+            bool const wasdk_exp = args.exists("wasdk_exp");
             // -winui always auto-discovers WASDK metadata (NuGet cache) —
             // there is no explicit wasdk input spec.
             {
-                auto wasdk_paths = resolve_wasdk();
+                // `-winui exp` / `-winui_no_compile exp`: newest experimental
+                // winmds only; without `exp` the newest stable channel
+                // (mirrors winversec -include_wasdk [exp]).
+                auto const wasdk_t0 = std::chrono::steady_clock::now();
+                auto wasdk_paths = resolve_wasdk(wasdk_exp);
                 if (wasdk_paths.empty())
                 {
-                    throw winmd::error("-winui: no Windows App SDK metadata found in the NuGet cache\n"
-                        "  looked in: " + nuget_packages_root().string() + "\n"
-                        "  fix: restore any WASDK-based project once (msbuild /t:restore or 'nuget restore'),\n"
-                        "  or set NUGET_PACKAGES if your package cache lives elsewhere");
+                    throw winmd::error(wasdk_exp
+                        ? "-winui exp: no experimental Windows App SDK metadata found in the NuGet cache\n"
+                          "  looked in: " + nuget_packages_root().string() + "\n"
+                          "  fix: restore an experimental WASDK package (version dir ending\n"
+                          "  in -experimental) once, or set NUGET_PACKAGES if your cache lives elsewhere"
+                        : "-winui: no Windows App SDK metadata found in the NuGet cache\n"
+                          "  looked in: " + nuget_packages_root().string() + "\n"
+                          "  fix: restore any WASDK-based project once (msbuild /t:restore or 'nuget restore'),\n"
+                          "  or set NUGET_PACKAGES if your package cache lives elsewhere\n"
+                          "  (if only experimental packages are installed, pass -winui exp)");
                 }
                 for (auto const& p : wasdk_paths)
                     settings.input.push_back(p);
-                std::printf("-winui: auto-added %zu WASDK winmds\n", wasdk_paths.size());
+                auto const wasdk_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - wasdk_t0).count();
+                std::printf("-winui: auto-added %zu WASDK winmds%s (%lld ms, %zu cores)\n", wasdk_paths.size(),
+                    wasdk_exp ? " (experimental channel)" : " (stable channel)",
+                    static_cast<long long>(wasdk_ms), system_core_count());
             }
             // -winui also auto-adds the Windows SDK UnionMetadata so types the
             // WASDK metadata references (Windows.Foundation TypedEventHandler /
@@ -461,8 +545,11 @@ void process_args(arg_parser const& args)
             }
             // Detect WinUI3 runtime DLLs in NuGet cache
             // Find the runtime DLLs across ALL installed versions, newest
-            // first (lexicographic sort works for semver), probing every
-            // architecture's runtimes-framework native folder.
+            // first — numerically (ver_dir_newer: lexicographic order would
+            // rank "2.3.9" above "2.3.10-experimental"), probing every
+            // architecture's runtimes-framework native folder. Versions are
+            // channel-filtered like the winmd pick, so -winui exp pairs
+            // experimental metadata with experimental runtime DLLs.
             auto winui_pkg = nuget / L"microsoft.windowsappsdk.winui";
             if (std::filesystem::is_directory(winui_pkg))
             {
@@ -471,29 +558,56 @@ void process_args(arg_parser const& args)
                 {
                     if (!entry.is_directory()) continue;
                     auto p = entry.path().filename().string();
-                    if (!p.empty() && std::isdigit(static_cast<unsigned char>(p.front())))
-                        versions.push_back(entry.path());
+                    if (p.empty() || !std::isdigit(static_cast<unsigned char>(p.front()))) continue;
+                    if (!wasdk_channel_ok(p, wasdk_exp)) continue;   // channel pick
+                    versions.push_back(entry.path());
                 }
                 std::sort(versions.begin(), versions.end(), [](auto const& a, auto const& b)
                 {
-                    return a.filename().string() > b.filename().string();
+                    return ver_dir_newer(a.filename().string(), b.filename().string());
                 });
                 static const wchar_t* arches[] = { L"win-x64", L"win-arm64", L"win-x86" };
-                for (auto const& ver : versions)
+                // Probe every version's framework folder concurrently — one
+                // slot per version (a runtimes-framework tree is deep) — then
+                // let the already-sorted newest-first order pick the winner,
+                // exactly like the old serial walk.
+                std::vector<std::string> dll_slots(versions.size());
+                if (!versions.empty())
                 {
-                    if (!settings.winui_dll_path.empty()) break;
-                    for (auto const* arch : arches)
+                    std::size_t nthreads = system_core_count();
+                    if (nthreads > versions.size()) nthreads = versions.size();
+                    std::atomic<std::size_t> idx{ 0 };
+                    std::vector<std::jthread> workers;
+                    workers.reserve(nthreads);
+                    for (std::size_t t = 0; t < nthreads; ++t)
                     {
-                        auto native = ver / L"runtimes-framework" / arch / L"native";
-                        if (!std::filesystem::is_directory(native)) continue;
-                        auto dll = native / L"Microsoft.ui.xaml.dll";
-                        if (std::filesystem::exists(dll))
-                        {
-                            settings.winui_dll_path = native.string();
-                            std::printf("-winui: runtime DLLs found at %s\n", settings.winui_dll_path.c_str());
-                            break;
-                        }
+                        workers.emplace_back([&] {
+                            for (;;)
+                            {
+                                std::size_t i = idx.fetch_add(1);
+                                if (i >= versions.size()) break;
+                                for (auto const* arch : arches)
+                                {
+                                    std::error_code ec;
+                                    auto native = versions[i] / L"runtimes-framework" / arch / L"native";
+                                    if (!std::filesystem::is_directory(native, ec)) continue;
+                                    if (std::filesystem::exists(native / L"Microsoft.ui.xaml.dll", ec))
+                                    {
+                                        dll_slots[i] = native.string();
+                                        break;
+                                    }
+                                }
+                            }
+                        });
                     }
+                }
+                // newest version first (already sorted): first hit wins
+                for (auto const& slot : dll_slots)
+                {
+                    if (slot.empty()) continue;
+                    settings.winui_dll_path = slot;
+                    std::printf("-winui: runtime DLLs found at %s\n", settings.winui_dll_path.c_str());
+                    break;
                 }
             }
             if (settings.winui_dll_path.empty())
@@ -644,7 +758,7 @@ void process_args(arg_parser const& args)
             settings.component_folder = std::filesystem::canonical(component).string();
             settings.component_folder += std::filesystem::path::preferred_separator;
         }
-        settings.component_name = args.value("name");
+        settings.component_name = sanitize_app_name(args.value("name"));
         if (settings.component_name.empty())
         {
             // Component source = the app .winmd(s): EVERY non-system .winmd
@@ -674,21 +788,56 @@ void process_args(arg_parser const& args)
                     start = comma + 1;
                 }
             }
+            // The project's OWN metadata vs third-party control-library winmds
+            // mixed into the same -input: winuic / xaml2winuic mark their output
+            // with WinUIAttribute / WinUIControlCatalogAttribute. When any input
+            // carries that marker, only marker winmds are the project — every
+            // other non-system winmd is a library whose types stay ordinary
+            // projected (platform) types. Treating a library winmd as a
+            // component source made every third-party control the project uses
+            // an "app type": setters skipped, children wrapped, no import
+            // emitted, component impls generated for foreign types, and the
+            // exe named after the library. Without any marker (plain
+            // -component runs) every non-system winmd stays a component source,
+            // exactly as before.
+            auto is_system_stem = [](std::string const& stem)
+            {
+                return stem == "Windows.Win32" || stem == "Windows.Wdk"
+                    || stem == "Windows" || stem.starts_with("Microsoft.");
+            };
+            bool any_winuic_md = false;
+            for (auto const& in : inputs)
+            {
+                if (in.size() > 6 && in.rfind(".winmd") == in.size() - 6)
+                {
+                    if (is_system_stem(std::filesystem::path(in).filename().replace_extension().string()))
+                        continue;
+                    std::error_code mec;
+                    if (winmd_has_winuic_markers(std::filesystem::weakly_canonical(in, mec)))
+                    {
+                        any_winuic_md = true;
+                        break;
+                    }
+                }
+            }
             std::string best_stem;
             for (auto const& in : inputs)
             {
                 if (in.size() > 6 && in.rfind(".winmd") == in.size() - 6)
                 {
                     std::string stem = std::filesystem::path(in).filename().replace_extension().string();
-                    if (stem == "Windows.Win32" || stem == "Windows.Wdk" || stem == "Windows" || stem.starts_with("Microsoft."))
+                    if (is_system_stem(stem))
                         continue;
                     std::error_code app_ec;
-                    settings.app_dbs.insert(std::filesystem::weakly_canonical(in, app_ec).string());
+                    auto canonical_in = std::filesystem::weakly_canonical(in, app_ec).string();
+                    if (any_winuic_md && !winmd_has_winuic_markers(canonical_in))
+                        continue; // third-party control library, not the project
+                    settings.app_dbs.insert(canonical_in);
                     // Default file name stays order-independent too: with a
                     // single app winmd (the normal case) it is its stem;
                     // with several, the lexicographic first wins.
                     if (best_stem.empty() || stem < best_stem)
-                        best_stem = stem;
+                        best_stem = sanitize_app_name(stem);
                 }
             }
             if (!best_stem.empty())
@@ -697,7 +846,7 @@ void process_args(arg_parser const& args)
             }
             if (settings.component_name.empty() && !settings.input_dbs.empty())
             {
-                settings.component_name = std::filesystem::path(*settings.input_dbs.begin()).filename().replace_extension().string();
+                settings.component_name = sanitize_app_name(std::filesystem::path(*settings.input_dbs.begin()).filename().replace_extension().string());
             }
         }
     }
@@ -707,25 +856,10 @@ void process_args(arg_parser const& args)
 // Win32 API projection writers
 //
 
-// Win32 handle type mapping: metadata type names to projected void* wrappers
-static std::string win32_handle_projected(std::string_view type_name)
-{
-    static const std::unordered_map<std::string_view, std::string_view> handle_map = {
-        {"HANDLE", "void*"}, {"HWND", "void*"}, {"HDC", "void*"},
-        {"HKEY", "void*"}, {"HMODULE", "void*"}, {"HINSTANCE", "void*"},
-        {"HBITMAP", "void*"}, {"HBRUSH", "void*"}, {"HFONT", "void*"},
-        {"HPEN", "void*"}, {"HRGN", "void*"}, {"HICON", "void*"},
-        {"HCURSOR", "void*"}, {"HMENU", "void*"}, {"HACCEL", "void*"},
-        {"HMONITOR", "void*"}, {"HGDIOBJ", "void*"}, {"HGLOBAL", "void*"},
-        {"HLOCAL", "void*"}, {"HRSRC", "void*"}, {"HWINSTA", "void*"},
-        {"HDESK", "void*"}, {"SC_HANDLE", "void*"}, {"SOCKET", "void*"},
-        {"HINTERNET", "void*"}, {"HCRYPTPROV", "void*"}, {"HCRYPTKEY", "void*"},
-        {"HCRYPTHASH", "void*"}, {"HCERTSTORE", "void*"}, {"HCRYPTMSG", "void*"},
-        {"HDEVNOTIFY", "void*"}, {"HPOWERNOTIFY", "void*"}, {"HDROP", "void*"},
-    };
-    auto it = handle_map.find(type_name);
-    return it != handle_map.end() ? std::string(it->second) : "";
-}
+// (The old win32_handle_projected name->void* table is gone: it had no
+// callers, and handle projection is metadata-driven - winversec marks
+// every handle type with its HandleKind attribute, which winmd_reader
+// surfaces as type_info::handle_kind.)
 
 // Enum member names that collide with C++ keywords or alternative-operator
 // tokens (ICU `or = 201`, TEXTSERV `not = ...`) are a hard syntax error
@@ -748,6 +882,15 @@ static std::string mangle_enum_member(std::string const& n)
     };
     if (kw.count(n)) return n + "_";
     return n;
+}
+
+// Hex literal for 64-bit singleton constants: 0x0002000500040000ull keeps
+// the packed version layout readable where a bare decimal would not.
+static std::string hex_ull(std::uint64_t v)
+{
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "0x%llXull", (unsigned long long)v);
+    return buf;
 }
 
 static void write_win32_enum(writer& w, winmd::type_info const& type, type_mapper const& mapper)
@@ -773,7 +916,12 @@ static void write_win32_enum(writer& w, winmd::type_info const& type, type_mappe
         // materializer tags every constant field U4, so widen when the
         // value needs it.
         std::string const_underst = underlying;
-        if (type.enum_fields[0].second > 2147483647LL ||
+        // 64-bit materialized constants (WINDOWSAPPSDK_RUNTIME_VERSION_UINT64
+        // = 0x0002000500040000) need uint64 — one tier wider than the u32
+        // case below; std::uint32_t would truncate them (C2397).
+        if (type.enum_fields[0].second > 0xFFFFFFFFLL)
+            const_underst = "std::uint64_t";
+        else if (type.enum_fields[0].second > 2147483647LL ||
             type.enum_fields[0].second < -2147483648LL)
             const_underst = "std::uint32_t";
         // #undef first: BUFSIZ/EXIT_SUCCESS/FILENAME_MAX/RAND_MAX are CRT
@@ -781,8 +929,13 @@ static void write_win32_enum(writer& w, winmd::type_info const& type, type_mappe
         // literal before the declaration parses (C2332/C2059). Macros never
         // cross a module boundary, so importers never see this name anyway.
         w.write("#undef %\n", mangle_enum_member(type.name));
-        w.write("export inline constexpr % % = %;\n\n", const_underst,
-            mangle_enum_member(type.name), type.enum_fields[0].second);
+        if (type.enum_fields[0].second > 0xFFFFFFFFLL)
+            w.write("export inline constexpr % % = %;\n\n", const_underst,
+                mangle_enum_member(type.name),
+                hex_ull((std::uint64_t)type.enum_fields[0].second));
+        else
+            w.write("export inline constexpr % % = %;\n\n", const_underst,
+                mangle_enum_member(type.name), type.enum_fields[0].second);
         return;
     }
     // Same macro guard as the singleton-const path above.
@@ -1539,7 +1692,12 @@ static void write_wdk_enum(writer& w, winmd::type_info const& type, type_mapper 
         // materializer tags every constant field U4, so widen when the
         // value needs it.
         std::string const_underst = underlying;
-        if (type.enum_fields[0].second > 2147483647LL ||
+        // 64-bit materialized constants (WINDOWSAPPSDK_RUNTIME_VERSION_UINT64
+        // = 0x0002000500040000) need uint64 — one tier wider than the u32
+        // case below; std::uint32_t would truncate them (C2397).
+        if (type.enum_fields[0].second > 0xFFFFFFFFLL)
+            const_underst = "std::uint64_t";
+        else if (type.enum_fields[0].second > 2147483647LL ||
             type.enum_fields[0].second < -2147483648LL)
             const_underst = "std::uint32_t";
         // #undef first: BUFSIZ/EXIT_SUCCESS/FILENAME_MAX/RAND_MAX are CRT
@@ -1547,8 +1705,13 @@ static void write_wdk_enum(writer& w, winmd::type_info const& type, type_mapper 
         // literal before the declaration parses (C2332/C2059). Macros never
         // cross a module boundary, so importers never see this name anyway.
         w.write("#undef %\n", mangle_enum_member(type.name));
-        w.write("export inline constexpr % % = %;\n\n", const_underst,
-            mangle_enum_member(type.name), type.enum_fields[0].second);
+        if (type.enum_fields[0].second > 0xFFFFFFFFLL)
+            w.write("export inline constexpr % % = %;\n\n", const_underst,
+                mangle_enum_member(type.name),
+                hex_ull((std::uint64_t)type.enum_fields[0].second));
+        else
+            w.write("export inline constexpr % % = %;\n\n", const_underst,
+                mangle_enum_member(type.name), type.enum_fields[0].second);
         return;
     }
     // Same macro guard as the singleton-const path above.
@@ -1711,22 +1874,17 @@ static void write_wdk_function(writer& w, winmd::type_info const& type, type_map
 {
     if (type.methods.empty()) return;
     wdk_driver_model model = classify_driver_model(type);
-    std::string cc = (model == wdk_driver_model::wdm) ? "__stdcall" : "";
-    std::string lib_name;
-    switch (model)
-    {
-    case wdk_driver_model::wdm:  lib_name = "ntoskrnl.exe"; cc = "__stdcall"; break;
-    case wdk_driver_model::kmdf: lib_name = "wdfldr.dll"; break;
-    case wdk_driver_model::umdf: lib_name = "wdfumdf.dll"; break;
-    default: lib_name = "ntoskrnl.exe"; cc = "__stdcall"; break;
-    }
-    if (!type.import_library.empty())
-    {
-        // Truthful body comment on whatever stub survives: the projection
-        // now attributes kernel rows too (km scan / driver fill), so show
-        // the real library rather than the model default.
-        lib_name = type.import_library;
-    }
+    // The model only decides the calling convention: UMDF/KMDF factory
+    // wrappers are not __stdcall, WDM and unclassified kernel rows are.
+    std::string cc = (model == wdk_driver_model::kmdf || model == wdk_driver_model::umdf)
+        ? std::string() : std::string("__stdcall");
+    // The library attribution is metadata-only: winversec attributes every
+    // driver row with the image/lib that exports it (wdfldr.dll,
+    // ntoskrnl.exe, the per-family WDK resolve, or the runtime SDK km-lib
+    // scan) and ImportLibrary is the single channel cppwinc reads. The stub
+    // body comment shows exactly that attribution; an empty value means the
+    // row genuinely has no exporting library - no lib-name guessing here.
+    std::string lib_name = type.import_library;
     static const std::set<std::string> skip_names = {
         "NTSTATUS", "TAG", "DECLSPEC_UUID", "DECLSPEC_UUIDX",
         "data", "resource", "local", "align", "pack"
@@ -1969,6 +2127,7 @@ export int run(int const, char**)
             && !args.exists("winui") && !args.exists("winui_no_compile"))
         {
             std::filesystem::path folder = args.value("compile");
+            if (folder.empty()) folder = args.value("output");
             if (folder.empty() || !std::filesystem::is_directory(folder))
             {
                 std::printf("cppwinc : error -compile needs a projection folder: cppwinc -compile <folder>\n");
@@ -2523,6 +2682,7 @@ export int run(int const, char**)
         winuic::g_view_type_names.clear();
 
         // Populate g_type_ns and g_project_nss from metadata
+        winuic::g_enum_info.clear();
         // so is_app_or_unknown_type() correctly identifies component vs platform types.
         // The Windows SDK winmd carries UWP-era Windows.UI.Xaml.* duplicates of the
         // WinUI3 Microsoft.UI.Xaml.* types (ColorPicker, ToggleSwitch, Popup, ...); a
@@ -2531,6 +2691,12 @@ export int run(int const, char**)
         for (auto const& [ns, info] : metadata.namespaces())
         {
             bool is_uwp_xaml = ns.rfind("Windows.UI.Xaml", 0) == 0;
+            // WinUI pipeline (-winui / -winui_no_compile): Microsoft.Windows.*
+            // (Windows App SDK) always wins over Windows.* (OS) for the same
+            // bare type name — the generated app bootstraps against the WASDK
+            // surface (AppLifecycle, AppNotifications, DynamicDependency,
+            // Power, ...), and an OS duplicate must never hijack resolution.
+            bool is_winns = settings.winui && ns.rfind("Windows.", 0) == 0;
             // Win32/WDK namespaces (winversec-projected) must never feed the
             // XAML name map: names like Image/Frame/Panel also exist there
             // (different types), and a Win32 hit would make the view codegen
@@ -2539,14 +2705,246 @@ export int run(int const, char**)
             for (auto const* t : info.classes)
             {
                 if (is_uwp_xaml && winuic::g_type_ns.count(t->name)) continue;
+                if (is_winns)
+                {
+                    auto it0 = winuic::g_type_ns.find(t->name);
+                    if (it0 != winuic::g_type_ns.end()
+                        && it0->second.rfind("Microsoft.Windows.", 0) == 0) continue;
+                }
                 winuic::g_type_ns[t->name] = ns;
             }
             for (auto const* t : info.interfaces)
             {
                 if (is_uwp_xaml && winuic::g_type_ns.count(t->name)) continue;
+                if (is_winns)
+                {
+                    auto it0 = winuic::g_type_ns.find(t->name);
+                    if (it0 != winuic::g_type_ns.end()
+                        && it0->second.rfind("Microsoft.Windows.", 0) == 0) continue;
+                }
                 winuic::g_type_ns[t->name] = ns;
             }
+            // Enum types -> (namespace, members): the value resolver qualifies
+            // enum literals from this table instead of hardcoded control/property
+            // tables. Same never-overwrite policy as g_type_ns: UWP-era
+            // Windows.UI.Xaml duplicates never displace WinUI3, and
+            // Microsoft.Windows.* (WASDK 2.x, e.g. Foundation.DecimalHelper)
+            // wins over the OS copy.
+            for (auto const* t : info.enums)
+            {
+                if (is_uwp_xaml && winuic::g_enum_info.count(t->name)) continue;
+                if (is_winns)
+                {
+                    auto it0 = winuic::g_enum_info.find(t->name);
+                    if (it0 != winuic::g_enum_info.end()
+                        && it0->second.first.rfind("Microsoft.Windows.", 0) == 0) continue;
+                }
+                auto& ei = winuic::g_enum_info[t->name];
+                ei.first = ns;
+                ei.second.clear();
+                for (auto const& ef : t->enum_fields) ei.second.insert(ef.first);
+            }
         }
+        // Metadata-driven control knowledge for the view post-pass: event
+        // names + property type names per type, flattened over base classes
+        // and interfaces (WinRT declares events/properties mostly on
+        // interfaces). Keys are lowercased type names; property values are
+        // short metadata names ("GridLength", "double", ...). fixup_view_code
+        // consults these instead of hardcoded name lists, so a new control,
+        // event or property type ships in metadata only - no cppwinc rebuild.
+        winuic::g_type_events.clear();
+        winuic::g_type_prop_kinds.clear();
+        // Types the WINMD itself declared a property surface for. Registry
+        // gap-fill below must never invent props for these: winmd truth wins
+        // on conflicts (an entry may claim composition_kind "content" while
+        // the platform type demonstrably has no Content - AnimatedVisualPlayer).
+        std::set<std::string> winmd_prop_keys;
+        {
+            std::vector<winmd::type_info const*> stack;
+            std::set<winmd::type_info const*> done;
+            auto lower_in_place = [](std::string& s)
+            {
+                for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            };
+            // Element types (double/int/...) have no TypeDef row to resolve -
+            // map the winmd element kind to its projected primitive name so
+            // primitive-typed properties (Shape.Width=double, Slider.Value=double)
+            // reach the map as well. Type knowledge only, never property names.
+            auto prim_name = [](winmd::type const& t) -> std::string
+            {
+                using namespace winmd;
+                switch (t.kind)
+                {
+                    case et_r8: return "double";
+                    case et_r4: return "float";
+                    case et_i4: return "int32_t";
+                    case et_u4: return "uint32_t";
+                    case et_i2: return "int16_t";
+                    case et_u2: return "uint16_t";
+                    case et_i1: return "int8_t";
+                    case et_u1: return "uint8_t";
+                    case et_i8: return "int64_t";
+                    case et_u8: return "uint64_t";
+                    case et_char: return "char16_t";
+                    case et_string: return "hstring";
+                    case et_boolean: return "bool";
+                    // Bare object element (IInspectable) - put_Content/put_Icon/
+                    // put_Item etc. all take one. Without this every
+                    // object-typed property (Content on all ContentControl
+                    // derived controls) resolved to "" and was dropped from
+                    // g_type_prop_kinds, which made the composition guard
+                    // comment legitimate .Content(...) setter lines.
+                    case et_object: return "IInspectable";
+                    default: return {};
+                }
+            };
+            auto resolve_pname = [&](winmd::type const& t) -> std::string
+            {
+                std::string pns, pname;
+                if (metadata.resolve_type_name(t, pns, pname))
+                {
+                    // Generic instantiation: keep the inner type, so a
+                    // nullable property carries it (IReference<Double> ->
+                    // "IReference<double>"). The typed-value resolver boxes
+                    // numbers into IReference<double> from this, and an open
+                    // "IReference"/"IReference`1" name would lose that.
+                    if (!t.args.empty() && !pname.empty())
+                    {
+                        std::string inner;
+                        for (auto const& a : t.args)
+                        {
+                            std::string ans, an;
+                            if (!inner.empty()) inner += ",";
+                            if (metadata.resolve_type_name(a, ans, an)) inner += an;
+                            else
+                            {
+                                auto pn = prim_name(a);
+                                if (pn.empty()) return pname; // unresolvable arg: keep the open name
+                                inner += pn;
+                            }
+                        }
+                        auto const tick = pname.find('`');
+                        if (tick != std::string::npos) pname = pname.substr(0, tick);
+                        return pname + "<" + inner + ">";
+                    }
+                    return pname;
+                }
+                return prim_name(t);
+            };
+            auto gather = [&](std::string const& type_key, winmd::type_info const& start)
+            {
+                stack.clear();
+                done.clear();
+                stack.push_back(&start);
+                winmd_prop_keys.insert(type_key);
+                auto& evs = winuic::g_type_events[type_key];
+                auto& props = winuic::g_type_prop_kinds[type_key];
+                while (!stack.empty())
+                {
+                    winmd::type_info const* t = stack.back();
+                    stack.pop_back();
+                    if (!t || !done.insert(t).second) continue;
+                    for (auto const& ev : t->events)
+                    {
+                        std::string n = ev.name;
+                        lower_in_place(n);
+                        evs.insert(std::move(n));
+                    }
+                    for (auto const& pr : t->properties)
+                    {
+                        std::string pname = resolve_pname(pr.value);
+                        if (pname.empty()) continue;
+                        std::string pn = pr.name;
+                        lower_in_place(pn);
+                        props.insert_or_assign(std::move(pn), std::move(pname));
+                    }
+                    // WinRT exposes most instance properties as get_/put_
+                    // METHOD PAIRS on interfaces, not as PropertyDef rows -
+                    // interface PropertyMaps come back empty. Derive property
+                    // type knowledge from every put_<Name>(T const&) method so
+                    // interface-declared props (ITableViewColumn.Width ->
+                    // GridLength) reach the map. Metadata-only: no lists.
+                    for (auto const& m : t->methods)
+                    {
+                        if (m.name.rfind("put_", 0) != 0 || m.params.empty()) continue;
+                        std::string pname = resolve_pname(m.params[0].value);
+                        if (pname.empty()) continue;
+                        if (pname == "DependencyProperty" || pname == "RoutedEvent" || pname == "AutomationProperty")
+                            continue; // static *Property accessor slots, not value-typed props
+                        std::string pn = m.name.substr(4);
+                        lower_in_place(pn);
+                        props.insert_or_assign(std::move(pn), std::move(pname));
+                    }
+                    if (t->base) stack.push_back(t->base);
+                    for (auto const* i : t->interfaces) if (i) stack.push_back(i);
+                }
+            };
+            for (auto const& [ns, info] : metadata.namespaces())
+            {
+                bool is_uwp_xaml = ns.rfind("Windows.UI.Xaml", 0) == 0;
+                // WinUI pipeline: Microsoft.Windows.* (Windows App SDK)
+                // knowledge wins over Windows.* (OS) duplicates — same
+                // never-overwrite policy as g_type_ns above.
+                bool is_winns = settings.winui && ns.rfind("Windows.", 0) == 0;
+                if (ns.rfind("Windows.Win32", 0) == 0 || ns.rfind("Windows.Wdk", 0) == 0) continue;
+                for (auto const* t : info.classes)
+                {
+                    std::string key = t->name;
+                    lower_in_place(key);
+                    // Never let UWP-era Windows.UI.Xaml duplicates overwrite the
+                    // WinUI3 Microsoft.UI.Xaml knowledge (same policy as g_type_ns).
+                    if (is_uwp_xaml && (winuic::g_type_events.count(key) || winuic::g_type_prop_kinds.count(key))) continue;
+                    if (is_winns && (winuic::g_type_events.count(key) || winuic::g_type_prop_kinds.count(key))) continue;
+                    gather(key, *t);
+                }
+                for (auto const* t : info.interfaces)
+                {
+                    std::string key = t->name;
+                    lower_in_place(key);
+                    if (is_uwp_xaml && (winuic::g_type_events.count(key) || winuic::g_type_prop_kinds.count(key))) continue;
+                    if (is_winns && (winuic::g_type_events.count(key) || winuic::g_type_prop_kinds.count(key))) continue;
+                    gather(key, *t);
+                }
+            }
+            // Env-gated diagnostic: dump the metadata-derived control maps so
+            // coverage can be verified without a debugger (zero noise by default).
+            if (char const* dump_pat = std::getenv("CPPWINC_DUMP_CTRL_MAPS"))
+            {
+                // Coverage probe: CPPWINC_DUMP_CTRL_MAPS=<needle> keeps only
+                // matching type keys; "1" prints every type and enum, so
+                // metadata coverage can be verified end to end (the old dump
+                // was hardcoded to keys containing "column"/"table").
+                std::string const pat = (dump_pat[0] != '\0' && std::string(dump_pat) != "1")
+                    ? std::string(dump_pat) : std::string();
+                std::fprintf(stderr, "[ctrlmaps] types=%zu events_types=%zu enums=%zu\n",
+                    winuic::g_type_prop_kinds.size(), winuic::g_type_events.size(),
+                    winuic::g_enum_info.size());
+                for (auto const& [ek, ev] : winuic::g_enum_info)
+                {
+                    if (!pat.empty() && ek.find(pat) == std::string::npos) continue;
+                    std::fprintf(stderr, "[enum] %s ns=%s members=", ek.c_str(), ev.first.c_str());
+                    bool first = true;
+                    for (auto const& m : ev.second)
+                    {
+                        std::fprintf(stderr, "%s%s", first ? "" : "|", m.c_str());
+                        first = false;
+                    }
+                    std::fprintf(stderr, "\n");
+                }
+                for (auto const& [k, pm] : winuic::g_type_prop_kinds)
+                {
+                    if (!pat.empty() && k.find(pat) == std::string::npos) continue;
+                    std::fprintf(stderr, "[ctrlmaps] %s props={", k.c_str());
+                    for (auto const& [pn, pt] : pm) std::fprintf(stderr, "%s:%s,", pn.c_str(), pt.c_str());
+                    std::fprintf(stderr, "} evs={");
+                    auto ev = winuic::g_type_events.find(k);
+                    if (ev != winuic::g_type_events.end())
+                        for (auto const& e : ev->second) std::fprintf(stderr, "%s,", e.c_str());
+                    std::fprintf(stderr, "}\n");
+                }
+            }
+        }
+
         // Mark component namespaces (from the app's winmd)
         if (settings.component)
         {
@@ -2569,6 +2967,106 @@ export int run(int const, char**)
             if (!metadata.module_catalog_json().empty())
             {
                 catalog.load_from_json(metadata.module_catalog_json());
+                // Registry -> control-knowledge maps. The registry JSON winuic
+                // embeds in the winmd (built-ins + extended / overridden /
+                // brand-new controls from third-party libraries) feeds the
+                // SAME maps winmd metadata fills, so registry-declared control
+                // surface drives R6/R41/R36 with no compiler rebuild.
+                // Gap-fill only: winmd truth always wins on conflicts.
+                auto lower_copy = [](std::string s) {
+                    for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    return s;
+                };
+                for (auto const& [ename, centry] : catalog.entries())
+                {
+                    std::vector<std::string> keys;
+                    if (!ename.empty()) keys.push_back(lower_copy(ename));
+                    if (!centry.platform.platform_type.empty())
+                    {
+                        std::string k = lower_copy(centry.platform.platform_type);
+                        auto dot = k.rfind("::");
+                        if (dot != std::string::npos) k = k.substr(dot + 2);
+                        bool dup = false;
+                        for (auto const& kk : keys) if (kk == k) { dup = true; break; }
+                        if (!dup) keys.push_back(std::move(k));
+                    }
+                    for (auto const& key : keys)
+                    {
+                        if (key.empty()) continue;
+                        auto& evs = winuic::g_type_events[key];
+                        for (auto const& ev : centry.event_names) evs.insert(ev);
+                        auto& props = winuic::g_type_prop_kinds[key];
+                        for (auto const& [pn, pt] : centry.prop_types)
+                            if (!props.count(pn)) props.insert_or_assign(pn, pt);
+                        // composition_kind "content": the view emitter attaches a
+                        // single child with .Content(...) for this control, so the
+                        // registry-declared attach must exist in the prop table as
+                        // well — otherwise the composition guard treats the
+                        // generated (valid) Content line as impossible and comments
+                        // it. That is how SettingsCard/SettingsExpander lost all
+                        // their card content: the stub derives ContentControl and
+                        // really has Content, but the entry declared no such prop.
+                        // Only for registry-only types: a type the winmd also
+                        // declares keeps its (possibly content-less) winmd truth.
+                        if (centry.composition_kind == "content" && !props.count("content")
+                            && !winmd_prop_keys.count(key))
+                            props.insert_or_assign("content", "IInspectable");
+                    }
+                }
+                // Env-gated diagnostic: prove the registry -> rules chain parsed.
+                if (std::getenv("CPPWINC_DUMP_CTRL_MAPS"))
+                {
+                    std::size_t with_props = 0, with_ev = 0, props_n = 0, ev_n = 0, shown = 0;
+                    for (auto const& [n2, ce] : catalog.entries())
+                    {
+                        props_n += ce.prop_types.size();
+                        ev_n += ce.event_names.size();
+                        if (!ce.prop_types.empty()) ++with_props;
+                        if (!ce.event_names.empty()) ++with_ev;
+                        if (shown < 5 && (!ce.prop_types.empty() || !ce.event_names.empty()))
+                        {
+                            ++shown;
+                            std::fprintf(stderr, "[catalog] %s props=", n2.c_str());
+                            for (auto const& [pn2, pt2] : ce.prop_types)
+                                std::fprintf(stderr, "%s:%s,", pn2.c_str(), pt2.c_str());
+                            std::fprintf(stderr, " evs=");
+                            for (auto const& ev2 : ce.event_names) std::fprintf(stderr, "%s,", ev2.c_str());
+                            std::fprintf(stderr, "\n");
+                        }
+                    }
+                }
+            }
+            // Discover all platform and control resource dictionaries dynamically:
+            // 1) From catalog resource_dictionaries
+            // 2) From each control entry's resource_dictionary
+            // 3) From loaded .winmd metadata TypeDefs (*Resources)
+            winuic::g_dynamic_resource_dictionaries.clear();
+            {
+                std::set<std::string> seen_rd;
+                auto add_rd = [&](std::string const& rd) {
+                    if (rd.empty()) return;
+                    if (rd.find('.') != std::string::npos && rd.find('/') == std::string::npos && seen_rd.insert(rd).second)
+                    {
+                        winuic::g_dynamic_resource_dictionaries.push_back(rd);
+                    }
+                };
+                for (auto const& rd : catalog.resource_dictionaries()) add_rd(rd);
+                for (auto const& [_, ce] : catalog.entries()) add_rd(ce.resource_dictionary);
+                for (auto const& [ns, info] : metadata.namespaces())
+                {
+                    if (ns.rfind("Windows.Win32", 0) == 0 || ns.rfind("Windows.Wdk", 0) == 0) continue;
+                    for (auto const* t : info.classes)
+                    {
+                        if (t->name.ends_with("Resources") && (t->name.find("ControlsResources") != std::string::npos || t->name.find("Xaml") != std::string::npos || t->name == "TabularControlsResources"))
+                        {
+                            add_rd(ns + "." + t->name);
+                        }
+                        else if (t->name.ends_with("Resources") && (ns.rfind("Microsoft.UI.Xaml", 0) == 0 || ns.rfind("Windows.UI.Xaml", 0) == 0))
+                        {
+                            add_rd(ns + "." + t->name);
+                        }
+                    }
+                }
             }
             // Pre-scan: find the app's root window class - any class with a
             // Window-derived base type. The host layer must not hardcode a
@@ -2621,12 +3119,16 @@ export int run(int const, char**)
             // generator gates its fallback stubs on this set - a stub for a type
             // that IS projected (e.g. ControlExample in the app winmd) would be a
             // second definition and break every importing module (C1117).
+            // Keys use the identifier spelling (hyphenated app namespaces
+            // mangled): every consumer compares a C++ spelling (the stub gate's
+            // `@`-expansion, winrt::-qualified element types) against this set.
             std::set<std::string> projected_names;
             for (auto const& [pns, pinfo] : metadata.namespaces())
             {
-                for (auto const* t : pinfo.classes) projected_names.insert(pns + "." + t->name);
-                for (auto const* t : pinfo.interfaces) projected_names.insert(pns + "." + t->name);
-                for (auto const* t : pinfo.structs) projected_names.insert(pns + "." + t->name);
+                std::string const pns_id = winuic::ident_ns(pns);
+                for (auto const* t : pinfo.classes) projected_names.insert(pns_id + "." + t->name);
+                for (auto const* t : pinfo.interfaces) projected_names.insert(pns_id + "." + t->name);
+                for (auto const* t : pinfo.structs) projected_names.insert(pns_id + "." + t->name);
             }
             for (auto const& [ns, info] : metadata.namespaces())
             {
@@ -2719,7 +3221,9 @@ export int run(int const, char**)
                         {
                             if (pj.view_name == main_window_class) continue;
                             std::string nm = norm(pj.view_name);
-                            if (nm == norm(tag) || nm == norm(tag) + "page")
+                            std::string nt = norm(tag);
+                            std::string nt_stem = (nt.size() > 4 && nt.ends_with("item")) ? nt.substr(0, nt.size() - 4) : nt;
+                            if (nm == nt || nm == nt + "page" || nm == nt_stem + "page" || (nt == "all" && nm == "allcontrolspage"))
                             {
                                 nav_pages.emplace_back(tag, pj.mod_ns + "." + pj.view_name);
                                 break;
@@ -2864,7 +3368,7 @@ export int run(int const, char**)
                                 lv.nav_pages = nav_pages;
                             std::string code = winuic::generate_view_module(lv, catalog, metadata.namespaces().count("Windows.Foundation") > 0,
                                 projected_names);
-                            std::string fname = vj.mod_ns + "." + vj.view_name + ".ixx";
+                            std::string fname = winuic::ident_ns(vj.mod_ns + "." + vj.view_name) + ".ixx";
                             write_output_file(output_folder / fname, code);
                             {
                                 std::lock_guard<std::mutex> lk(dbg_m);
@@ -2901,7 +3405,7 @@ export int run(int const, char**)
                     lv.nav_pages = nav_pages;
                 std::string code = winuic::generate_view_module(lv, catalog, metadata.namespaces().count("Windows.Foundation") > 0,
                     projected_names);
-                std::string fname = vj.mod_ns + "." + vj.view_name + ".ixx";
+                std::string fname = winuic::ident_ns(vj.mod_ns + "." + vj.view_name) + ".ixx";
                     write_output_file(output_folder / fname, code);
                 }
             }
@@ -2931,6 +3435,38 @@ export int run(int const, char**)
                 // on DynamicDependency's transitive re-export of AppModel.
                 entry << "import Windows.Win32.System.AppModel;\n";
                 entry << "import Windows.Win32.System.DynamicDependency;\n";
+                // Bootstrap major.minor as a NAMED constant from the winmd:
+                // winversec harvests WINDOWSAPPSDK_RELEASE_MAJORMINOR from the
+                // located WASDK package's WindowsAppSDK-VersionInfo.h at
+                // generation time, so a future WASDK release changes the winmd,
+                // not cppwinc — no recompile of either compiler. The literal is
+                // only the fallback for winmds built before the constant
+                // existed.
+                std::string boot_ver_ns;
+                std::string boot_ver_expr = "0x00020000";
+                for (auto const& [ns, ninfo] : metadata.namespaces())
+                {
+                    for (auto const* e : ninfo.enums)
+                    {
+                        if (e && e->name == "WINDOWSAPPSDK_RELEASE_MAJORMINOR" &&
+                            e->enum_fields.size() == 1)
+                        {
+                            boot_ver_ns = ns;
+                            std::string cpp;
+                            for (char ch : ns)
+                            {
+                                if (ch == '.') cpp += "::";   // C++ nested-namespace qualifier
+                                else if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_') cpp += ch;
+                                else cpp += '_';              // hyphenated app namespace -> identifier
+                            }
+                            boot_ver_expr = cpp + "::WINDOWSAPPSDK_RELEASE_MAJORMINOR";
+                            break;
+                        }
+                    }
+                    if (!boot_ver_ns.empty()) break;
+                }
+                if (!boot_ver_ns.empty())
+                    entry << "import " << winuic::ident_ns(boot_ver_ns) << ";\n";
                 std::string app_ns;
                 for (auto const& [ns, info] : metadata.namespaces()) {
                     for (auto const* c : info.classes) {
@@ -2939,7 +3475,7 @@ export int run(int const, char**)
                     if (!app_ns.empty()) break;
                 }
                 if (app_ns.empty() && !settings.component_name.empty()) app_ns = settings.component_name;
-                entry << "import " << app_ns << ".App;\n";
+                entry << "import " << winuic::ident_ns(app_ns + ".App") << ";\n";
                 // Local activation registry wiring: import every activatable
                 // view module (the ones exporting create_<View>()) so each
                 // register_local_factory_<View>() is callable from wWinMain.
@@ -2947,7 +3483,7 @@ export int run(int const, char**)
                 {
                     if (vj.view_name == "App" || vj.shell_window || vj.view_name.ends_with("Window"))
                         continue; // App/window views emit launch_<X>, not create_<X>
-                    entry << "import " << vj.mod_ns << "." << vj.view_name << ";\n";
+                    entry << "import " << winuic::ident_ns(vj.mod_ns + "." + vj.view_name) << ";\n";
                 }
                 entry << "\n";
                 entry << "// One short alias per imported namespace, at module scope.\n";
@@ -2961,19 +3497,19 @@ export int run(int const, char**)
                 entry << "    (void)hInstance;\n";
                 entry << "    // Fatal-exception self-report: any uncaught winrt/stdlib\n";
                 entry << "    // exception appends its kind + HRESULT + message to\n";
-                entry << "    // boot_log.txt before the process dies.\n";
+                entry << "    //     boot_log.txt before the process dies.\n";
                 entry << "    winrt::set_crash_reporter();\n\n";
-                entry << "    winrt::init_apartment();\n\n";
                 entry << "    // minVersion {0,0} = any 2.x runtime; the bootstrapper resolves\n";
                 entry << "    // the highest installed match for the major.minor requested.\n";
                 entry << "    am::PACKAGE_VERSION min_version{};\n";
-                entry << "    if (auto hr = dd::MddBootstrapInitialize2(0x00020000, nullptr, min_version,\n";
+                entry << "    if (auto hr = dd::MddBootstrapInitialize2(" << boot_ver_expr << ", nullptr, min_version,\n";
                 entry << "        dd::MddBootstrapInitializeOptions::MddBootstrapInitializeOptions_None); hr < 0)\n";
                 entry << "    {\n";
                 entry << "        std::wcerr << L\"dynamic dependency initialization failed: 0x\"\n";
                 entry << "                   << std::hex << hr << std::endl;\n";
                 entry << "        return 1;\n";
                 entry << "    }\n\n";
+                entry << "    winrt::init_apartment(winrt::apartment_type::single_threaded);\n\n";
                 entry << "    // Local activation registry: map every app runtime class to\n";
                 entry << "    // its in-process C++ factory BEFORE App::Start. XAML control\n";
                 entry << "    // instantiation may construct winrt::<ns>::<Class>() wrappers\n";
@@ -3002,9 +3538,9 @@ export int run(int const, char**)
             {
                 // Component source = the app .winmd (first input_dbs entry).
                 if (!settings.input_dbs.empty())
-                    settings.component_name = std::filesystem::path(*settings.input_dbs.begin()).filename().replace_extension().string();
+                    settings.component_name = sanitize_app_name(std::filesystem::path(*settings.input_dbs.begin()).filename().replace_extension().string());
                 else
-                    settings.component_name = std::filesystem::path(args.values("input").front()).filename().replace_extension().string();
+                    settings.component_name = sanitize_app_name(std::filesystem::path(args.values("input").front()).filename().replace_extension().string());
             }
             component_classes.clear();
             for (auto const& [ns, info] : metadata.namespaces()) {
@@ -3110,7 +3646,7 @@ export int run(int const, char**)
                             if (model == ns_projection_model::win32 || model == ns_projection_model::wdk)
                                 deps.insert(sanitize_module_name(ns_owner[d]));
                             else if (auto oit = ns_owner.find(d); oit != ns_owner.end() && oit->second != owner)
-                                deps.insert("winrt." + oit->second);
+                                deps.insert("winrt." + winuic::ident_ns(oit->second));
                         }
                         return deps;
                     }
@@ -3140,7 +3676,7 @@ export int run(int const, char**)
                                 else
                                 {
                                     // WinRT: module name has "winrt." prefix
-                                    deps.insert("winrt." + oit->second);
+                                    deps.insert("winrt." + winuic::ident_ns(oit->second));
                                 }
                             }
                         }
@@ -3261,15 +3797,48 @@ export int run(int const, char**)
             // dependency subgraphs (MediaPlayerElement -> Windows.Media.Playback)
             // blow up the huge P1 module and trip frontend ICEs (C1001).
             std::vector<winmd::type_info const*> closure_roots = component_classes;
-            for (std::pair<char const*, char const*> seed : {
-                    std::pair<char const*, char const*>{"Microsoft.UI.Xaml.Data", "CollectionViewSource"},
-                    {"Microsoft.UI.Xaml.Input", "XamlUICommand"} })
+            std::set<std::string> needed_class_names = {
+                "CollectionViewSource", "XamlUICommand", "AutomationProperties", "ToolTipService",
+                "RelativePanel", "ThemeShadow", "ElementShadow"
+            };
+            // Dynamically add all discovered control resource dictionaries from metadata
+            for (auto const& rd : winuic::g_dynamic_resource_dictionaries)
             {
-                auto nit = metadata.namespaces().find(seed.first);
-                if (nit == metadata.namespaces().end()) continue;
-                for (auto const* t : nit->second.classes)
-                    if (t->name == seed.second)
-                        closure_roots.push_back(t);
+                auto dot = rd.rfind('.');
+                std::string bare = (dot != std::string::npos) ? rd.substr(dot + 1) : rd;
+                needed_class_names.insert(std::move(bare));
+            }
+            for (auto const& [ns, info] : metadata.namespaces())
+            {
+                for (auto const* t : info.classes)
+                {
+                    if (t->winuic_json.empty()) continue;
+                    for (auto const& [type_name, type_ns] : winuic::g_type_ns)
+                    {
+                        if (needed_class_names.count(type_name)) continue;
+                        std::string needle_ctrl = "\"control\":\"" + type_name + "\"";
+                        std::string needle_type = "\"type\":\"" + type_name + "\"";
+                        if (t->winuic_json.find(needle_ctrl) != std::string::npos ||
+                            t->winuic_json.find(needle_type) != std::string::npos)
+                        {
+                            needed_class_names.insert(type_name);
+                        }
+                    }
+                }
+            }
+            for (auto const& name : needed_class_names)
+            {
+                auto it_ns = winuic::g_type_ns.find(name);
+                if (it_ns != winuic::g_type_ns.end())
+                {
+                    auto nit = metadata.namespaces().find(it_ns->second);
+                    if (nit != metadata.namespaces().end())
+                    {
+                        for (auto const* t : nit->second.classes)
+                            if (t->name == name)
+                                closure_roots.push_back(t);
+                    }
+                }
             }
             build_winui_type_closure(metadata, closure_roots, needed_modules);
             g_type_closure_active = true;
@@ -3331,7 +3900,7 @@ export int run(int const, char**)
             auto model = classify_namespace(ns);
             std::string group_name = (model == ns_projection_model::win32 || model == ns_projection_model::wdk)
                 ? sanitize_module_name(owner)
-                : "winrt." + owner;
+                : "winrt." + winuic::ident_ns(owner);
             if (settings.winui)
             {
                 if (!needed_modules.empty() && !needed_modules.contains(group_name)) continue;
@@ -3368,7 +3937,7 @@ export int run(int const, char**)
             }
             else
             {
-                module_name = "winrt." + owner;
+                module_name = "winrt." + winuic::ident_ns(owner);
             }
             // needed_modules filtering. In -winui selective mode the Win32/WDK
             // set is pruned too: only the modules the generated app code imports
@@ -3639,8 +4208,8 @@ export int run(int const, char**)
             else
             {
                 // WinRT: module name has "winrt." prefix
-                reexport_name = "winrt." + ns;
-                owner_module = "winrt." + owner;
+                reexport_name = "winrt." + winuic::ident_ns(ns);
+                owner_module = "winrt." + winuic::ident_ns(owner);
             }
             
             // Full-mode runs keep every module: emit re-export shells for all
@@ -3798,7 +4367,7 @@ export int run(int const, char**)
                 else
                 {
                     // WinRT: module name has "winrt." prefix
-                    dep_module_name = "winrt." + d;
+                    dep_module_name = "winrt." + winuic::ident_ns(d);
                 }
                 
                 // Import any dependency module that was actually emitted.
@@ -3847,9 +4416,9 @@ export int run(int const, char**)
                 for (int pi = 1; ; ++pi)
                 {
                     std::string sub = owner + ".P" + std::to_string(pi);
-                    if (emitted_modules.contains("winrt." + sub))
+                    if (emitted_modules.contains("winrt." + winuic::ident_ns(sub)))
                     {
-                        w.write("export import winrt.%;\n", sub);
+                        w.write("export import winrt.%;\n", winuic::ident_ns(sub));
                         has_subs = true;
                     }
                     else break;
@@ -4512,7 +5081,7 @@ export int run(int const, char**)
                     || stem.starts_with("Windows.Win32.") || stem.starts_with("Windows.Wdk.")
                     || stem == "Windows.Win32" || stem == "Windows.Wdk"
                     || (!settings.component_name.empty()
-                        && (stem == settings.component_name || stem.starts_with(settings.component_name + ".")));
+                        && (stem == winuic::ident_ns(settings.component_name) || stem.starts_with(winuic::ident_ns(settings.component_name) + ".")));
                 if (!generator_named) continue;
                 // Double-check the module declaration matches the file name
                 // before removing anything.
@@ -4554,14 +5123,14 @@ export int run(int const, char**)
             // Guard against clobbering a projection module of the same name:
             // emit_module already wrote <component_name>.ixx when an SCC group
             // owns that name, and the component file would overwrite it.
-            if (settings.verbose && (emitted_modules.contains(settings.component_name) || std::filesystem::exists(std::filesystem::path(settings.output_folder) / (settings.component_name + ".ixx"))))
+            if (settings.verbose && (emitted_modules.contains(winuic::ident_ns(settings.component_name)) || std::filesystem::exists(std::filesystem::path(settings.output_folder) / (winuic::ident_ns(settings.component_name) + ".ixx"))))
             {
                 std::printf("  [warn] component module name '%s' collides with a projection module; skipping component module write\n", settings.component_name.c_str());
             }
             else
             {
             writer out;
-            write_module_preamble(out, settings.component_name);
+            write_module_preamble(out, winuic::ident_ns(settings.component_name));
             std::set<std::string, std::less<>> comp_owners;
             for (auto const& [cns, classes] : by_ns)
             {
@@ -4575,11 +5144,11 @@ export int run(int const, char**)
                     // Import projection module for interface types (IControlExample, etc.)
                     // Only if different namespace — app's own namespace may lack a projection module
                     if (settings.component_name != owner)
-                        out.write("import winrt.%;\n", owner);
+                        out.write("import winrt.%;\n", winuic::ident_ns(owner));
                     // Component modules use their component name as the module name
                     // Skip self-import (re-export module importing itself)
                     if (settings.component_name != owner)
-                        out.write("export import %;\n", settings.component_name);
+                        out.write("export import %;\n", winuic::ident_ns(settings.component_name));
                 }
             }
             // Collect projection modules needed for base types of component classes
@@ -4593,7 +5162,7 @@ export int run(int const, char**)
             }
             for (auto const& mod_ns : needed_proj_modules)
             {
-                std::string proj_mod = "winrt." + mod_ns;
+                std::string proj_mod = "winrt." + winuic::ident_ns(mod_ns);
                 if (settings.component_name != mod_ns)
                     out.write("import %;\n", proj_mod);
             }
@@ -4625,14 +5194,24 @@ export int run(int const, char**)
                     {
                         out.write("    winrt::com_ptr<void> m_unknown;\n");
                         out.write("    mutable winrt::impl::iface_cache m_cache;\n\n");
-                        out.write("    static % from_abi(void* ptr) noexcept { % result; result.m_unknown = winrt::com_ptr<void>::attach(ptr); return result; }\n", c->name, c->name);
+                        out.write("    struct wrap_tag_t {};\n");
+                        out.write("    explicit %(wrap_tag_t) noexcept {}\n", c->name);
+                        out.write("    static % from_abi(void* ptr) noexcept { % result{wrap_tag_t{}}; result.m_unknown = winrt::com_ptr<void>::attach(ptr); return result; }\n", c->name, c->name);
                         out.write("    void* get_abi() const noexcept { return m_unknown.get(); }\n\n");
                         out.write("    static % wrap_borrowed(void* ptr) noexcept { if (ptr) { auto* vt = *reinterpret_cast<void* const**>(ptr); reinterpret_cast<std::uint32_t(__stdcall*)(void*)>(vt[1])(ptr); } return from_abi(ptr); }\n\n", c->name);
                         out.write("    template <typename I>\n    void* iface() const {\n        void* result = m_cache.get(winrt::iid_of<I>, m_unknown.get());\n        if (!result) throw winrt::hresult_error(winrt::hr_no_interface);\n        return result;\n    }\n\n");
                         out.write("    void* addref_borrowed() const noexcept\n    {\n        if (m_unknown.get())\n        {\n            auto* vt = *reinterpret_cast<void* const**>(m_unknown.get());\n            reinterpret_cast<std::uint32_t(__stdcall*)(void*)>(vt[1])(m_unknown.get());\n        }\n        return m_unknown.get();\n    }\n\n");
                         out.write("    operator winrt::IInspectable() const noexcept { return winrt::IInspectable(addref_borrowed()); }\n\n");
+                        out.write("    %() { m_unknown = winrt::com_ptr<void>::attach(winrt::impl::create_instance(class_name())); }\n\n", c->name);
                     }
-                    out.write("    %() { m_unknown = winrt::com_ptr<void>::attach(winrt::impl::create_instance(class_name())); }\n\n", c->name);
+                    else
+                    {
+                        out.write("    using wrap_tag_t = typename %::wrap_tag_t;\n", base_cpp);
+                        out.write("    explicit %(wrap_tag_t t) noexcept : %(t) {}\n", c->name, base_cpp);
+                        out.write("    static % from_abi(void* ptr) noexcept { % result{wrap_tag_t{}}; result.m_unknown = winrt::com_ptr<void>::attach(ptr); return result; }\n", c->name, c->name);
+                        out.write("    static % wrap_borrowed(void* ptr) noexcept { if (ptr) { auto* vt = *reinterpret_cast<void* const**>(ptr); reinterpret_cast<std::uint32_t(__stdcall*)(void*)>(vt[1])(ptr); } return from_abi(ptr); }\n\n", c->name);
+                        out.write("    %() noexcept : %(wrap_tag_t{}) { m_unknown = winrt::com_ptr<void>::attach(winrt::impl::create_instance(class_name())); }\n\n", c->name, base_cpp);
+                    }
                     out.write("    using implements_type = %;\n", c->name);
                     out.write("    using default_interface = winrt::IInspectable;\n\n");
 
@@ -4742,8 +5321,17 @@ export int run(int const, char**)
                                 // Emit as hstring property (most dependency props are strings)
                                 std::string pname = prop;
                                 if (!pname.empty()) pname[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(pname[0])));
-                                out.write("    winrt::hstring %() const { return {}; }\n", pname);
-                                out.write("    void %(winrt::hstring const& value) const {}\n", pname);
+                                if (pname == "Source" || pname == "Content" || pname == "Child")
+                                {
+                                    out.write("    winrt::IInspectable %() const { return {}; }\n", pname);
+                                    out.write("    void %(winrt::IInspectable const& value) const {}\n", pname);
+                                    out.write("    void %(winrt::Microsoft::UI::Xaml::UIElement const& value) const {}\n", pname);
+                                }
+                                else
+                                {
+                                    out.write("    winrt::hstring %() const { return {}; }\n", pname);
+                                    out.write("    void %(winrt::hstring const& value) const {}\n", pname);
+                                }
                             }
                         }
                     }
@@ -4931,7 +5519,7 @@ export int run(int const, char**)
                 // class projections above are complete by now
                 out.write("%", component_bodies);
             }
-            write_output_file(folder / (settings.component_name + ".ixx"), out.str());
+            write_output_file(folder / (winuic::ident_ns(settings.component_name) + ".ixx"), out.str());
             } // component module clobber guard else
         }
 
@@ -4957,7 +5545,7 @@ export int run(int const, char**)
                     || stem.starts_with("Windows.Win32.") || stem.starts_with("Windows.Wdk.")
                     || stem == "Windows.Win32" || stem == "Windows.Wdk"
                     || (!settings.component_name.empty()
-                        && (stem == settings.component_name || stem.starts_with(settings.component_name + ".")));
+                        && (stem == winuic::ident_ns(settings.component_name) || stem.starts_with(winuic::ident_ns(settings.component_name) + ".")));
                 if (!generator_named) continue;
                 // Double-check the module declaration matches the file name
                 // before removing anything.
@@ -5114,61 +5702,158 @@ export int run(int const, char**)
     return result;
 }
 
+struct bootstrap_candidate
+{
+    std::array<unsigned long, 4> ver{};
+    std::string path;
+};
+
+struct bootstrap_scan
+{
+    std::vector<bootstrap_candidate> libs;
+    std::vector<bootstrap_candidate> dlls;
+};
+
+// wasdk_bootstrap_scan — ONE parallel walk over every microsoft.windowsappsdk*
+// / microsoft.windowsappruntime* package version in the local NuGet cache,
+// collecting the x64 Bootstrap .lib AND .dll in a single pass (the link step
+// and the exe-copy step used to each re-walk every version tree serially).
+// (pkg, ver) pairs are enumerated serially — a listing each, and it fixes
+// the order — then each version tree is walked concurrently on all cores;
+// the result is cached per process, so whichever locator runs first pays
+// for the walk and the other reads the cache. Candidates keep enumeration
+// order, so the highest-package-version rule (old 1.0.x libs lack
+// MddBootstrapInitialize2 and poison the link) selects the same file the
+// serial walks did.
+bootstrap_scan const& wasdk_bootstrap_scan()
+{
+    static bootstrap_scan const scan = [] {
+        auto const t0 = std::chrono::steady_clock::now();
+        bootstrap_scan r;
+        std::filesystem::path pkgs = nuget_packages_root();
+        if (pkgs.empty()) return r;
+        std::error_code ec;
+        if (!std::filesystem::is_directory(pkgs, ec)) return r;
+        // 1. enumerate (pkg -> version dir) serially
+        std::vector<std::filesystem::path> vers;
+        for (auto const& pkg : std::filesystem::directory_iterator(pkgs, ec))
+        {
+            auto name = pkg.path().filename().wstring();
+            if (name.rfind(L"microsoft.windowsappsdk", 0) != 0 &&
+                name.rfind(L"microsoft.windowsappruntime", 0) != 0)
+                continue;
+            for (auto const& ver : std::filesystem::directory_iterator(pkg.path(), ec))
+            {
+                if (!ver.is_directory()) continue;
+                vers.push_back(ver.path());
+            }
+        }
+        // Parse a version dir name into its 4-part rank — the same
+        // digits-first parser the serial walks used.
+        auto parse_ver = [](std::wstring const& vstr) {
+            std::array<unsigned long, 4> v = { 0, 0, 0, 0 };
+            int idx = 0;
+            unsigned long cur = 0;
+            bool any = false;
+            for (wchar_t c : vstr)
+            {
+                if (c >= L'0' && c <= L'9') { cur = cur * 10 + (c - L'0'); any = true; }
+                else { if (any && idx < 4) v[idx++] = cur; cur = 0; any = false; }
+            }
+            if (any && idx < 4) v[idx] = cur;
+            return v;
+        };
+        // 2. walk every version tree concurrently — one slot per version dir
+        std::vector<std::pair<std::vector<bootstrap_candidate>,
+            std::vector<bootstrap_candidate>>> slots(vers.size());
+        std::string scan_error;
+        std::mutex scan_error_m;
+        if (!vers.empty())
+        {
+            std::size_t nthreads = system_core_count();
+            if (nthreads > vers.size()) nthreads = vers.size();
+            std::atomic<std::size_t> idx{ 0 };
+            std::vector<std::jthread> workers;
+            workers.reserve(nthreads);
+            for (std::size_t t = 0; t < nthreads; ++t)
+            {
+                workers.emplace_back([&] {
+                    for (;;)
+                    {
+                        std::size_t i = idx.fetch_add(1);
+                        if (i >= vers.size()) break;
+                        try
+                        {
+                            auto v = parse_ver(vers[i].filename().wstring());
+                            std::error_code vec;
+                            for (auto const& f : std::filesystem::recursive_directory_iterator(vers[i],
+                                    std::filesystem::directory_options::skip_permission_denied, vec))
+                            {
+                                if (!f.is_regular_file()) continue;
+                                auto fn = f.path().filename().wstring();
+                                bool const is_lib = fn == L"Microsoft.WindowsAppRuntime.Bootstrap.lib";
+                                bool const is_dll = fn == L"Microsoft.WindowsAppRuntime.Bootstrap.dll";
+                                if (!is_lib && !is_dll) continue;
+                                // The packages ship arm64/x86/x64 flavors — a mismatched
+                                // machine type poisons the link (LNK4272 + unresolved
+                                // MddBootstrap*). Only the x64 flavor links an x64 exe.
+                                auto p = f.path().wstring();
+                                if (p.find(L"x64") == std::wstring::npos || p.find(L"arm") != std::wstring::npos)
+                                    continue;
+                                (is_lib ? slots[i].first : slots[i].second).push_back({ v, f.path().string() });
+                            }
+                        }
+                        catch (std::exception const& e)
+                        {
+                            std::lock_guard<std::mutex> lk(scan_error_m);
+                            if (scan_error.empty()) scan_error = e.what();
+                        }
+                    }
+                });
+            }
+        }
+        if (!scan_error.empty())
+            throw std::runtime_error("WASDK NuGet cache scan failed: " + scan_error);
+        // 3. ordered merge — candidates in the serial walks' order
+        for (auto const& slot : slots)
+        {
+            r.libs.insert(r.libs.end(), slot.first.begin(), slot.first.end());
+            r.dlls.insert(r.dlls.end(), slot.second.begin(), slot.second.end());
+        }
+        if (settings.verbose)
+        {
+            auto const ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            std::printf("  (bootstrap scan: %zu version trees -> %zu lib / %zu dll candidates,"
+                " %lld ms, %zu cores)\n",
+                vers.size(), r.libs.size(), r.dlls.size(),
+                static_cast<long long>(ms), system_core_count());
+        }
+        return r;
+    }();
+    return scan;
+}
+
+// Pick the candidate from the highest package version (old 1.0.x libs lack
+// MddBootstrapInitialize2 (1.1+), so taking the first hit — alphabetical =
+// 1.0.0 — poisons the link).
+std::string best_bootstrap_candidate(std::vector<bootstrap_candidate> const& cands)
+{
+    if (cands.empty()) return {};
+    auto best = std::max_element(cands.begin(), cands.end(),
+        [](bootstrap_candidate const& a, bootstrap_candidate const& b) { return a.ver < b.ver; });
+    return best->path;
+}
+
 // locate_wasdk_bootstrap_lib — find Microsoft.WindowsAppRuntime.Bootstrap.lib
 // in the local NuGet cache (ships with the WindowsAppSDK packages). The
 // bootstrap lib provides MddBootstrapInitialize2 for the unpackaged app exe.
 std::string locate_wasdk_bootstrap_lib(bool verbose)
 {
-    std::filesystem::path pkgs = nuget_packages_root();
-    if (pkgs.empty()) return {};
-    std::error_code ec;
-    if (!std::filesystem::is_directory(pkgs, ec)) return {};
-    // Collect every x64 candidate, then return the one from the highest
-    // package version — old 1.0.x libs lack MddBootstrapInitialize2 (1.1+),
-    // so taking the first hit (alphabetical = 1.0.0) poisons the link.
-    std::vector<std::pair<std::array<unsigned long, 4>, std::string>> candidates;
-    for (auto const& pkg : std::filesystem::directory_iterator(pkgs, ec))
-    {
-        auto name = pkg.path().filename().wstring();
-        if (name.rfind(L"microsoft.windowsappsdk", 0) != 0 && name.rfind(L"microsoft.windowsappruntime", 0) != 0)
-            continue;
-        for (auto const& ver : std::filesystem::directory_iterator(pkg.path(), ec))
-        {
-            if (!ver.is_directory()) continue;
-            for (auto const& f : std::filesystem::recursive_directory_iterator(ver.path(),
-                    std::filesystem::directory_options::skip_permission_denied, ec))
-            {
-                // The packages ship arm64/x86/x64 flavors — a mismatched
-                // machine type poisons the link (LNK4272 + unresolved
-                // MddBootstrap*). Only the x64 flavor links an x64 exe.
-                auto p = f.path().wstring();
-                if (!f.is_regular_file() || f.path().filename() != L"Microsoft.WindowsAppRuntime.Bootstrap.lib")
-                    continue;
-                if (p.find(L"x64") == std::wstring::npos || p.find(L"arm") != std::wstring::npos)
-                    continue;
-                std::array<unsigned long, 4> v = { 0, 0, 0, 0 };
-                std::wstring vstr = ver.path().filename().wstring();
-                int idx = 0;
-                unsigned long cur = 0;
-                bool any = false;
-                for (wchar_t c : vstr)
-                {
-                    if (c >= L'0' && c <= L'9') { cur = cur * 10 + (c - L'0'); any = true; }
-                    else { if (any && idx < 4) v[idx++] = cur; cur = 0; any = false; }
-                }
-                if (any && idx < 4) v[idx] = cur;
-                candidates.push_back({ v, f.path().string() });
-            }
-        }
-    }
-    if (!candidates.empty())
-    {
-        auto best = std::max_element(candidates.begin(), candidates.end(),
-            [](auto const& a, auto const& b) { return a.first < b.first; });
-        return best->second;
-    }
-    if (verbose) std::printf("  (no Microsoft.WindowsAppRuntime.Bootstrap.lib in NuGet cache)\n");
-    return {};
+    auto r = best_bootstrap_candidate(wasdk_bootstrap_scan().libs);
+    if (r.empty() && verbose)
+        std::printf("  (no Microsoft.WindowsAppRuntime.Bootstrap.lib in NuGet cache)\n");
+    return r;
 }
 
 // locate_wasdk_bootstrap_dll — find Microsoft.WindowsAppRuntime.Bootstrap.dll
@@ -5178,51 +5863,10 @@ std::string locate_wasdk_bootstrap_lib(bool verbose)
 // installed system-wide. Same highest-version-wins rule as the .lib locator.
 std::string locate_wasdk_bootstrap_dll(bool verbose)
 {
-    std::filesystem::path pkgs = nuget_packages_root();
-    if (pkgs.empty()) return {};
-    std::error_code ec;
-    if (!std::filesystem::is_directory(pkgs, ec)) return {};
-    std::vector<std::pair<std::array<unsigned long, 4>, std::string>> candidates;
-    for (auto const& pkg : std::filesystem::directory_iterator(pkgs, ec))
-    {
-        auto name = pkg.path().filename().wstring();
-        if (name.rfind(L"microsoft.windowsappsdk", 0) != 0 && name.rfind(L"microsoft.windowsappruntime", 0) != 0)
-            continue;
-        for (auto const& ver : std::filesystem::directory_iterator(pkg.path(), ec))
-        {
-            if (!ver.is_directory()) continue;
-            for (auto const& f : std::filesystem::recursive_directory_iterator(ver.path(),
-                    std::filesystem::directory_options::skip_permission_denied, ec))
-            {
-                // x64 flavor only — the produced exe is x64 (same rule as the lib).
-                auto p = f.path().wstring();
-                if (!f.is_regular_file() || f.path().filename() != L"Microsoft.WindowsAppRuntime.Bootstrap.dll")
-                    continue;
-                if (p.find(L"x64") == std::wstring::npos || p.find(L"arm") != std::wstring::npos)
-                    continue;
-                std::array<unsigned long, 4> v = { 0, 0, 0, 0 };
-                std::wstring vstr = ver.path().filename().wstring();
-                int idx = 0;
-                unsigned long cur = 0;
-                bool any = false;
-                for (wchar_t c : vstr)
-                {
-                    if (c >= L'0' && c <= L'9') { cur = cur * 10 + (c - L'0'); any = true; }
-                    else { if (any && idx < 4) v[idx++] = cur; cur = 0; any = false; }
-                }
-                if (any && idx < 4) v[idx] = cur;
-                candidates.push_back({ v, f.path().string() });
-            }
-        }
-    }
-    if (!candidates.empty())
-    {
-        auto best = std::max_element(candidates.begin(), candidates.end(),
-            [](auto const& a, auto const& b) { return a.first < b.first; });
-        return best->second;
-    }
-    if (verbose) std::printf("  (no Microsoft.WindowsAppRuntime.Bootstrap.dll in NuGet cache)\n");
-    return {};
+    auto r = best_bootstrap_candidate(wasdk_bootstrap_scan().dlls);
+    if (r.empty() && verbose)
+        std::printf("  (no Microsoft.WindowsAppRuntime.Bootstrap.dll in NuGet cache)\n");
+    return r;
 }
 
 // Runtime folder for the -winui companions: wherever the linked exe lands
@@ -5307,28 +5951,159 @@ void copy_winui_pri()
 }
 
 // copy_winui_assets — winuic emits the app's Assets folder next to the
-// app .winmd (images, icons, and any other packaged payloads referenced by
-// the .winui sources). The produced app needs those same files beside the
-// exe (ms-appx:///Assets/... resolution), so -winui mirrors the whole
-// folder into the output folder. Always overwrites so assets always match
-// the winmd that produced this projection.
+// app .winmd. The produced app resolves those files beside the exe
+// (ms-appx:///Assets/...), but mirroring the WHOLE tree ships every unused
+// payload and blows up the output folder. Only the assets the generated
+// views actually REFERENCE are copied: the emitted sources are scanned for
+// ms-appx: / "Assets/..." literals and just those files are mirrored
+// (subfolders preserved). A build whose views reference no asset file
+// copies nothing.
 void copy_winui_assets()
 {
+    // Collect the referenced asset paths from the generated modules.
+    std::set<std::string, std::less<>> refs;
+    {
+        std::error_code ec;
+        std::filesystem::path outp(settings.output_folder);
+        if (std::filesystem::is_directory(outp, ec))
+        {
+            for (auto const& e : std::filesystem::directory_iterator(outp, ec))
+            {
+                if (!e.is_regular_file(ec) || e.path().extension() != ".ixx") continue;
+                std::ifstream ifs(e.path());
+                if (!ifs) continue;
+                auto add_ref = [&](std::string path)
+                {
+                    for (auto& c : path) if (c == '\\') c = '/';
+                    // strip a trailing quote fragment / qualifiers
+                    auto endp = path.find_first_of("\"' )};,");
+                    if (endp != std::string::npos) path.erase(endp);
+                    if (path.rfind("Assets/", 0) == 0
+                        && path.find('*') == std::string::npos
+                        && path.find('{') == std::string::npos)
+                        refs.insert(std::move(path));
+                };
+                std::string ln;
+                while (std::getline(ifs, ln))
+                {
+                    // ms-appx:///Assets/... (also ms-appx:///<ns>/Assets/...)
+                    std::size_t p = 0;
+                    while ((p = ln.find("ms-appx:", p)) != std::string::npos)
+                    {
+                        std::size_t q = p + 8;
+                        while (q < ln.size() && (ln[q] == '/' || ln[q] == '\\')) ++q;
+                        std::size_t s = q;
+                        while (q < ln.size() && ln[q] != '"' && ln[q] != '\'' && ln[q] != ')' && ln[q] != ';') ++q;
+                        add_ref(ln.substr(s, q - s));
+                        p = (q > p) ? q : p + 1;
+                    }
+                    // bare "Assets/..." literals (converter-reduced Sources etc.)
+                    p = 0;
+                    while ((p = ln.find("\"Assets/", p)) != std::string::npos)
+                    {
+                        std::size_t s = p + 1, q = s;
+                        while (q < ln.size() && ln[q] != '"') ++q;
+                        add_ref(ln.substr(s, q - s));
+                        p = (q > p) ? q : p + 1;
+                    }
+                }
+            }
+        }
+    }
     for (auto const& in : settings.input)
     {
         if (!std::filesystem::is_regular_file(in)) continue;
-        auto src = in.parent_path() / L"Assets";
-        if (!std::filesystem::is_directory(src)) continue;
-        auto dst = std::filesystem::path(winui_runtime_dir()) / L"Assets";
+        auto src_root = in.parent_path() / L"Assets";
+        if (!std::filesystem::is_directory(src_root)) continue;
+        auto dst_root = std::filesystem::path(winui_runtime_dir()) / L"Assets";
         std::error_code ec;
-        std::filesystem::copy(src, dst,
-            std::filesystem::copy_options::overwrite_existing | std::filesystem::copy_options::recursive, ec);
-        if (!ec)
-            std::printf("-winui: Assets copied from %s\n", src.string().c_str());
+        std::size_t copied = 0, missing = 0;
+        for (auto const& rel : refs)
+        {
+            auto relp = std::filesystem::path(rel.substr(7)); // strip "Assets/"
+            if (relp.empty()) continue;
+            auto src = src_root / relp;
+            if (!std::filesystem::is_regular_file(src, ec)) { ++missing; continue; }
+            auto dst = dst_root / relp;
+            std::filesystem::create_directories(dst.parent_path(), ec);
+            std::filesystem::copy_file(src, dst,
+                std::filesystem::copy_options::overwrite_existing, ec);
+            if (!ec) ++copied;
+        }
+        if (copied || missing)
+            std::printf("-winui: %zu referenced asset(s) copied, %zu referenced but missing%s\n",
+                copied, missing, refs.empty() ? "" : "");
         else
-            std::printf("cppwinc : warning could not copy Assets: %s\n", ec.message().c_str());
-        return;
+            std::printf("-winui: no referenced assets in generated views - Assets copy skipped\n");
+        break;
     }
+    // Copy LICENSE file to output directory if present next to any input winmd or parent
+    for (auto const& inp : settings.input)
+    {
+        if (!std::filesystem::is_regular_file(inp)) continue;
+        auto lic = inp.parent_path() / L"LICENSE";
+        if (!std::filesystem::is_regular_file(lic))
+            lic = inp.parent_path().parent_path() / L"LICENSE";
+        if (std::filesystem::is_regular_file(lic))
+        {
+            std::error_code lec;
+            std::filesystem::copy_file(lic, std::filesystem::path(winui_runtime_dir()) / L"LICENSE",
+                std::filesystem::copy_options::overwrite_existing, lec);
+            if (!lec) std::printf("-winui: LICENSE copied to output directory\n");
+            break;
+        }
+    }
+}
+
+// externals/ — zero-switch integration of external C++ code with a
+// projection. Everything lives under <projection folder>/externals:
+//   externals/include/ or externals/<pkg>/include/... → /I on every module
+//       (.ixx) and app (.cpp) compile
+//   externals/**.lib   → added to every link (exe, sys, dll)
+//   externals/**.dll   → copied next to the final linked binaries
+// NuGet package folders can be dropped in verbatim (build/native/include,
+// lib/x64, runtimes/win-x64/native all match this scan). Metadata is NOT
+// discovered here: third-party .winmd files stay explicit -input entries
+// the developer passes by hand.
+struct externals_bundle
+{
+    std::vector<std::string>           include_dirs; // -I search paths
+    std::vector<std::string>           libs;         // .lib files (full paths)
+    std::vector<std::filesystem::path> dlls;         // copied next to binaries
+};
+
+externals_bundle scan_externals(std::filesystem::path const& proj_folder)
+{
+    externals_bundle out;
+    std::error_code ec;
+    std::filesystem::path root = proj_folder / "externals";
+    if (!std::filesystem::is_directory(root, ec)) return out;
+
+    std::set<std::string, std::less<>> inc, libs, dlls;
+    // Headers dropped straight into externals/ resolve too.
+    inc.insert(root.lexically_normal().string());
+    std::filesystem::recursive_directory_iterator it(
+        root, std::filesystem::directory_options::skip_permission_denied, ec), end;
+    for (; !ec && it != end; it.increment(ec))
+    {
+        std::error_code tec;
+        if (it->is_directory(tec))
+        {
+            if (it->path().filename() == "include")
+                inc.insert(it->path().lexically_normal().string());
+        }
+        else if (it->is_regular_file(tec))
+        {
+            auto ext_s = it->path().extension().string();
+            for (auto& c : ext_s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (ext_s == ".lib") libs.insert(it->path().lexically_normal().string());
+            else if (ext_s == ".dll") dlls.insert(it->path().lexically_normal().string());
+        }
+    }
+    out.include_dirs.assign(inc.begin(), inc.end());
+    out.libs.assign(libs.begin(), libs.end());
+    out.dlls.assign(dlls.begin(), dlls.end());
+    return out;
 }
 
 // compile_project_folder — the shared compile+link pass behind -winui and
@@ -5344,6 +6119,12 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
                            std::string const& final_out)
 {
     int result = 0;
+    // externals/ convention: header dirs, import/static libs and runtime
+    // DLLs drop in with zero switches (see scan_externals).
+    externals_bundle ext = scan_externals(proj_folder);
+    if (!ext.include_dirs.empty() || !ext.libs.empty() || !ext.dlls.empty())
+        std::printf("externals/: %zu include dir(s), %zu lib(s), %zu dll(s)\n",
+                    ext.include_dirs.size(), ext.libs.size(), ext.dlls.size());
     std::filesystem::path toolchain = locate_msvc_toolchain();
     if (toolchain.empty())
     {
@@ -5441,7 +6222,7 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
                             if (!e.is_directory()) continue;
                             auto p = e.path().filename().string();
                             if (!p.empty() && std::isdigit(static_cast<unsigned char>(p.front())))
-                                if (latest_ver.empty() || p > latest_ver.filename().string())
+                                if (latest_ver.empty() || ver_dir_newer(p, latest_ver.filename().string()))
                                     latest_ver = e.path();
                         }
                         if (!latest_ver.empty()) wasdk_inc = (latest_ver / L"include").string();
@@ -5570,7 +6351,7 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
                         {
                             if (stale_set.contains(n)) continue;
                             // Precompiled SDK modules with valid .ifc and .obj should not be poisoned transitively
-                            if (is_sdk_mod(n) && std::filesystem::exists(obj_dir / (n + ".ifc")) && std::filesystem::exists(obj_dir / (n + ".obj")))
+                            if (!stale_set.contains("winrt_base") && is_sdk_mod(n) && std::filesystem::exists(obj_dir / (n + ".ifc")) && std::filesystem::exists(obj_dir / (n + ".obj")))
                             {
                                 std::error_code sec;
                                 if (std::filesystem::file_size(obj_dir / (n + ".ifc"), sec) >= 128)
@@ -5694,8 +6475,9 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
                         std::filesystem::remove(obj_dir / (n + ".obj"), dec);
                     }
                     std::string log_path = abs_obj + "\\" + n + ".log";
-                    std::string cl_cmd = "\"" + cl_path + "\" /nologo /c /std:c++latest /EHsc /MD /O2 /DNDEBUG /FS /utf-8 /W4 /bigobj /DWIN32_LEAN_AND_MEAN /DWINRT_LEAN_AND_MEAN /DNOMINMAX";
+                    std::string cl_cmd = "\"" + cl_path + "\" /nologo /c /std:c++latest /EHsc " + (settings.debug ? "/MDd /Od /Zi /D_DEBUG" : "/MD /O2 /DNDEBUG") + " /FS /utf-8 /W4 /bigobj /DWIN32_LEAN_AND_MEAN /DWINRT_LEAN_AND_MEAN /DNOMINMAX";
                     cl_cmd += " /ifcOutput \"" + abs_obj + "\" /ifcSearchDir \"" + abs_obj + "\" /ifcSearchDir \"" + abs_ixx + "\"";
+                    for (auto const& d : ext.include_dirs) cl_cmd += " /I\"" + d + "\"";
                     cl_cmd += " /Fo\"" + abs_obj + "\\" + n + ".obj\"";
                     cl_cmd += " \"" + ixx.string() + "\"";
                     cl_cmd += " >\"" + log_path + "\" 2>&1";
@@ -6052,7 +6834,12 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
                         push_libpath(sdk_lib + "\\um\\x64");   // um import libs
                     }
                 }
-                for (auto const& l : libs)
+                // externals/**.lib joins every link flavor (exe, sys, dll).
+                std::vector<std::string> merged_libs = libs;
+                for (auto const& l : ext.libs)
+                    if (std::find(merged_libs.begin(), merged_libs.end(), l) == merged_libs.end())
+                        merged_libs.push_back(l);
+                for (auto const& l : merged_libs)
                 {
                     // Directory entries are search paths, not input files:
                     // the driver link pushes the WDK km\\x64 folder so
@@ -6132,7 +6919,8 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
             // failed compile can never leave stale code to be linked.
             std::error_code cec;
             std::filesystem::remove(obj, cec);
-            std::string cmd = env_prefix + "\"" + cl_path + "\" /nologo /c /std:c++latest /EHsc /MD /O2 /DNDEBUG /FS /utf-8 /W4 /bigobj";
+            std::string cmd = env_prefix + "\"" + cl_path + "\" /nologo /c /std:c++latest /EHsc " + (settings.debug ? "/MDd /Od /Zi /D_DEBUG" : "/MD /O2 /DNDEBUG") + " /FS /utf-8 /W4 /bigobj";
+            for (auto const& d : ext.include_dirs) cmd += " /I\"" + d + "\"";
             cmd += " /Fo\"" + obj.string() + "\" \"" + src.string() + "\"";
             cmd += " >\"" + (obj_dir / (src.filename().string() + ".log")).string() + "\" 2>&1";
             std::printf("-compiling %s\n", src.filename().string().c_str());
@@ -6246,7 +7034,9 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
             // explicit /ENTRY the linker defaults to WinMain and fails with
             // LNK2019 on `WinMain`.
             if (!link_with(name + ".exe", app_objs, app_libs,
-                "/SUBSYSTEM:WINDOWS /MACHINE:X64 /INCREMENTAL:NO /ENTRY:wWinMainCRTStartup /RELEASE /OPT:REF /OPT:ICF"))
+                settings.debug
+                    ? "/SUBSYSTEM:WINDOWS /MACHINE:X64 /INCREMENTAL:NO /ENTRY:wWinMainCRTStartup /DEBUG:FULL"
+                    : "/SUBSYSTEM:WINDOWS /MACHINE:X64 /INCREMENTAL:NO /ENTRY:wWinMainCRTStartup /RELEASE /OPT:REF /OPT:ICF /DEBUG"))
                 result = 1;
         }
         // Console quick-test: a .cpp with plain main() -> <name>.exe linked
@@ -6368,7 +7158,9 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
                         }
                     }
                 }
-                if (!link_with(name + ".exe", objs, libs, "/SUBSYSTEM:CONSOLE /MACHINE:X64 /INCREMENTAL:NO /RELEASE /OPT:REF /OPT:ICF"))
+                if (!link_with(name + ".exe", objs, libs, settings.debug
+                    ? "/SUBSYSTEM:CONSOLE /MACHINE:X64 /INCREMENTAL:NO /DEBUG:FULL"
+                    : "/SUBSYSTEM:CONSOLE /MACHINE:X64 /INCREMENTAL:NO /RELEASE /OPT:REF /OPT:ICF"))
                     result = 1;
             }
             else if (explicit_targets)
@@ -6383,6 +7175,19 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
             std::printf("cppwinc : error -target exe: no main.ixx or .cpp source found in %s\n",
                         proj_folder.string().c_str());
             result = 1;
+        }
+
+        // externals/**.dll ride next to the binaries they were built for.
+        {
+            std::error_code dec;
+            for (auto const& dll : ext.dlls)
+            {
+                std::filesystem::copy_file(dll, final_dir / dll.filename(),
+                    std::filesystem::copy_options::overwrite_existing, dec);
+                if (dec)
+                    std::printf("cppwinc : warning could not copy %s next to binaries: %s\n",
+                                dll.filename().string().c_str(), dec.message().c_str());
+            }
         }
     }
     return result;

@@ -24,6 +24,68 @@ inline std::filesystem::path nuget_packages_root()
     return {};
 }
 
+// Numeric dotted-version compare for NuGet cache directory names.
+// Lexicographic string compare picks "2.3.9" over "2.3.10-experimental";
+// compare the numeric components instead. A prerelease suffix (everything
+// after the numeric core, e.g. "-experimental") ranks below the release of
+// the SAME version, but a numerically newer prerelease still wins
+// (2.3.10-experimental > 2.3.9).
+inline bool ver_dir_newer(std::string const& a, std::string const& b)
+{
+    auto core = [](std::string const& v, std::vector<int>& out, bool& prerelease) {
+        out.clear();
+        prerelease = false;
+        std::size_t i = 0;
+        while (i < v.size())
+        {
+            if (!std::isdigit(static_cast<unsigned char>(v[i]))) { prerelease = true; break; }
+            int n = 0;
+            while (i < v.size() && std::isdigit(static_cast<unsigned char>(v[i])))
+            {
+                n = n * 10 + (v[i] - '0');
+                ++i;
+            }
+            out.push_back(n);
+            if (i < v.size() && v[i] == '.') { ++i; continue; }
+            if (i < v.size()) { prerelease = true; break; }   // "-experimental" / "-preview"
+            break;
+        }
+    };
+    std::vector<int> va, vb;
+    bool pa = false, pb = false;
+    core(a, va, pa);
+    core(b, vb, pb);
+    std::size_t n = (std::max)(va.size(), vb.size());
+    for (std::size_t i = 0; i < n; ++i)
+    {
+        int x = i < va.size() ? va[i] : 0;
+        int y = i < vb.size() ? vb[i] : 0;
+        if (x != y) return x > y;
+    }
+    return !pa && pb;   // same numeric version: release outranks prerelease
+}
+
+// True system core count. GetSystemInfo ignores the CPU-affinity mask that
+// std::thread::hardware_concurrency() respects, so a process accidentally
+// pinned to one core still uses all the machine's cores ("my PC has 4 cores").
+// Lives in core (included first) so every parallel consumer — view emission,
+// module compile, and the WASDK NuGet search — shares it. CPPWINC_JOBS=<n>
+// caps it (the documented override), which also makes the search A/B one
+// env var away.
+std::size_t system_core_count()
+{
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    std::size_t n = si.dwNumberOfProcessors;
+    if (n == 0) n = std::thread::hardware_concurrency();
+    if (n < 2) n = 2;
+    if (char const* jobs = std::getenv("CPPWINC_JOBS"))
+    {
+        if (int j = std::atoi(jobs); j > 0) n = static_cast<std::size_t>(j);
+    }
+    return n;
+}
+
 // Check if a type is in Windows.Foundation or Microsoft.Windows.Foundation.
 // WASDK 2.3.x ships Microsoft.Windows.Foundation.winmd which uses
 // Microsoft.Windows.Foundation alongside Windows.Foundation.
@@ -137,6 +199,7 @@ struct settings_type
     // -compile: run the built-in module compilation pass (same machinery as
     // -winui) without WASDK auto-discovery — for winrt/win32/wdk projections.
     bool compile = false;
+    bool debug = false;
     // -target exe,sys,dll — explicit link targets (comma-separated,
     // case-insensitive). Empty = auto-detect from project sources.
     std::set<std::string, std::less<>> targets;

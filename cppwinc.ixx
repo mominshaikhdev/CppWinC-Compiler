@@ -44,6 +44,7 @@ export module cppwinc;
 import winmd_reader;
 import strings_data;
 import component_data;
+import winuic_helper;
 import winuic_data;
 import win32_data;
 import wdk_data;

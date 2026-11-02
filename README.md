@@ -35,7 +35,16 @@ and correct calling conventions.
   (`Microsoft.UI.*` / `Microsoft.UI.Xaml.*`) as C++23 modules — controls,
   layouts, resources, and typed-event handlers — importable
   alongside WinRT, Win32, and WDK from the same run (`-winui`).
-- **Any WinRT API — past, present and future.** `cppwinc` is driven
+- **Metadata-First in WinUI 3 & Rebuild-Free Architecture.** `cppwinc` implements a
+  pure **metadata-first** architecture for WinUI 3 applications. Rather than maintaining
+  hardcoded control lists or requiring compiler updates when new controls or WinUI Gallery
+  releases appear, `cppwinc` dynamically inspects the ECMA-335 `.winmd` metadata (carrying
+  `WinUIAttribute` view JSON and `WinUIControlCatalogAttribute`). It auto-discovers all
+  referenced controls, resolves namespaces against the metadata type system, dynamically
+  seeds closure roots, and dynamically instantiates external control resource dictionaries
+  (such as `TabularControlsResources`, `XamlChartsResources`) at launch. Future controls and
+  future WinUI Gallery releases require **zero rebuilds** of `cppwinc.exe`.
+- **Any Windows APIs — past, present and future.** `cppwinc` is driven
   entirely by metadata: whatever `.winmd` files you feed it, it projects.
   The OS's own `WinMetadata` folder, any Windows SDK version, Windows App
   SDK, WinUI 3, Win2D, WebView2, or your own component's metadata — all
@@ -62,9 +71,10 @@ and correct calling conventions.
   are emitted as `.ixx` module interface units. Consumers `import` them
   directly — no headers, no IFC build ordering headaches. The standard
   library is a named module too: apps and the generated code use
-  `import std;`, never STL headers.
-- **Multi-core generation.** Metadata loading, classification and module
-  generation always use all available CPU cores.
+  `import std;`, never STL headers.- **Multi-core generation.** Metadata loading, classification, WASDK NuGet
+  cache discovery (metadata, runtime-DLL and bootstrap walks all run on all
+  cores — one shared bootstrap scan per process) and module generation always
+  use all available CPU cores (`CPPWINC_JOBS=<n>` caps it).
 - **In-place regeneration.** Re-running into the same output directory
   overwrites regenerated modules — previously generated files from other
   input sets or user-authored modules are never deleted.
@@ -513,6 +523,60 @@ void convert_handles() {
 }
 ```
 
+## External C++ code: headers, libs, DLLs (`externals/`)
+
+Extending, modifying and creating controls never requires editing generated
+files or passing extra flags — it is a plain folder convention under the
+projection folder (the `-output` folder, or the folder given to `-compile`):
+
+```
+externals/
+├── include/ ...      every directory named `include` is added as /I to
+│                     every module (.ixx) and .cpp compile (headers dropped
+│                     directly in externals/ resolve too)
+├── **/*.lib          every import/static library found is added to the
+│                     exe, sys and dll links
+└── **/*.dll          copied next to the final linked binaries
+```
+
+NuGet package folders can be dropped in verbatim — `build/native/include`,
+`lib/x64` and `runtimes/win-x64/native` all match the scan. No switches:
+the convention is discovered from the folder itself.
+
+What this gives you:
+
+- **Modify built-in controls / add your own C++** — put headers and sources
+  under `externals/` and `#include` them from any module; they compile with
+  the same flags as everything else, and their objects join the same links.
+- **Mix in external NuGet third-party controls** — drop the package under
+  `externals/` for its headers/libs/DLLs and pass its `.winmd` **manually**
+  as a regular `-input` entry (metadata is never auto-discovered). When your
+  own winuic-produced winmd is present in `-input`, every other winmd is
+  treated as a library: its types are projected as ordinary platform types —
+  their namespaces are imported, kept alive by the needed-set, and never
+  misfiled as app/component types.
+- **Create new controls** — write the CppWinC control, pass its `.winmd`
+  via `-input`, drop its binaries under `externals/`, and describe it in a
+  `*.json` catalog next to `winuic.exe` (auto-loaded) if you also want the
+  `.winui` DSL to see it. Downstream, the `.winmd` you consume is
+  language-projection agnostic — winuic/xaml2winuic emit metadata only, and
+  this compiler turns it into C++23 modules.
+
+## Metadata-First WinUI 3 Projection & Rebuild-Free Architecture
+
+`CppWinC` implements a pure **metadata-first** architecture for WinUI 3 applications. All control resolution, type system discovery, container layouts, dimension sizing, property evaluation, and resource handling are driven dynamically from ECMA-335 `.winmd` metadata:
+
+- **Universal Control & Layout Resolution**: The compiler embeds no hardcoded lists of UI controls, panels, or layout containers. Any standard, third-party, custom, or future control (such as future WinUI Gallery releases or new Windows App SDK versions) resolves automatically through its metadata TypeDef, interface hierarchies, and `WinUIControlCatalogAttribute` schema.
+- **Generic Layout & Dimension Sizing**: Layout properties, dimensions (`Width`, `Height`, `MinWidth`, `MaxHeight`), alignment vectors (`HorizontalAlignment`, `VerticalAlignment`), and container-specific sizing definitions (e.g. Grid `Star`, `Auto`, `Pixel`, `GridLength`, and RelativePanel constraints) resolve generically based on the target property type system in metadata, allowing arbitrary nested layouts and containers to size and align correctly.
+- **Dynamic Closure Root Discovery**: Rather than relying on a static set of controls, `cppwinc` parses the `WinUIAttribute` AST payloads from view classes in `.winmd`, extracts all referenced control and type names, matches them against `g_type_ns` in the metadata reader, and dynamically injects them into the module compilation `closure_roots`.
+- **Dynamic Resource Dictionary Integration & Day-1 Unknown Control Discovery**: Controls requiring specialized platform resource dictionaries or external styles are dynamically resolved and instantiated via `winrt::impl::create_instance` and merged into `Application.Current.Resources.MergedDictionaries` at launch. Rather than hardcoding known platform resource dictionaries, `cppwinc` dynamically inspects the `WinUIControlCatalogAttribute` schema from `.winmd` (reading top-level `resource_dictionaries` and per-control `resource_dictionary` declarations) as well as querying all loaded `.winmd` ECMA-335 `TypeDef` tables for any classes ending in `Resources` that derive from `ResourceDictionary`. Discovered resource classes are automatically injected into module `closure_roots` and merged into `MergedDictionaries` at launch, completely decoupling control resources from compiler updates and guaranteeing 100% Day-1 support for any future or unknown controls.
+- **Type-Driven Events & Properties**:
+  - **Events** are resolved dynamically from the winmd `Event` table, flattened across all implemented base classes and interfaces.
+  - **Properties** are resolved from `PropertyDef` rows and getter/setter method signatures. Codegen gates strictly on the property's *underlying metadata type* (primitives, numeric types, enums, strings, brushes, geometries, thicknesses) rather than control names, ensuring full type safety and zero rebuilds for future APIs.
+- **Rebuild-Free Evolution**: Because the entire projection pipeline is generic and metadata-driven, new controls, properties, events, and layouts function seamlessly out of the box with zero compiler rebuilds.
+
+Set `CPPWINC_DUMP_CTRL_MAPS=1` to print the derived maps at startup.
+
 ## Usage
 
 ```
@@ -520,7 +584,9 @@ cppwinc.exe [options...]
 
 Options:
     -input <spec>        Windows metadata to include - ONE comma-separated list
-                         (local, <path-to-winmd-or-folder>, 10.0.x); -winui
+                         (local, <path-to-winmd-or-folder>, 10.0.x). A
+                         winuic-produced winmd here activates the WinUI3
+                         pipeline automatically (default behavior); -winui
                          auto-adds WASDK metadata and finds its runtime DLLs
     -output <path>       Location of generated projection (also the default
                          landing spot for every other switch's output)
@@ -535,14 +601,20 @@ Options:
                          -include; takes precedence over -include
     -base                Generate base module unconditionally
     -std [<path>]        Build the std named module into <path>
-    -winui [<path>]      Auto-discover WASDK metadata + DLLs, build std,
-                         compile all modules; optional <path> receives ONLY
-                         the final linked binaries (+ resources.pri, Assets,
-                         bootstrap DLL beside the exe)
-    -winui_no_compile [<path>]
+    -winui [exp] [debug] [<path>]
+                         Auto-discover WASDK metadata + DLLs, build std,
+                         compile all modules; optional 'exp' = latest
+                         experimental winmds only (default: latest stable);
+                         optional <path> receives ONLY the final linked
+                         binaries (+ resources.pri, Assets, LICENSE, bootstrap DLL
+                         beside the exe)
+    -winui_no_compile [exp] [<path>]
                          Like -winui but skip compilation (generate only);
-                         same optional <path> outpath support
-    -compile [<path>]    Compile modules (release, parallel across all cores)
+                         same optional 'exp' channel and <path> outpath
+                         support (+ resources.pri, Assets, LICENSE, bootstrap DLL
+                         beside the exe)
+    -compile [debug] [<path>]
+                         Compile modules (default: release /MD /O2; with 'debug': /MDd /Od /Zi /D_DEBUG)
                          + link exe / sys / release dll - see below
     -target <list>       Link targets for -compile (requires -compile):
                          comma-separated exe, sys, dll
@@ -567,9 +639,15 @@ Where <spec> is a single comma-separated list of any of:
 :: OS metadata plus a folder of extra winmd files (e.g. WASDK/WinUI3)
 cppwinc.exe -input local,<path\to\winmd-folder> -base -output out
 
-:: WinUI app - WASDK metadata + DLLs are found automatically; the winversec
-:: Windows.Win32.winmd is still required for the main.ixx bootstrap
-cppwinc.exe -input MyApp.winmd,Windows.Win32.winmd -winui
+:: WinUI app - the winuic-produced winmd turns the WinUI3 pipeline on by
+:: itself (default behavior): WASDK metadata + DLLs are discovered, views
+:: and modules are generated, then everything is compiled and linked.
+:: The winversec Windows.Win32.winmd is still required for the main.ixx
+:: bootstrap.
+cppwinc.exe -input MyApp.winmd,Windows.Win32.winmd
+
+:: Same pipeline, but stop after generation (explicit generate-only mode)
+cppwinc.exe -input MyApp.winmd,Windows.Win32.winmd -winui_no_compile
 
 :: Multiple winmd files, comma-separated
 cppwinc.exe -input Xaml.winmd,Foundation.winmd -base -output out
@@ -726,10 +804,10 @@ cppwinc.exe -compile build\proj -target exe,dll
 
 What `-compile` guarantees:
 
-- **Release everywhere.** Modules and `.cpp` sources compile with
+- **Release by default, Debug with `debug`.** Modules and `.cpp` sources compile with
   `/MD /O2 /DNDEBUG`; the exe, sys and dll links all run with
   `/RELEASE /OPT:REF /OPT:ICF` (`/INCREMENTAL:NO`). There is no debug
-  flavor in this pass.
+  Passing `debug` (`-compile debug` or `-winui debug` / `-winui exp debug`) switches compilation to `/MDd /Od /Zi /D_DEBUG` and links with `/DEBUG:FULL`.
 - **All cores in parallel.** The topological module build is leveled and
   compiles every ready module concurrently across `system_core_count()`
   threads (set `CPPWINC_JOBS=<n>` to override the thread count).
@@ -774,7 +852,7 @@ cppwinc.exe -input MyApp.winmd,Windows.Win32.winmd -winui -output .
 
 :: optional path: ONLY the final binaries (+ resources.pri, Assets,
 :: bootstrap DLL) land there; modules stay in -output
-cppwinc.exe -input MyApp.winmd,Windows.Win32.winmd -winui -output out -winui out\bin
+cppwinc.exe -input MyApp.winmd,Windows.Win32.winmd -winui out\bin -output out
 ```
 
 This automatically:
@@ -792,6 +870,53 @@ This automatically:
 MSVC toolchain, SDK, and WASDK include paths.
 
 No hardcoded paths — works on any Windows machine with Visual Studio and NuGet.
+
+#### App naming
+
+The app name comes from `-name`, or from the input winmd stem; spaces are
+hyphen-joined once (`WinUI Gallery` → `WinUI-Gallery`) and a `-name` value is
+taken verbatim. That spelling names the artifacts — `<App>.exe`, `<App>.pri`,
+the input winmd — and is retained in activation strings
+(`L"WinUI-Gallery.App"`). C++ identifiers derived from it are underscored, as
+the language requires (`WinUI_Gallery.App`, `winrt::WinUI_Gallery`).
+
+#### Experimental channel (`exp`)
+
+Both switches take an optional `exp` argument — `-winui exp` /
+`-winui_no_compile exp` — restricting WASDK winmd discovery to experimental
+packages (version directories tagged `-experimental*`, e.g.
+`2.3.10-experimental`): the newest installed experimental version wins and
+stable releases are skipped. Without `exp`, experimental directories are
+skipped and the latest stable version of each package is picked. Same channel
+semantics as winversec's `-include_wasdk [exp]`.
+
+```bat
+:: latest stable WASDK winmds (default)
+cppwinc.exe -input MyApp.winmd,Windows.Win32.winmd -winui -output out
+
+:: latest experimental WASDK winmds only
+cppwinc.exe -input MyApp.winmd,Windows.Win32.winmd -winui exp -output out
+```
+
+#### Debug builds (debug)
+
+Both -winui and -compile default to optimized **Release** builds (/MD /O2 /DNDEBUG compiler flags and /RELEASE /OPT:REF /OPT:ICF linker flags).
+
+Passing the debug positional keyword enables unoptimized debug builds with full debug information and debug CRT symbols (/MDd /Od /Zi /D_DEBUG and /DEBUG:FULL linker flags):
+
+```bat
+:: Release WinUI build (default)
+cppwinc.exe -input MyApp.winmd,Windows.Win32.winmd -winui -output out
+
+:: Debug WinUI build
+cppwinc.exe -input MyApp.winmd,Windows.Win32.winmd -winui debug -output out
+
+:: Debug WinUI build with experimental WASDK packages
+cppwinc.exe -input MyApp.winmd,Windows.Win32.winmd -winui exp debug -output out
+
+:: Standalone compile in Debug mode
+cppwinc.exe -compile debug -output out
+```
 
 #### System metadata and module selection
 
@@ -823,11 +948,14 @@ pruned at all.
 
 #### Component module structs
 
-The component module (`<Name>.ixx`) exports a struct per WinRT runtime class:
+The component module (`<Name>.ixx`) exports a struct per WinRT runtime class.
+`class_name()` carries the runtime class's metadata full name **verbatim** —
+including the hyphenated app namespace (`My App` → `My-App`) — because the
+activation key must match the `.winmd`:
 
 ```cpp
 export struct MainWindow {
-    static constexpr std::wstring_view class_name() noexcept { return L"App.MainWindow"; }
+    static constexpr std::wstring_view class_name() noexcept { return L"My-App.MainWindow"; }
     winrt::com_ptr<void> m_unknown;
     mutable winrt::impl::iface_cache m_cache;
     static MainWindow from_abi(void* ptr) noexcept;
@@ -845,7 +973,7 @@ to project the instance and call `Activate()`.
 
 #### Brush and geometry property handling
 
-The codegen automatically handles type-incompatible properties:
+Properties whose XAML value type has no 1:1 projection are handled at codegen:
 - `Foreground`/`Background`/`IconSource` (Brush types) — skipped when value is
   empty or a `{ThemeResource}` XAML resource reference.
 - `Data` (Geometry type) — emits `Geometry()` placeholder.
@@ -974,7 +1102,7 @@ build.bat
 The tool is C++23 named modules:
 
 ```
-cppwinrtc-compiler/
+cppwinc-compiler/
 ├── cppwinc.ixx              # Module root, includes all sub-modules
 ├── cppwinc_core.ixx         # Core metadata classification
 ├── cppwinc_cli.ixx          # CLI argument parsing
@@ -1007,3 +1135,5 @@ cppwinrtc-compiler/
 
 MIT License — see `LICENSE`. Copyright (c) 2026 Momin Shaikh. All rights
 reserved. Not affiliated with or endorsed by Microsoft.
+
+

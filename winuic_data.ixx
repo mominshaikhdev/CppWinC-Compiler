@@ -186,17 +186,62 @@ struct catalog_entry
     std::string control_type;           // "xaml" | "cpp"
     std::string template_resource_key;  // x:Key in ResourceDictionary (xaml only)
     std::string resource_dictionary;    // relative path to .xaml in package (xaml only)
+
+    // Registry-declared control surface (extend / modify / create): the
+    // property types and event names a registry JSON declares, normalized to
+    // the same vocabulary the metadata-driven rules consume. Lets an
+    // extended, overridden or brand-new control reach R6/R41/R36 exactly
+    // like a winmd-declared type does - no compiler rebuild.
+    std::vector<std::pair<std::string, std::string>> prop_types; // property -> canonical type name
+    std::vector<std::string> event_names;                        // event names (XAML spelling)
 };
+
+// Canonical fixup-rule type name for a registry property declaration.
+// Returns "" when the registry carries no type knowledge the rules use
+// (unknown behaves exactly like metadata-absent: not numeric, no wrap).
+inline std::string canon_prop_type(std::string_view type_s, std::string_view transform_s)
+{
+    auto lo = [](std::string_view s) {
+        std::string o(s);
+        for (auto& c : o) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return o;
+    };
+    std::string const t = lo(type_s), f = lo(transform_s);
+    if (t == "double") return "double";
+    if (t == "float") return "float";
+    if (t == "int" || t == "integer") return "int32_t";
+    if (t == "bool" || t == "boolean") return "bool";
+    if (t == "gridlength") return "GridLength";
+    if (t == "thickness") return "Thickness";
+    if (t == "fontweight") return "FontWeight";
+    if (f == "double") return "double";
+    if (f == "int") return "int32_t";
+    if (f == "bool" || f == "nullable_bool") return "bool";
+    if (f == "gridlength") return "GridLength";
+    if (f == "thickness") return "Thickness";
+    if (f == "font_weight") return "FontWeight";
+    return "";
+}
 
 class attribute_catalog
 {
     std::unordered_map<std::string, catalog_entry> entries_;
+    std::vector<std::string> resource_dictionaries_;
 public:
     void load_from_json(std::string_view json)
     {
         if (json.empty()) return;
         json_parser p;
         auto root = p.parse(json);
+        auto const* res_dicts = root.find("resource_dictionaries");
+        if (res_dicts && res_dicts->is_arr())
+        {
+            for (auto const& rd : res_dicts->a)
+            {
+                if (rd.is_str() && !rd.s.empty())
+                    resource_dictionaries_.push_back(rd.s);
+            }
+        }
         auto const* controls = root.find("controls");
         if (!controls || !controls->is_arr()) return;
         for (auto const& c : controls->a)
@@ -210,11 +255,46 @@ public:
             if (auto const* v = c.find("platform_namespace"))  e.platform.platform_namespace = v->str_or("");
             if (auto const* v = c.find("composition_kind"))   e.composition_kind = v->str_or("");
             if (auto const* v = c.find("type"))                 e.control_type = v->str_or("cpp");
-            if (auto const* v = c.find("template_resource_key")) e.template_resource_key = v->str_or("");
-            if (auto const* v = c.find("resource_dictionary"))   e.resource_dictionary = v->str_or("");
+            if (auto const* v = c.find("template_resource_key")) e.template_resource_key = v->str_or("");            if (auto const* v = c.find("resource_dictionary"))    e.resource_dictionary = v->str_or("");
+            // Registry-declared properties/events (extend/modify/create):
+            // normalized into the same vocabulary the rules consume.
+            if (auto const* pr = c.find("properties"); pr && pr->is_arr())
+            {
+                for (auto const& pv : pr->a)
+                {
+                    std::string pn, pt, tr;
+                    if (auto const* v = pv.find("name"))      pn = v->str_or("");
+                    if (auto const* v = pv.find("type"))      pt = v->str_or("");
+                    if (auto const* v = pv.find("transform")) tr = v->str_or("");
+                    std::string canon = canon_prop_type(pt, tr);
+                    if (pn.empty() || canon.empty()) continue;
+                    for (auto& cc : pn) cc = static_cast<char>(std::tolower(static_cast<unsigned char>(cc)));
+                    e.prop_types.emplace_back(std::move(pn), std::move(canon));
+                }
+            }
+            if (auto const* ev = c.find("events"); ev && ev->is_arr())
+            {
+                for (auto const& evv : ev->a)
+                {
+                    std::string en, pe;
+                    if (auto const* v = evv.find("name"))            en = v->str_or("");
+                    if (auto const* v = evv.find("platform_event"))  pe = v->str_or("");
+                    std::string evn = !pe.empty() ? pe : en;
+                    // Convention: abstract "onValueChanged" -> "ValueChanged"
+                    if (evn.size() > 2 && evn.rfind("on", 0) == 0
+                        && std::isupper(static_cast<unsigned char>(evn[2])))
+                        evn = evn.substr(2);
+                    if (evn.empty()) continue;
+                    for (auto& cc : evn) cc = static_cast<char>(std::tolower(static_cast<unsigned char>(cc)));
+                    e.event_names.push_back(std::move(evn));
+                }
+            }
             if (!e.abstract_name.empty()) entries_[e.abstract_name] = std::move(e);
         }
     }
+
+    auto const& entries() const { return entries_; }
+    auto const& resource_dictionaries() const { return resource_dictionaries_; }
 
     catalog_entry const* find(std::string_view name) const
     {
@@ -295,6 +375,8 @@ public:
     // Returns the single-child property name for a control.
     std::string single_child_prop(std::string_view name) const
     {
+        if (name == "ControlExample")
+            return "Example";
         if (name == "Border" || name == "Panel" || name == "Card" || name == "ItemContainer")
             return "Child";
         if (name == "StackPanel" || name == "Grid" || name == "Canvas"
@@ -307,12 +389,14 @@ public:
             return "Items";
         if (name == "Viewbox")
             return "Child";
-        if (name == "ScrollViewer" || name == "SwipeControl")
+        if (name == "ScrollViewer" || name == "ScrollView" || name == "SwipeControl")
             return "Content";
+        if (name == "Tile" || name == "HorizontalScrollContainer")
+            return "Source";
         if (name == "ContentControl" || name == "Button" || name == "CheckBox" || name == "RadioButton"
             || name == "ToggleButton" || name == "HyperlinkButton" || name == "AppBarButton"
             || name == "AppBarToggleButton"
-            || name == "CommandBarFlyout" || name == "ColorTile" || name == "Tile"
+            || name == "CommandBarFlyout" || name == "ColorTile"
             || name == "DropDownButton" || name == "SplitButton")
             return "Content";
         if (name == "MenuFlyoutItem" || name == "SplitMenuFlyoutItem"
@@ -341,6 +425,8 @@ public:
     // All standalone struct types need from_abi cast since they don't inherit
     bool single_child_needs_cast(std::string_view name) const
     {
+        if (name == "ControlExample")
+            return false;
         // All controls need cast because no standalone struct inherits UIElement
         return true;
     }
@@ -635,6 +721,8 @@ inline std::string to_cxx_type(std::string_view json_type)
     // winrt::Microsoft::UI::Xaml::Controls is wrong for app controls and for
     // Media/Data types - emit the bare name so ordinary lookup resolves it
     // exactly like the element-construction path does.
+    if (s == "any" || s == "object") return "winrt::IInspectable";
+    if (s == "any[]" || s == "object[]") return "winrt::Windows::Foundation::Collections::IObservableVector<winrt::IInspectable>";
     if (!json_type.empty() && std::isupper(static_cast<unsigned char>(json_type[0])))
         return std::string(json_type);
     return "winrt::hstring";
@@ -1197,36 +1285,40 @@ inline auto json_node_to_cpp(
             // Grid ColumnDefinitions / RowDefinitions: parse <ColumnDefinition Width="..."/> XML
             if ((klo == "columndefinitions" || klo == "rowdefinitions")
                 && cl == "grid" && !v.empty() && v.front() == '<') {
-                std::vector<std::string> widths;
+                std::vector<std::string> dims;
+                bool is_col = (klo == "columndefinitions");
+                std::string dim_attr = is_col ? "Width=\"" : "Height=\"";
                 std::string tmp = v;
                 while (true) {
-                    auto wp = tmp.find("Width=\"");
+                    auto wp = tmp.find(dim_attr);
                     if (wp == std::string::npos) break;
-                    wp += 7;
+                    wp += dim_attr.size();
                     auto we = tmp.find('"', wp);
                     if (we == std::string::npos) break;
-                    widths.push_back(tmp.substr(wp, we - wp));
+                    dims.push_back(tmp.substr(wp, we - wp));
                     tmp = tmp.substr(we + 1);
                 }
-                if (!widths.empty()) {
-                    std::string prop_name = (klo == "columndefinitions") ? "ColumnDefinitions" : "RowDefinitions";
+                if (!dims.empty()) {
+                    std::string prop_name = is_col ? "ColumnDefinitions" : "RowDefinitions";
+                    std::string def_type = is_col ? "ColumnDefinition" : "RowDefinition";
+                    std::string put_fn = is_col ? "put_Width" : "put_Height";
                     out << indent << "{\n";
                     out << indent << "    auto __gc = " << var_name << ".get_" << prop_name << "();\n";
-                    for (auto const& w : widths) {
+                    for (auto const& w : dims) {
                         if (w == "Auto") {
-                            out << indent << "    { auto __d = winrt::Microsoft::UI::Xaml::ColumnDefinition();\n";
-                            out << indent << "      __d.put_Width(winrt::Microsoft::UI::Xaml::GridLength(0, winrt::Microsoft::UI::Xaml::GridUnitType::Auto));\n";
+                            out << indent << "    { auto __d = winrt::Microsoft::UI::Xaml::Controls::" << def_type << "();\n";
+                            out << indent << "      __d." << put_fn << "(winrt::Microsoft::UI::Xaml::GridLength(0, winrt::Microsoft::UI::Xaml::GridUnitType::Auto));\n";
                             out << indent << "      __gc.Append(__d); }\n";
                         } else if (!w.empty() && w.back() == '*') {
                             std::string num = w.substr(0, w.size() - 1);
                             if (num.empty()) num = "1";
-                            out << indent << "    { auto __d = winrt::Microsoft::UI::Xaml::ColumnDefinition();\n";
-                            out << indent << "      __d.put_Width(winrt::Microsoft::UI::Xaml::GridLength(" << num
+                            out << indent << "    { auto __d = winrt::Microsoft::UI::Xaml::Controls::" << def_type << "();\n";
+                            out << indent << "      __d." << put_fn << "(winrt::Microsoft::UI::Xaml::GridLength(" << num
                                 << ", winrt::Microsoft::UI::Xaml::GridUnitType::Star));\n";
                             out << indent << "      __gc.Append(__d); }\n";
                         } else {
-                            out << indent << "    { auto __d = winrt::Microsoft::UI::Xaml::ColumnDefinition();\n";
-                            out << indent << "      __d.put_Width(winrt::Microsoft::UI::Xaml::GridLength(" << w
+                            out << indent << "    { auto __d = winrt::Microsoft::UI::Xaml::Controls::" << def_type << "();\n";
+                            out << indent << "      __d." << put_fn << "(winrt::Microsoft::UI::Xaml::GridLength(" << w
                                 << ", winrt::Microsoft::UI::Xaml::GridUnitType::Pixel));\n";
                             out << indent << "      __gc.Append(__d); }\n";
                         }
@@ -1261,7 +1353,11 @@ inline auto json_node_to_cpp(
                     // Determine if this property expects a Brush or a Style/other
                     bool is_brush_prop = (klo == "background" || klo == "foreground"
                         || klo == "borderbrush" || klo == "fill" || klo == "stroke"
-                        || klo == "overlaybrush" || klo == "selectedhighlightcolor");
+                        || klo == "overlaybrush" || klo == "selectedhighlightcolor"
+                        || klo == "rowbackground" || klo == "alternatingrowbackground"
+                        || klo == "axislinebrush" || klo == "tickbrush"
+                        || klo == "gridlinemajorbrush" || klo == "gridlineminorbrush"
+                        || klo == "datamarkerbrush" || klo == "databrush");
                     bool is_style_prop = (klo == "style");
                     bool is_template_prop = klo.ends_with("template");
                     if (is_brush_prop) {
@@ -1450,8 +1546,57 @@ inline auto json_node_to_cpp(
 // Globals for component-type detection and string escaping
 inline std::unordered_map<std::string, std::string> g_type_ns;
 inline std::set<std::string> g_project_nss;
+
+// A namespace resolved from loaded metadata is a PLATFORM namespace unless it
+// belongs to the project itself (g_project_nss = the project's own component
+// namespaces). Platform = WinUI/WinRT framework types OR a third-party control
+// library the project mixed in via its own winmd in -input. The old
+// Microsoft./Windows. name-prefix test misfiled every third-party control as
+// an app type: its setters were skipped, its children wrapped, its <Name>
+// typed as <Name>View, and no import was emitted — so the -winui needed-set
+// prune dropped the very controls the project uses.
+inline bool is_platform_ns(std::string const& ns)
+{
+    return !ns.empty() && !g_project_nss.count(ns);
+}
 inline std::set<std::string> g_view_type_names;
 inline std::set<std::string> g_missing_types;
+inline std::vector<std::string> g_dynamic_resource_dictionaries;
+// Metadata-derived control knowledge (keys lowercased; populated by the
+// driver from the loaded winmds, consumed by fixup_view_code):
+//   type name -> set of lowercased event names (Event table, flattened over
+//                base classes + interfaces)
+//   type name -> { lowercased property -> metadata type name ("GridLength") }
+// Control-specific knowledge stays OUT of the compiler binary: new controls
+// and events arrive as metadata, never as new hardcoded lists.
+inline std::unordered_map<std::string, std::set<std::string>> g_type_events;
+inline std::unordered_map<std::string, std::unordered_map<std::string, std::string>> g_type_prop_kinds;
+// Enum type knowledge from the loaded winmds: enum type name ->
+// (namespace, member names). Populated by the driver next to g_type_ns;
+// resolve_typed_value() qualifies enum values from this table, so the
+// property -> enum mapping is metadata truth only - never a control list.
+inline std::unordered_map<std::string, std::pair<std::string, std::set<std::string>>> g_enum_info;
+
+// Metadata-driven replacement for the old hardcoded numeric-DP name list:
+// true iff the loaded winmd says THIS receiver's property setter takes a
+// primitive numeric type. Unknown/app-local props are not numeric - the same
+// default the old list had for names outside it. Type+metadata only; a new
+// control never requires touching this file.
+inline bool is_numeric_prop(std::string const& control, std::string const& prop)
+{
+    std::string lo_c = control;
+    for (auto& c : lo_c) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    auto sc = lo_c.rfind("::");
+    if (sc != std::string::npos) lo_c = lo_c.substr(sc + 2);
+    std::string lo_p = prop;
+    for (auto& c : lo_p) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (lo_c.empty() || lo_p.empty()) return false;
+    auto it = g_type_prop_kinds.find(lo_c);
+    if (it == g_type_prop_kinds.end()) return false;
+    auto pit = it->second.find(lo_p);
+    if (pit == it->second.end()) return false;
+    return is_numeric_type_name(pit->second);
+}
 
 // Convert template JSON payload to a C++ factory function.
 inline auto template_payload_to_cpp_factory(
@@ -1555,10 +1700,9 @@ inline bool is_app_or_unknown_type(std::string const& control)
     std::string ns = resolve_type_ns(control);
     if (ns.empty()) return true;
     if (g_project_nss.count(ns) > 0) return true;
-    // If namespace is not a known platform namespace, treat as app type.
-    // Platform types live under winrt::Microsoft::* or winrt::Windows::*.
-    if (!ns.empty() && ns.find("Microsoft") == std::string::npos && ns.find("Windows") == std::string::npos)
-        return true;
+    // Resolved from loaded metadata and not the project's own namespace →
+    // platform type: WinUI/WinRT framework OR a third-party control library
+    // the project brought in as its own winmd.
     return false;
 }
 
@@ -1669,13 +1813,439 @@ inline std::string try_interpolate_string(
     return res;
 }
 
+// C3: data-driven component-stub catalog.
+//
+// Stubs the view modules may need: types generated code references but the
+// component winmd does not export. Each stub is declared ONCE, as data
+// below - gate, namespace, base, ordered body rows - and emitted by one
+// loop (emit_component_stubs). The old hand-written if(have(...)) chain is
+// gone: adding a stub is a table row, never new emission logic, and gating,
+// namespace bracing and ordering all derive from the data.
+//
+//   gate    qualified name checked against the projected-name set; '@' is
+//           the view's app namespace (renaming WinUIGallery -> WinUI_Gallery
+//           moves every app stub with it); "" = never gated (the type sits
+//           outside every winmd projection and is always stubbed)
+//   nspace  namespace the struct is emitted into; "" = global scope
+//   base    base type exactly as written after ':'
+//   body    ordered rows (sm_* builders); a row is either a structured
+//           member or one verbatim line for bespoke shapes
+//   blank   extra blank line after the closing `};`
+struct stub_member
+{
+    std::string kind;     // using | ctor | dctor | field | fromabi | method | raw
+    std::string ret;      // method: return type
+    std::string name;     // method: member name
+    std::string params;   // method: parameter list, parens included
+    bool        is_const = false;
+    std::string dflt;     // method: return expression ("" = derived from ret)
+    std::string line;     // raw: verbatim body line (emitted as-is + '\n')
+};
+
+struct stub_def
+{
+    std::string gate;
+    std::string nspace;
+    std::string type;
+    std::string base;
+    bool        abs_from_abi = false; // from_abi attaches via ::winrt::com_ptr
+    bool        blank_after  = false; // extra blank line after `};`
+    std::vector<stub_member> body;
+};
+
+inline stub_member sm_using()   { stub_member m; m.kind = "using";   return m; }
+inline stub_member sm_ctor()    { stub_member m; m.kind = "ctor";    return m; }
+inline stub_member sm_dctor()   { stub_member m; m.kind = "dctor";   return m; }
+inline stub_member sm_field()   { stub_member m; m.kind = "field";   return m; }
+inline stub_member sm_fromabi() { stub_member m; m.kind = "fromabi"; return m; }
+inline stub_member sm_raw(std::string line)
+{ stub_member m; m.kind = "raw"; m.line = std::move(line); return m; }
+inline stub_member sm_meth(std::string ret, std::string name, std::string params,
+                           bool is_const = false, std::string dflt = {})
+{
+    stub_member m; m.kind = "method";
+    m.ret = std::move(ret); m.name = std::move(name);
+    m.params = std::move(params); m.is_const = is_const; m.dflt = std::move(dflt);
+    return m;
+}
+
+inline std::vector<stub_def> const& component_stub_catalog()
+{
+    static std::vector<stub_def> const cat = [] {
+        std::vector<stub_def> v;
+        auto add = [&](std::string gate, std::string nspace, std::string type,
+                       std::string base, std::vector<stub_member> body,
+                       bool abs_from_abi = false, bool blank_after = false) {
+            stub_def d;
+            d.gate = std::move(gate); d.nspace = std::move(nspace);
+            d.type = std::move(type); d.base = std::move(base);
+            d.abs_from_abi = abs_from_abi; d.blank_after = blank_after;
+            d.body = std::move(body);
+            v.push_back(std::move(d));
+        };
+        std::string const UC  = "winrt::Microsoft::UI::Xaml::Controls::UserControl";
+        std::string const CC  = "winrt::Microsoft::UI::Xaml::Controls::ContentControl";
+        std::string const INS = "::winrt::IInspectable";
+        std::string const CVT = "(::winrt::IInspectable const&, ::winrt::hstring const&, ::winrt::IInspectable const&, ::winrt::hstring const&)";
+
+        // app namespace: gallery controls the winmd never exports
+        add("@.ControlExample", "winrt::@", "ControlExample", UC, {
+            sm_using(),
+            sm_raw("    winrt::Microsoft::UI::Xaml::UIElement Content() const { return static_cast<winrt::Microsoft::UI::Xaml::Controls::UserControl const&>(*this).get_Content(); }"),
+            sm_raw("    void Content(winrt::Microsoft::UI::Xaml::UIElement const& value) const { static_cast<winrt::Microsoft::UI::Xaml::Controls::UserControl const&>(*this).put_Content(value); }"),
+            sm_raw("    template<class H> winrt::event_token add_Loaded(H const&) const { return {}; }"),
+        });
+        add("@.ControlExampleSubstitution", "winrt::@", "ControlExampleSubstitution", UC, {
+            sm_using(),
+            sm_meth("winrt::IInspectable", "Substitution", "()"),
+            sm_meth("void", "Substitution", "(winrt::IInspectable const&)"),
+        });
+        // FeaturedTileLayout: gallery layout control that appears only in the
+        // XAML payload of LayoutPanelPage, never as a winmd TypeDef - without
+        // this stub the page's bare `FeaturedTileLayout()` fails with C3861.
+        add("@.FeaturedTileLayout", "winrt::@", "FeaturedTileLayout",
+            "winrt::Microsoft::UI::Xaml::Controls::StackPanel", { sm_using() });
+
+        // CommunityToolkit controls
+        add("CommunityToolkit.WinUI.Controls.SettingsCard", "winrt::CommunityToolkit::WinUI::Controls",
+            "SettingsCard", CC, {
+            sm_using(),
+            sm_raw("    struct _sc_state { winrt::Microsoft::UI::Xaml::Controls::TextBlock hdr{winrt::Microsoft::UI::Xaml::Controls::TextBlock::wrap_tag_t{}}; winrt::Microsoft::UI::Xaml::Controls::TextBlock desc{winrt::Microsoft::UI::Xaml::Controls::TextBlock::wrap_tag_t{}}; winrt::Microsoft::UI::Xaml::Controls::Border slot{winrt::Microsoft::UI::Xaml::Controls::Border::wrap_tag_t{}}; winrt::Microsoft::UI::Xaml::Controls::Border icon_slot{winrt::Microsoft::UI::Xaml::Controls::Border::wrap_tag_t{}}; winrt::Microsoft::UI::Xaml::Controls::Border action_slot{winrt::Microsoft::UI::Xaml::Controls::Border::wrap_tag_t{}}; };"),
+            sm_raw("    std::shared_ptr<_sc_state> _st;"),
+            sm_raw("    SettingsCard() : ContentControl() {"),
+            sm_raw("        _st = std::make_shared<_sc_state>();"),
+            sm_raw("        HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);"),
+            sm_raw("        HorizontalContentAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);"),
+            sm_raw("        auto b = winrt::Microsoft::UI::Xaml::Controls::Border();"),
+            sm_raw("        b.Background(::theme_brush_th(L\"CardBackgroundFillColorDefaultBrush\"));"),
+            sm_raw("        b.BorderBrush(::theme_brush_th(L\"CardStrokeColorDefaultBrush\"));"),
+            sm_raw("        b.BorderThickness(winrt::Microsoft::UI::Xaml::Thickness{1,1,1,1});"),
+            sm_raw("        b.CornerRadius(winrt::Microsoft::UI::Xaml::CornerRadius{4,4,4,4});"),
+            sm_raw("        b.Padding(winrt::Microsoft::UI::Xaml::Thickness{16,14,16,14});"),
+            sm_raw("        b.Margin(winrt::Microsoft::UI::Xaml::Thickness{0,0,0,4});"),
+            sm_raw("        b.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);"),
+            sm_raw("        auto g = winrt::Microsoft::UI::Xaml::Controls::Grid();"),
+            sm_raw("        auto c0 = winrt::Microsoft::UI::Xaml::Controls::ColumnDefinition(); c0.Width(winrt::Microsoft::UI::Xaml::GridLength(0, winrt::Microsoft::UI::Xaml::GridUnitType::Auto)); g.ColumnDefinitions().Append(c0);"),
+            sm_raw("        auto c1 = winrt::Microsoft::UI::Xaml::Controls::ColumnDefinition(); c1.Width(winrt::Microsoft::UI::Xaml::GridLength(1, winrt::Microsoft::UI::Xaml::GridUnitType::Star)); g.ColumnDefinitions().Append(c1);"),
+            sm_raw("        auto c2 = winrt::Microsoft::UI::Xaml::Controls::ColumnDefinition(); c2.Width(winrt::Microsoft::UI::Xaml::GridLength(0, winrt::Microsoft::UI::Xaml::GridUnitType::Auto)); g.ColumnDefinitions().Append(c2);"),
+            sm_raw("        auto c3 = winrt::Microsoft::UI::Xaml::Controls::ColumnDefinition(); c3.Width(winrt::Microsoft::UI::Xaml::GridLength(0, winrt::Microsoft::UI::Xaml::GridUnitType::Auto)); g.ColumnDefinitions().Append(c3);"),
+            sm_raw("        _st->icon_slot = winrt::Microsoft::UI::Xaml::Controls::Border(); _st->icon_slot.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center); _st->icon_slot.Margin(winrt::Microsoft::UI::Xaml::Thickness{0,0,16,0}); _st->icon_slot.Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);"),
+            sm_raw("        winrt::Microsoft::UI::Xaml::Controls::Grid::SetColumn(winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(_st->icon_slot.m_unknown.get()), 0);"),
+            sm_raw("        g.Children().Append(_st->icon_slot);"),
+            sm_raw("        auto sp = winrt::Microsoft::UI::Xaml::Controls::StackPanel(); sp.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center); sp.Spacing(2);"),
+            sm_raw("        _st->hdr = winrt::Microsoft::UI::Xaml::Controls::TextBlock(); _st->hdr.FontSize(14); _st->hdr.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::Wrap); sp.Children().Append(_st->hdr);"),
+            sm_raw("        _st->desc = winrt::Microsoft::UI::Xaml::Controls::TextBlock(); _st->desc.FontSize(12); _st->desc.Foreground(::theme_brush_th(L\"TextFillColorSecondaryBrush\")); _st->desc.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::Wrap); _st->desc.Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed); sp.Children().Append(_st->desc);"),
+            sm_raw("        winrt::Microsoft::UI::Xaml::Controls::Grid::SetColumn(winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(sp.m_unknown.get()), 1);"),
+            sm_raw("        g.Children().Append(sp);"),
+            sm_raw("        _st->slot = winrt::Microsoft::UI::Xaml::Controls::Border(); _st->slot.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center); _st->slot.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Right);"),
+            sm_raw("        winrt::Microsoft::UI::Xaml::Controls::Grid::SetColumn(winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(_st->slot.m_unknown.get()), 2);"),
+            sm_raw("        g.Children().Append(_st->slot);"),
+            sm_raw("        _st->action_slot = winrt::Microsoft::UI::Xaml::Controls::Border(); _st->action_slot.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center); _st->action_slot.Margin(winrt::Microsoft::UI::Xaml::Thickness{12,0,0,0}); _st->action_slot.Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);"),
+            sm_raw("        winrt::Microsoft::UI::Xaml::Controls::Grid::SetColumn(winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(_st->action_slot.m_unknown.get()), 3);"),
+            sm_raw("        g.Children().Append(_st->action_slot);"),
+            sm_raw("        b.Child(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(g.m_unknown.get()));"),
+            sm_raw("        static_cast<winrt::Microsoft::UI::Xaml::Controls::ContentControl const&>(*this).Content(winrt::IInspectable(b.addref_borrowed()));"),
+            sm_raw("    }"),
+            sm_raw("    template<class H> winrt::event_token add_Click(H const&) const { return {}; }"),
+            sm_raw("    void Header(winrt::IInspectable const& v) const { if (_st && _st->hdr.m_unknown.get()) _st->hdr.Text(winrt::unbox_value_or<winrt::hstring>(v, L\"\")); }"),
+            sm_raw("    void Header(winrt::hstring const& v) const { if (_st && _st->hdr.m_unknown.get()) _st->hdr.Text(v); }"),
+            sm_raw("    void Description(winrt::IInspectable const& v) const { if (_st && _st->desc.m_unknown.get()) { auto s = winrt::unbox_value_or<winrt::hstring>(v, L\"\"); _st->desc.Text(s); _st->desc.Visibility(s.empty() ? winrt::Microsoft::UI::Xaml::Visibility::Collapsed : winrt::Microsoft::UI::Xaml::Visibility::Visible); } }"),
+            sm_raw("    void Description(winrt::hstring const& v) const { if (_st && _st->desc.m_unknown.get()) { _st->desc.Text(v); _st->desc.Visibility(v.empty() ? winrt::Microsoft::UI::Xaml::Visibility::Collapsed : winrt::Microsoft::UI::Xaml::Visibility::Visible); } }"),
+            sm_raw("    void Content(winrt::Microsoft::UI::Xaml::UIElement const& v) const { if (_st && _st->slot.m_unknown.get()) _st->slot.Child(v); }"),
+            sm_raw("    void Content(winrt::IInspectable const& v) const { if (_st && _st->slot.m_unknown.get() && v.get_abi()) _st->slot.Child(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(v.get_abi())); }"),
+            sm_raw("    void set_icon_helper(winrt::Microsoft::UI::Xaml::Controls::Border const& border, winrt::hstring const& s) const {"),
+            sm_raw("        if (!border.m_unknown.get() || s.empty()) return;"),
+            sm_raw("        std::wstring ws(s.to_view());"),
+            sm_raw("        if (ws.find(L\"BitmapIcon\") != std::wstring::npos || ws.find(L\".png\") != std::wstring::npos) {"),
+            sm_raw("            auto bi = winrt::Microsoft::UI::Xaml::Controls::BitmapIcon(); bi.ShowAsMonochrome(false); bi.Width(24); bi.Height(24);"),
+            sm_raw("            bi.UriSource(winrt::Windows::Foundation::Uri(L\"ms-appx:///Assets/Tiles/BadgeLogo.png\"));"),
+            sm_raw("            border.Child(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(bi.m_unknown.get())); border.Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible);"),
+            sm_raw("        } else {"),
+            sm_raw("            std::wstring glyph = ws; auto p1 = ws.find(L\"Glyph=\\\"\"); if (p1 != std::wstring::npos) { p1 += 7; auto p2 = ws.find(L'\\\"', p1); if (p2 != std::wstring::npos) glyph = ws.substr(p1, p2 - p1); }"),
+            sm_raw("            auto fi = winrt::Microsoft::UI::Xaml::Controls::FontIcon(); fi.Glyph(winrt::hstring(glyph)); fi.FontSize(18);"),
+            sm_raw("            border.Child(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(fi.m_unknown.get())); border.Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible);"),
+            sm_raw("        }"),
+            sm_raw("    }"),
+            sm_raw("    void HeaderIcon(winrt::IInspectable const& v) const { if (_st) set_icon_helper(_st->icon_slot, winrt::unbox_value_or<winrt::hstring>(v, L\"\")); }"),
+            sm_raw("    void HeaderIcon(winrt::hstring const& v) const { if (_st) set_icon_helper(_st->icon_slot, v); }"),
+            sm_raw("    void ActionIcon(winrt::IInspectable const& v) const { if (_st) set_icon_helper(_st->action_slot, winrt::unbox_value_or<winrt::hstring>(v, L\"\")); }"),
+            sm_raw("    void ActionIcon(winrt::hstring const& v) const { if (_st) set_icon_helper(_st->action_slot, v); }"),
+            sm_meth("void", "ActionIconToolTip", "(winrt::hstring const&)"),
+            sm_meth("void", "IsClickEnabled", "(bool)"),
+            sm_meth("void", "ContentAlignment", "(winrt::IInspectable const&)"),
+            sm_meth("void", "ContentAlignment", "(winrt::hstring const&)"),
+            sm_meth("void", "IsExpanded", "(bool)"),
+            sm_meth("bool", "IsExpanded", "()"),
+        });
+        add("CommunityToolkit.WinUI.Controls.SettingsExpander", "winrt::CommunityToolkit::WinUI::Controls",
+            "SettingsExpander", CC, {
+            sm_using(),
+            sm_raw("    struct _se_state { winrt::Microsoft::UI::Xaml::Controls::TextBlock hdr{winrt::Microsoft::UI::Xaml::Controls::TextBlock::wrap_tag_t{}}; winrt::Microsoft::UI::Xaml::Controls::TextBlock desc{winrt::Microsoft::UI::Xaml::Controls::TextBlock::wrap_tag_t{}}; winrt::Microsoft::UI::Xaml::Controls::Border slot{winrt::Microsoft::UI::Xaml::Controls::Border::wrap_tag_t{}}; winrt::Microsoft::UI::Xaml::Controls::Border icon_slot{winrt::Microsoft::UI::Xaml::Controls::Border::wrap_tag_t{}}; winrt::Microsoft::UI::Xaml::Controls::FontIcon chevron{winrt::Microsoft::UI::Xaml::Controls::FontIcon::wrap_tag_t{}}; winrt::Microsoft::UI::Xaml::Controls::StackPanel items_panel{winrt::Microsoft::UI::Xaml::Controls::StackPanel::wrap_tag_t{}}; bool is_expanded{false}; bool has_header_content{false}; };"),
+            sm_raw("    std::shared_ptr<_se_state> _st;"),
+            sm_raw("    SettingsExpander() : ContentControl() {"),
+            sm_raw("        _st = std::make_shared<_se_state>();"),
+            sm_raw("        HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);"),
+            sm_raw("        HorizontalContentAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);"),
+            sm_raw("        auto outer = winrt::Microsoft::UI::Xaml::Controls::StackPanel(); outer.Spacing(2); outer.Margin(winrt::Microsoft::UI::Xaml::Thickness{0,0,0,4}); outer.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);"),
+            sm_raw("        auto b = winrt::Microsoft::UI::Xaml::Controls::Border();"),
+            sm_raw("        b.Background(::theme_brush_th(L\"CardBackgroundFillColorDefaultBrush\"));"),
+            sm_raw("        b.BorderBrush(::theme_brush_th(L\"CardStrokeColorDefaultBrush\"));"),
+            sm_raw("        b.BorderThickness(winrt::Microsoft::UI::Xaml::Thickness{1,1,1,1});"),
+            sm_raw("        b.CornerRadius(winrt::Microsoft::UI::Xaml::CornerRadius{4,4,4,4});"),
+            sm_raw("        b.Padding(winrt::Microsoft::UI::Xaml::Thickness{16,14,16,14});"),
+            sm_raw("        b.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);"),
+            sm_raw("        auto g = winrt::Microsoft::UI::Xaml::Controls::Grid();"),
+            sm_raw("        auto c0 = winrt::Microsoft::UI::Xaml::Controls::ColumnDefinition(); c0.Width(winrt::Microsoft::UI::Xaml::GridLength(0, winrt::Microsoft::UI::Xaml::GridUnitType::Auto)); g.ColumnDefinitions().Append(c0);"),
+            sm_raw("        auto c1 = winrt::Microsoft::UI::Xaml::Controls::ColumnDefinition(); c1.Width(winrt::Microsoft::UI::Xaml::GridLength(1, winrt::Microsoft::UI::Xaml::GridUnitType::Star)); g.ColumnDefinitions().Append(c1);"),
+            sm_raw("        auto c2 = winrt::Microsoft::UI::Xaml::Controls::ColumnDefinition(); c2.Width(winrt::Microsoft::UI::Xaml::GridLength(0, winrt::Microsoft::UI::Xaml::GridUnitType::Auto)); g.ColumnDefinitions().Append(c2);"),
+            sm_raw("        auto c3 = winrt::Microsoft::UI::Xaml::Controls::ColumnDefinition(); c3.Width(winrt::Microsoft::UI::Xaml::GridLength(0, winrt::Microsoft::UI::Xaml::GridUnitType::Auto)); g.ColumnDefinitions().Append(c3);"),
+            sm_raw("        _st->icon_slot = winrt::Microsoft::UI::Xaml::Controls::Border(); _st->icon_slot.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center); _st->icon_slot.Margin(winrt::Microsoft::UI::Xaml::Thickness{0,0,16,0}); _st->icon_slot.Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);"),
+            sm_raw("        winrt::Microsoft::UI::Xaml::Controls::Grid::SetColumn(winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(_st->icon_slot.m_unknown.get()), 0);"),
+            sm_raw("        g.Children().Append(_st->icon_slot);"),
+            sm_raw("        auto sp = winrt::Microsoft::UI::Xaml::Controls::StackPanel(); sp.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center); sp.Spacing(2);"),
+            sm_raw("        _st->hdr = winrt::Microsoft::UI::Xaml::Controls::TextBlock(); _st->hdr.FontSize(14); _st->hdr.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::Wrap); sp.Children().Append(_st->hdr);"),
+            sm_raw("        _st->desc = winrt::Microsoft::UI::Xaml::Controls::TextBlock(); _st->desc.FontSize(12); _st->desc.Foreground(::theme_brush_th(L\"TextFillColorSecondaryBrush\")); _st->desc.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::Wrap); _st->desc.Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed); sp.Children().Append(_st->desc);"),
+            sm_raw("        winrt::Microsoft::UI::Xaml::Controls::Grid::SetColumn(winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(sp.m_unknown.get()), 1);"),
+            sm_raw("        g.Children().Append(sp);"),
+            sm_raw("        _st->slot = winrt::Microsoft::UI::Xaml::Controls::Border(); _st->slot.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center); _st->slot.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Right);"),
+            sm_raw("        winrt::Microsoft::UI::Xaml::Controls::Grid::SetColumn(winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(_st->slot.m_unknown.get()), 2);"),
+            sm_raw("        g.Children().Append(_st->slot);"),
+            sm_raw("        _st->chevron = winrt::Microsoft::UI::Xaml::Controls::FontIcon(); _st->chevron.Glyph(L\"\\uE70D\"); _st->chevron.FontSize(12); _st->chevron.Foreground(::theme_brush_th(L\"TextFillColorSecondaryBrush\")); _st->chevron.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center); _st->chevron.Margin(winrt::Microsoft::UI::Xaml::Thickness{14,0,0,0});"),
+            sm_raw("        winrt::Microsoft::UI::Xaml::Controls::Grid::SetColumn(winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(_st->chevron.m_unknown.get()), 3);"),
+            sm_raw("        g.Children().Append(_st->chevron);"),
+            sm_raw("        b.Child(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(g.m_unknown.get()));"),
+            sm_raw("        auto toggle_exp = [st = _st](auto const&, auto const&) {"),
+            sm_raw("            if (!st) return;"),
+            sm_raw("            st->is_expanded = !st->is_expanded;"),
+            sm_raw("            st->items_panel.Visibility(st->is_expanded ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed);"),
+            sm_raw("            st->chevron.Glyph(st->is_expanded ? L\"\\uE70E\" : L\"\\uE70D\");"),
+            sm_raw("        };"),
+            sm_raw("        b.add_PointerPressed(toggle_exp);"),
+            sm_raw("        b.add_Tapped(toggle_exp);"),
+            sm_raw("        outer.Children().Append(b);"),
+            sm_raw("        _st->items_panel = winrt::Microsoft::UI::Xaml::Controls::StackPanel(); _st->items_panel.Spacing(2); _st->items_panel.Margin(winrt::Microsoft::UI::Xaml::Thickness{0, 2, 0, 0}); _st->items_panel.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch); _st->items_panel.Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);"),
+            sm_raw("        outer.Children().Append(_st->items_panel);"),
+            sm_raw("        static_cast<winrt::Microsoft::UI::Xaml::Controls::ContentControl const&>(*this).Content(winrt::IInspectable(outer.addref_borrowed()));"),
+            sm_raw("    }"),
+            sm_raw("    void Header(winrt::IInspectable const& v) const { if (_st && _st->hdr.m_unknown.get()) _st->hdr.Text(winrt::unbox_value_or<winrt::hstring>(v, L\"\")); }"),
+            sm_raw("    void Header(winrt::hstring const& v) const { if (_st && _st->hdr.m_unknown.get()) _st->hdr.Text(v); }"),
+            sm_raw("    void Description(winrt::IInspectable const& v) const { if (_st && _st->desc.m_unknown.get()) { auto s = winrt::unbox_value_or<winrt::hstring>(v, L\"\"); _st->desc.Text(s); _st->desc.Visibility(s.empty() ? winrt::Microsoft::UI::Xaml::Visibility::Collapsed : winrt::Microsoft::UI::Xaml::Visibility::Visible); } }"),
+            sm_raw("    void Description(winrt::hstring const& v) const { if (_st && _st->desc.m_unknown.get()) { _st->desc.Text(v); _st->desc.Visibility(v.empty() ? winrt::Microsoft::UI::Xaml::Visibility::Collapsed : winrt::Microsoft::UI::Xaml::Visibility::Visible); } }"),
+            sm_raw("    void Content(winrt::Microsoft::UI::Xaml::UIElement const& v) const { if (_st && _st->slot.m_unknown.get()) _st->slot.Child(v); }"),
+            sm_raw("    void Content(winrt::IInspectable const& v) const { if (_st && _st->slot.m_unknown.get() && v.get_abi()) _st->slot.Child(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(v.get_abi())); }"),
+            sm_raw("    void Items(winrt::Microsoft::UI::Xaml::UIElement const& v) const { if (_st && _st->items_panel.m_unknown.get()) _st->items_panel.Children().Append(v); }"),
+            sm_raw("    void Items(winrt::IInspectable const& v) const { if (_st && _st->items_panel.m_unknown.get() && v.get_abi()) _st->items_panel.Children().Append(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(v.get_abi())); }"),
+            sm_raw("    void HeaderIcon(winrt::IInspectable const& v) const {"),
+            sm_raw("        if (!_st) return; auto s = winrt::unbox_value_or<winrt::hstring>(v, L\"\"); if (s.empty()) return;"),
+            sm_raw("        std::wstring ws(s.to_view());"),
+            sm_raw("        if (ws.find(L\"BitmapIcon\") != std::wstring::npos || ws.find(L\".png\") != std::wstring::npos) {"),
+            sm_raw("            auto bi = winrt::Microsoft::UI::Xaml::Controls::BitmapIcon(); bi.ShowAsMonochrome(false); bi.Width(24); bi.Height(24);"),
+            sm_raw("            bi.UriSource(winrt::Windows::Foundation::Uri(L\"ms-appx:///Assets/Tiles/BadgeLogo.png\"));"),
+            sm_raw("            _st->icon_slot.Child(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(bi.m_unknown.get())); _st->icon_slot.Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible);"),
+            sm_raw("        } else {"),
+            sm_raw("            std::wstring glyph = ws; auto p1 = ws.find(L\"Glyph=\\\"\"); if (p1 != std::wstring::npos) { p1 += 7; auto p2 = ws.find(L'\\\"', p1); if (p2 != std::wstring::npos) glyph = ws.substr(p1, p2 - p1); }"),
+            sm_raw("            auto fi = winrt::Microsoft::UI::Xaml::Controls::FontIcon(); fi.Glyph(winrt::hstring(glyph)); fi.FontSize(18);"),
+            sm_raw("            _st->icon_slot.Child(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(fi.m_unknown.get())); _st->icon_slot.Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible);"),
+            sm_raw("        }"),
+            sm_raw("    }"),
+            sm_raw("    void HeaderIcon(winrt::hstring const& v) const { HeaderIcon(winrt::box_value(v)); }"),
+            sm_raw("    void IsExpanded(bool v) const { if (!_st) return; _st->is_expanded = v; _st->items_panel.Visibility(v ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed); _st->chevron.Glyph(v ? L\"\\uE70E\" : L\"\\uE70D\"); }"),
+            sm_raw("    bool IsExpanded() const { return _st ? _st->is_expanded : false; }"),
+            sm_meth("void", "ItemsHeader", "(winrt::IInspectable const&)"),
+            sm_meth("void", "ItemsFooter", "(winrt::IInspectable const&)"),
+        });
+
+        // Microsoft.UI.Xaml.Controls types outside the -winui closure
+        add("Microsoft.UI.Xaml.Controls.WrapPanel", "winrt::Microsoft::UI::Xaml::Controls",
+            "WrapPanel", "winrt::Microsoft::UI::Xaml::Controls::Panel", {
+            sm_using(),
+            sm_meth("double", "ItemWidth", "()"),
+            sm_meth("void", "ItemWidth", "(double)"),
+            sm_meth("double", "ItemHeight", "()"),
+            sm_meth("void", "ItemHeight", "(double)"),
+        });
+        add("Microsoft.UI.Xaml.Controls.ImplicitAnimationSet", "winrt::Microsoft::UI::Xaml::Controls",
+            "ImplicitAnimationSet", "winrt::Microsoft::UI::Xaml::UIElement", { sm_using() });
+        add("@.CounterControl", "winrt::Microsoft::UI::Xaml::Controls", "CounterControl", UC, {
+            sm_using(),
+            sm_meth("int32_t", "Count", "()"),
+            sm_meth("void", "Count", "(int32_t)"),
+        });
+
+        // ungated: no winmd projection ever carries this one
+        add("", "winrt::Microsoft::UI::Xaml::Media", "OpacityMaskView", CC, { sm_using() });
+
+        // global-scope component stubs (global scope, ::winrt:: prefix)
+        add("@.MenuItemTemplateSelector", "", "MenuItemTemplateSelector", INS, {
+            sm_field(), sm_ctor(), sm_fromabi(),
+        }, false, true);
+        add("CommunityToolkit.WinUI.Controls.SwitchPresenter", "", "SwitchPresenter", CC, {
+            sm_dctor(), sm_fromabi(),
+            sm_meth("void", "Value", "(winrt::IInspectable const&)", true),
+            sm_meth("void", "TargetType", "(winrt::Windows::UI::Xaml::Interop::TypeName const&)", true),
+        }, false, true);
+        add("@.AnimatedSettingsVisualSource", "", "AnimatedSettingsVisualSource", INS, {
+            sm_field(), sm_ctor(),
+            sm_meth("void", "Prefix", "(::winrt::hstring const&)"),
+            sm_meth("::winrt::hstring", "Prefix", "()"),
+            sm_fromabi(),
+        }, false, true);
+        add("@.LottieLogo1", "", "LottieLogo1", INS, {
+            sm_field(), sm_ctor(), sm_fromabi(),
+        }, false, true);
+        add("@.ValidatedPasswordBox", "", "ValidatedPasswordBox", INS, {
+            sm_field(), sm_ctor(), sm_fromabi(),
+        }, false, true);
+        add("@.CollectionVisibilityConverter", "", "CollectionVisibilityConverter", INS, {
+            sm_meth("::winrt::IInspectable", "Convert", CVT),
+            sm_meth("::winrt::IInspectable", "ConvertBack", CVT),
+        }, false, true);
+        add("@.VariedImageSizeLayout", "", "VariedImageSizeLayout",
+            "::winrt::Microsoft::UI::Xaml::Controls::Layout", {
+            sm_using(),
+            sm_meth("double", "MinItemSpacing", "()"),
+            sm_meth("void", "MinItemSpacing", "(double)"),
+            sm_meth("double", "MinRowSpacing", "()"),
+            sm_meth("void", "MinRowSpacing", "(double)"),
+        }, false, true);
+
+        std::string const ANIM = "winrt::Microsoft::UI::Xaml::Media::Animation";
+        add("@.OffsetAnimation", ANIM, "OffsetAnimation", INS, {
+            sm_ctor(),
+            sm_meth("double", "Offset", "()"),
+            sm_meth("void", "Offset", "(double)"),
+            sm_meth("bool", "EnableDependentAnimation", "()"),
+            sm_meth("void", "EnableDependentAnimation", "(bool)"),
+            sm_meth("void", "EasingMode", "(::winrt::hstring const&)"),
+            sm_meth("::winrt::hstring", "EasingMode", "()"),
+            sm_meth("void", "From", "(double)"),
+            sm_meth("double", "From", "()"),
+            sm_meth("void", "To", "(double)"),
+            sm_meth("double", "To", "()"),
+            sm_meth("void", "Prefix", "(::winrt::hstring const&)"),
+            sm_meth("::winrt::hstring", "Prefix", "()"),
+        }, false, true);
+        add("@.OpacityAnimation", ANIM, "OpacityAnimation", INS, {
+            sm_ctor(),
+            sm_meth("bool", "EnableDependentAnimation", "()"),
+            sm_meth("void", "EnableDependentAnimation", "(bool)"),
+            sm_meth("void", "EasingMode", "(::winrt::hstring const&)"),
+            sm_meth("::winrt::hstring", "EasingMode", "()"),
+            sm_meth("void", "From", "(double)"),
+            sm_meth("double", "From", "()"),
+            sm_meth("void", "To", "(double)"),
+            sm_meth("double", "To", "()"),
+            sm_meth("void", "Prefix", "(::winrt::hstring const&)"),
+            sm_meth("::winrt::hstring", "Prefix", "()"),
+        });
+
+        add("@.EmptyCollectionToObjectConverter", "", "EmptyCollectionToObjectConverter", INS, {
+            sm_meth("::winrt::IInspectable", "Convert", CVT),
+            sm_meth("::winrt::IInspectable", "ConvertBack", CVT),
+        });
+        add("@.StringVisibilityConverter", "", "StringVisibilityConverter", INS, {
+            sm_meth("::winrt::IInspectable", "Convert", CVT),
+            sm_meth("::winrt::IInspectable", "ConvertBack", CVT),
+        }, false, true);
+
+        // CollectionViewSource is not part of the -winui closure (UI.Data
+        // namespace never reaches the selective projection) but app XAML
+        // declares state vars of it (ListViewPage contactCVS) and constructs
+        // it as a resource; the view-binding reads on it are commented by R39.
+        add("Microsoft.UI.Xaml.Data.CollectionViewSource", "winrt::Microsoft::UI::Xaml::Data",
+            "CollectionViewSource", INS, {
+            sm_ctor(), sm_field(), sm_fromabi(),
+            sm_meth("::winrt::IInspectable", "Source", "()", true),
+            sm_meth("void", "Source", "(::winrt::IInspectable const&)"),
+            sm_meth("void", "Source", "(::winrt::hstring const&)"),
+            sm_meth("bool", "IsSourceGrouped", "()", true),
+            sm_meth("void", "IsSourceGrouped", "(bool)"),
+            sm_meth("void", "ItemsPath", "(::winrt::hstring const&)"),
+            sm_meth("::winrt::IInspectable", "View", "()", true),
+            sm_meth("::winrt::IInspectable", "view", "()", true),
+        }, true);
+        return v;
+    }();
+    return cat;
+}
+
+// Walk the catalog: open/close namespaces as the table moves between them
+// (a namespace block is opened even when every stub inside it is gated out,
+// exactly like the old chain), gate each row on the projected-name set, and
+// emit `struct T : base { ... };` plus its body rows.
+inline void emit_component_stubs(std::ostringstream& out, std::string const& ns,
+                                 std::set<std::string> const& projected_names)
+{
+    auto const& cat = component_stub_catalog();
+    auto const expand = [&](std::string const& s) {
+        std::string r; r.reserve(s.size() + ns.size());
+        for (char c : s) { if (c == '@') r += ns; else r += c; }
+        return r;
+    };
+    // Default return expression, matching the old bodies: 0 / false / {}.
+    auto const dflt_for = [](std::string const& ret) -> std::string {
+        if (ret == "bool") return "false";
+        if (ret == "double" || ret == "float" || ret == "int32_t" || ret == "uint32_t") return "0";
+        return "{}";
+    };
+    std::string open;   // currently open namespace ("" = global scope)
+    for (auto const& d : cat)
+    {
+        std::string const ens = expand(d.nspace);
+        if (ens != open)
+        {
+            if (!open.empty()) out << "} // namespace " << open << "\n\n";
+            if (!ens.empty())  out << "namespace " << ens << " {\n";
+            open = ens;
+        }
+        std::string const gate = expand(d.gate);
+        // Winmd really exports the type: views import it from the app module,
+        // so a local stub would be a second definition (C1117).
+        if (!gate.empty() && projected_names.count(gate) != 0) continue;
+        out << "struct " << d.type << " : " << d.base << " {\n";
+        for (auto const& m : d.body)
+        {
+            if (m.kind == "using")
+            {
+                auto const pos = d.base.rfind("::");
+                std::string const sh = pos == std::string::npos ? d.base : d.base.substr(pos + 2);
+                out << "    using " << sh << "::" << sh << ";\n";
+            }
+            else if (m.kind == "ctor")   out << "    " << d.type << "() {}\n";
+            else if (m.kind == "dctor")  out << "    " << d.type << "() : " << d.base << "() {}\n";
+            else if (m.kind == "field")  out << "    winrt::com_ptr<void> m_unknown;\n";
+            else if (m.kind == "fromabi")
+            {
+                out << "    static " << d.type << " from_abi(void* ptr) noexcept { "
+                    << d.type << " r; r.m_unknown = "
+                    << (d.abs_from_abi ? "::winrt::com_ptr<void>" : "winrt::com_ptr<void>")
+                    << "::attach(ptr); return r; }\n";
+            }
+            else if (m.kind == "method")
+            {
+                out << "    " << m.ret << " " << m.name << m.params << (m.is_const ? " const" : "");
+                if (m.ret == "void" && m.dflt.empty()) out << " {}\n";
+                else out << " { return " << (m.dflt.empty() ? dflt_for(m.ret) : m.dflt) << "; }\n";
+            }
+            else out << m.line << "\n";
+        }
+        out << "};" << (d.blank_after ? "\n\n" : "\n");
+    }
+    if (!open.empty()) out << "} // namespace " << open << "\n\n";
+}
+
 // Generate the .ixx module for a single view.
 // Pure modules — zero #include, zero ref new, zero raw pointers.
 inline std::string generate_view_module(layout_view const& view, attribute_catalog const& catalog, bool const have_windows_sdk = false,
     std::set<std::string> const& projected_names = {})
 {
     std::ostringstream out;
-    std::string ns = view.namespace_name.empty() ? "App" : view.namespace_name;
+    std::string ns_meta = view.namespace_name.empty() ? "App" : view.namespace_name;
+    // Identifier spelling (module declarations, imports, C++ namespaces):
+    // the metadata namespace keeps the hyphen naming default (WinUI-Gallery)
+    // while C++ requires an identifier - mangle here, keep ns_meta for the
+    // activation string literals below.
+    std::string ns = ident_ns(ns_meta);
     std::string class_name = view.name;
 
     // Sanitize: strip C-style comment markers that leak from XAML names
@@ -1720,6 +2290,58 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         base_type = "Microsoft::UI::Xaml::Window";
     }
 
+    // Control has no content/children property — a Control-derived view with
+    // a real body (its ControlTemplate lowered into the view by xaml2winuic)
+    // must host its root element, so project it as ContentControl. Content
+    // attaches exactly where the XAML template renders; a bare Control
+    // cannot attach children at all (would leave the control empty again).
+    if (view.base_type == "Control" && !view.root.empty())
+        base_type = "Microsoft::UI::Xaml::Controls::ContentControl";
+
+    // ── Module header ──
+    // Platform namespaces named by this view's state-var / element types that
+    // fall OUTSIDE the fixed import set below (e.g. Charts: Samples,
+    // CategoryAxis, LinearAxis; InkControls; Tabular). g_type_ns resolves a
+    // bare winmd type name to its namespace. Without the import the bare
+    // to_cxx_type names don't resolve (C3646) and the -winui needed-set scan
+    // — which reads these very import lines — never keeps the module reachable.
+    std::vector<std::string> extra_platform_ns;
+    {
+        std::set<std::string, std::less<>> seen;
+        auto add_extra = [&](std::string const& type_name) {
+            if (type_name.size() < 2 || !std::isupper(static_cast<unsigned char>(type_name[0]))) return;
+            if (type_name.find(':') != std::string::npos) return;   // already qualified
+            auto it = g_type_ns.find(type_name);
+            if (it == g_type_ns.end()) return;
+            std::string const& xns = it->second;
+            // Platform namespaces come from ANY loaded winmd — Microsoft.*,
+            // Windows.* and third-party control libraries alike. The old
+            // Microsoft./Windows. prefix gate emitted no import for a
+            // third-party control the project uses, so its bare type name
+            // never resolved (C3646) and the -winui needed-set scan — which
+            // reads these very import lines — never kept its module alive.
+            if (!is_platform_ns(xns)) return;
+            // Namespaces already covered by the fixed import/using set below.
+            static const std::set<std::string, std::less<>> core = {
+                "Microsoft.UI.Xaml", "Microsoft.UI.Xaml.Hosting", "Microsoft.UI.Dispatching",
+                "Microsoft.UI.Xaml.Controls", "Microsoft.UI.Xaml.Controls.Primitives",
+                "Microsoft.UI.Xaml.Media", "Microsoft.UI.Xaml.Documents",
+                "Microsoft.UI.Xaml.Media.Animation", "Microsoft.UI.Xaml.Shapes",
+                "Microsoft.UI.Xaml.Input", "Microsoft.UI.Xaml.Data", "Microsoft.UI.Xaml.Markup",
+                "Microsoft.UI.Windowing", "Microsoft.UI.Content", "Microsoft.UI.Input",
+                "Windows.UI.Xaml.Interop", "Windows.Foundation", "Windows.Foundation.Collections",
+                "Windows.UI", "Windows.UI.Text", "Windows.UI.Xaml" };
+            if (core.contains(xns)) return;
+            if (seen.insert(xns).second) extra_platform_ns.push_back(xns);
+        };
+        for (auto const& sv : view.state_vars) add_extra(sv.type);
+        std::function<void(layout_node const&)> walk_ns = [&](layout_node const& nd) {
+            add_extra(nd.control);
+            for (auto const& ch : nd.children) walk_ns(ch);
+        };
+        for (auto const& rn : view.root) walk_ns(rn);
+    }
+
     // ── Module header ──
     out << "// " << class_name << ".ixx \u2014 module " << ns << "." << class_name << ".\n";
     out << "// generated by cppwinc from winuic-produced .winmd.\n\n";
@@ -1737,10 +2359,14 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     out << "export import winrt.Microsoft.UI.Xaml.Controls;\n";
     out << "import winrt.Microsoft.UI.Xaml.Controls.Primitives;\n";
     out << "export import winrt.Microsoft.UI.Xaml.Media;\n";
+    out << "import winrt.Microsoft.UI.Xaml.Automation;\n";
+    out << "import winrt.Microsoft.UI.Xaml.Markup;\n";
     // Windows.UI.Xaml.Interop - TypeName for Frame::Navigate(page registry).
     out << "import winrt.Windows.UI.Xaml.Interop;\n";
     out << "import winrt.Microsoft.UI.Windowing;\n";
     out << "import Windows.Win32.UI.WindowsAndMessaging;\n";
+    for (auto const& xns : extra_platform_ns)
+        out << "import winrt." << xns << ";\n";
     if (have_windows_sdk)
     {
         // Windows SDK metadata is loaded: the real projections exist, so
@@ -1768,7 +2394,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
             // The page view's module is exactly "<Ns>.<Page>" (same dotted
             // name as the page entry).
             if (page.empty() || !seen_page_mods.insert(page).second) continue;
-            out << "import " << page << ";\n";
+            out << "import " << ident_ns(page) << ";\n";
         }
     }
     // SolidColorBrush helpers: construct a REAL Microsoft.UI.Xaml.Media.SolidColorBrush
@@ -1825,7 +2451,10 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     out << "        void* text_on_accent = nullptr;\n";
     out << "        void* accent = nullptr;\n";
     out << "        void* page_bg = nullptr;\n";
+    out << "        void* solid_bg = nullptr;\n";
+    out << "        void* local_dict = nullptr;\n";
     out << "        void (*notify_theme_change)() = nullptr;\n";
+    out << "        void (*set_nav_mode)(int) = nullptr;\n";
     out << "    };\n";
     out << "    __declspec(selectany) ThemeState g_theme_state{};\n";
     out << "}\n\n";
@@ -1973,6 +2602,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     out << "    update_brush(g_theme_state.text_on_accent, is_light ? winrt::Windows::UI::Color{255, 255, 255, 255} : winrt::Windows::UI::Color{255, 0, 0, 0});\n";
     out << "    update_brush(g_theme_state.accent, is_light ? winrt::Windows::UI::Color{255, 0, 95, 184} : winrt::Windows::UI::Color{255, 96, 205, 255});\n";
     out << "    update_brush(g_theme_state.page_bg, winrt::Windows::UI::Color{0, 0, 0, 0});\n";
+    out << "    update_brush(g_theme_state.solid_bg, is_light ? winrt::Windows::UI::Color{255, 243, 243, 243} : winrt::Windows::UI::Color{255, 32, 32, 32});\n";
     out << "}\n\n";
     out << "static void apply_app_theme(bool is_dark) {\n";
     out << "    g_theme_state.theme_idx = is_dark ? 2 : 1;\n";
@@ -2044,15 +2674,21 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     out << "    return winrt::IInspectable{};\n";
     out << "}\n\n";
     out << "static winrt::IInspectable theme_lookup_th(wchar_t const* key, winrt::IInspectable fallback) {\n";
+    out << "    if (!key) return fallback;\n";
     out << "    try {\n";
-    out << "        auto app = winrt::Microsoft::UI::Xaml::Application::get_Current();\n";
-    out << "        if (app.get_abi() == nullptr) return fallback;\n";
-    out << "        auto res = app.get_Resources();\n";
-    out << "        if (res.get_abi() == nullptr) return fallback;\n";
     out << "        bool is_light = is_current_light_theme();\n";
     out << "        wchar_t const* th1 = is_light ? L\"Light\" : L\"Dark\";\n";
     out << "        wchar_t const* th2 = L\"Default\";\n";
     out << "        wchar_t const* th3 = is_light ? L\"Dark\" : L\"Light\";\n";
+    out << "        if (g_theme_state.local_dict) {\n";
+    out << "            auto lrd = winrt::Microsoft::UI::Xaml::ResourceDictionary::wrap_borrowed(g_theme_state.local_dict);\n";
+    out << "            winrt::IInspectable lv = theme_search_rd_recursive(lrd, key, th1, th2, th3, 0);\n";
+    out << "            if (lv) return lv;\n";
+    out << "        }\n";
+    out << "        auto app = winrt::Microsoft::UI::Xaml::Application::get_Current();\n";
+    out << "        if (app.get_abi() == nullptr) return fallback;\n";
+    out << "        auto res = app.get_Resources();\n";
+    out << "        if (res.get_abi() == nullptr) return fallback;\n";
     out << "        winrt::IInspectable v = theme_search_rd_recursive(res, key, th1, th2, th3, 0);\n";
     out << "        if (v) return v;\n";
     out << "    } catch (...) {}\n";
@@ -2071,6 +2707,13 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     out << "        winrt::IUnknown::addref_raw(slot);\n";
     out << "        return winrt::Microsoft::UI::Xaml::Media::Brush::from_abi(slot);\n";
     out << "    };\n";
+    out << "    if (k.find(L\"Acrylic\") != std::wstring_view::npos) {\n";
+    out << "        winrt::Microsoft::UI::Xaml::Media::AcrylicBrush ab{};\n";
+    out << "        ab.TintColor(is_light ? winrt::Windows::UI::Color{255, 252, 252, 252} : winrt::Windows::UI::Color{255, 44, 44, 44});\n";
+    out << "        ab.TintOpacity(is_light ? 0.0 : 0.15);\n";
+    out << "        ab.FallbackColor(is_light ? winrt::Windows::UI::Color{255, 249, 249, 249} : winrt::Windows::UI::Color{255, 44, 44, 44});\n";
+    out << "        return ab;\n";
+    out << "    }\n";
     out << "    if (k.find(L\"TextOnAccent\") != std::wstring_view::npos)\n";
     out << "        return get_or_create(g_theme_state.text_on_accent, winrt::Windows::UI::Color{255, 255, 255, 255}, winrt::Windows::UI::Color{255, 0, 0, 0});\n";
     out << "    if (k.find(L\"Secondary\") != std::wstring_view::npos)\n";
@@ -2083,9 +2726,11 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     out << "        return get_or_create(g_theme_state.text_primary, winrt::Windows::UI::Color{255, 26, 26, 26}, winrt::Windows::UI::Color{255, 255, 255, 255});\n";
     out << "    if (k.find(L\"Accent\") != std::wstring_view::npos)\n";
     out << "        return get_or_create(g_theme_state.accent, winrt::Windows::UI::Color{255, 0, 95, 184}, winrt::Windows::UI::Color{255, 96, 205, 255});\n";
-    out << "    if (k.find(L\"CardBackground\") != std::wstring_view::npos || k.find(L\"LayerFillColorDefault\") != std::wstring_view::npos)\n";
+    out << "    if (k.find(L\"DisplayBrush\") != std::wstring_view::npos || k.find(L\"SolidBackground\") != std::wstring_view::npos || k.find(L\"SmokeFill\") != std::wstring_view::npos)\n";
+    out << "        return get_or_create(g_theme_state.solid_bg, winrt::Windows::UI::Color{255, 243, 243, 243}, winrt::Windows::UI::Color{255, 32, 32, 32});\n";
+    out << "    if (k.find(L\"CardBackground\") != std::wstring_view::npos || k.find(L\"LayerFillColor\") != std::wstring_view::npos || k.find(L\"SubtleFill\") != std::wstring_view::npos || k.find(L\"ControlFill\") != std::wstring_view::npos)\n";
     out << "        return get_or_create(g_theme_state.card_bg, winrt::Windows::UI::Color{255, 255, 255, 255}, winrt::Windows::UI::Color{255, 43, 43, 43});\n";
-    out << "    if (k.find(L\"CardStroke\") != std::wstring_view::npos || k.find(L\"SurfaceStroke\") != std::wstring_view::npos)\n";
+    out << "    if (k.find(L\"CardStroke\") != std::wstring_view::npos || k.find(L\"SurfaceStroke\") != std::wstring_view::npos || k.find(L\"ControlStroke\") != std::wstring_view::npos || k.find(L\"Border\") != std::wstring_view::npos)\n";
     out << "        return get_or_create(g_theme_state.card_stroke, winrt::Windows::UI::Color{255, 229, 229, 229}, winrt::Windows::UI::Color{255, 58, 58, 58});\n";
     out << "    if (k.find(L\"DividerStroke\") != std::wstring_view::npos)\n";
     out << "        return get_or_create(g_theme_state.divider_stroke, winrt::Windows::UI::Color{255, 229, 229, 229}, winrt::Windows::UI::Color{255, 54, 54, 54});\n";
@@ -2185,6 +2830,163 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     out << "    if (!v) return winrt::Microsoft::UI::Xaml::DataTemplate::from_abi(nullptr);\n";
     out << "    winrt::IUnknown::addref_raw(v.get_abi());\n";
     out << "    return winrt::Microsoft::UI::Xaml::DataTemplate::from_abi(v.get_abi());\n";
+    out << "}\n\n";
+    out << "static winrt::Microsoft::UI::Xaml::Controls::ControlTemplate control_template_th(wchar_t const* key) {\n";
+    out << "    winrt::IInspectable v = theme_lookup_th(key, winrt::IInspectable{});\n";
+    out << "    if (!v) return winrt::Microsoft::UI::Xaml::Controls::ControlTemplate::from_abi(nullptr);\n";
+    out << "    winrt::IUnknown::addref_raw(v.get_abi());\n";
+    out << "    return winrt::Microsoft::UI::Xaml::Controls::ControlTemplate::from_abi(v.get_abi());\n";
+    out << "}\n\n";
+    out << "static winrt::Microsoft::UI::Xaml::Media::ImageSource image_source_lookup_th(wchar_t const* key) {\n";
+    out << "    winrt::IInspectable v = theme_lookup_th(key, winrt::IInspectable{});\n";
+    out << "    if (!v) return winrt::Microsoft::UI::Xaml::Media::ImageSource::from_abi(nullptr);\n";
+    out << "    void* is_raw = nullptr;\n";
+    out << "    if (winrt::IUnknown::qi_raw(v.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Media::ImageSource>, &is_raw) >= 0 && is_raw) {\n";
+    out << "        return winrt::Microsoft::UI::Xaml::Media::ImageSource::from_abi(is_raw);\n";
+    out << "    }\n";
+    out << "    winrt::hstring hs = winrt::unbox_value_or<winrt::hstring>(v, L\"\");\n";
+    out << "    if (!hs.empty()) {\n";
+    out << "        try {\n";
+    out << "            std::wstring s = hs.c_str();\n";
+    out << "            for (auto& c : s) if (c == L'\\\\') c = L'/';\n";
+    out << "            if (s.rfind(L\"ms-appx:/\", 0) == 0 && s.rfind(L\"ms-appx:///\", 0) != 0) s = L\"ms-appx:///\" + s.substr(9);\n";
+    out << "            else if (s.rfind(L\"/Assets/\", 0) == 0) s = L\"ms-appx:///\" + s.substr(1);\n";
+    out << "            else if (s.rfind(L\"Assets/\", 0) == 0) s = L\"ms-appx:///\" + s;\n";
+    out << "            return winrt::Microsoft::UI::Xaml::Media::Imaging::BitmapImage(winrt::Windows::Foundation::Uri(s.c_str()));\n";
+    out << "        } catch (...) {}\n";
+    out << "    }\n";
+    out << "    return winrt::Microsoft::UI::Xaml::Media::ImageSource::from_abi(nullptr);\n";
+    out << "}\n\n";
+    out << "static void apply_xaml_resources(winrt::Microsoft::UI::Xaml::FrameworkElement const& el, wchar_t const* xaml) {\n";
+    out << "    if (!el.get_abi() || !xaml || !*xaml) return;\n";
+    out << "    try {\n";
+    out << "        std::wstring s = xaml;\n";
+    out << "        size_t start = s.find_first_not_of(L\" \\t\\r\\n\"); if (start != std::wstring::npos) s = s.substr(start);\n";
+    out << "        std::wstring full;\n";
+    out << "        static const wchar_t* const xml_ns = L\" xmlns=\\\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\\\" xmlns:x=\\\"http://schemas.microsoft.com/winfx/2006/xaml\\\" xmlns:d=\\\"http://schemas.microsoft.com/expression/blend/2008\\\" xmlns:mc=\\\"http://schemas.openxmlformats.org/markup-compatibility/2006\\\" xmlns:local=\\\"using:WinUIGallery\\\" xmlns:controls=\\\"using:WinUIGallery.Controls\\\" xmlns:animations=\\\"using:CommunityToolkit.WinUI.Animations\\\" xmlns:media=\\\"using:CommunityToolkit.WinUI.Media\\\" xmlns:wuxdata=\\\"using:Microsoft.UI.Xaml.Data\\\"\";\n";
+    out << "        if (s.rfind(L\"<ResourceDictionary\", 0) == 0) {\n";
+    out << "            auto pos = s.find(L\">\", 19);\n";
+    out << "            if (pos != std::wstring::npos) {\n";
+    out << "                full = s.substr(0, 19) + xml_ns + s.substr(19);\n";
+    out << "            } else { full = s; }\n";
+    out << "        } else {\n";
+    out << "            full = std::wstring(L\"<ResourceDictionary\") + xml_ns + L\">\" + s + L\"</ResourceDictionary>\";\n";
+    out << "        }\n";
+    out << "        auto obj = winrt::Microsoft::UI::Xaml::Markup::XamlReader::Load(winrt::hstring(full.c_str()));\n";
+    out << "        if (obj) {\n";
+    out << "            auto rd = winrt::Microsoft::UI::Xaml::ResourceDictionary::wrap_borrowed(obj.get_abi());\n";
+    out << "            if (rd.get_abi()) {\n";
+    out << "                el.Resources().MergedDictionaries().Append(rd);\n";
+    out << "                winrt::IUnknown::addref_raw(rd.get_abi());\n";
+    out << "                g_theme_state.local_dict = rd.get_abi();\n";
+    out << "            }\n";
+    out << "        }\n";
+    out << "    } catch (...) {}\n";
+    out << "}\n\n";
+    out << "static void insert_resource(winrt::Microsoft::UI::Xaml::ResourceDictionary const& rd, wchar_t const* key, winrt::IInspectable const& val) {\n";
+    out << "    if (!rd.get_abi() || !key || !val.get_abi()) return;\n";
+    out << "    static winrt::winrt_guid const imap_iid{ 0x1b0d3570, 0x0877, 0x5ec2, { 0x8a, 0x2c, 0x1b, 0x95, 0x37, 0x37, 0x0a, 0x4a } };\n";
+    out << "    void* map_ptr = nullptr;\n";
+    out << "    if (winrt::impl::query_interface(rd.get_abi(), imap_iid, &map_ptr) == 0 && map_ptr) {\n";
+    out << "        void* boxed_key = winrt::box_value(winrt::hstring(key));\n";
+    out << "        auto** vtbl = *reinterpret_cast<void***>(map_ptr);\n";
+    out << "        using insert_fn = std::int32_t(__stdcall*)(void*, void*, void*, unsigned char*);\n";
+    out << "        unsigned char replaced = 0;\n";
+    out << "        reinterpret_cast<insert_fn>(vtbl[10])(map_ptr, boxed_key, val.get_abi(), &replaced);\n";
+    out << "        if (boxed_key) {\n";
+    out << "            auto** b_vtbl = *reinterpret_cast<void***>(boxed_key);\n";
+    out << "            reinterpret_cast<std::uint32_t(__stdcall*)(void*)>(b_vtbl[2])(boxed_key);\n";
+    out << "        }\n";
+    out << "        reinterpret_cast<std::uint32_t(__stdcall*)(void*)>(vtbl[2])(map_ptr);\n";
+    out << "    }\n";
+    out << "}\n\n";
+    out << "static void apply_app_resources(winrt::Microsoft::UI::Xaml::Application const& app, wchar_t const* xaml) {\n";
+    out << "    if (!app.get_abi() || !xaml || !*xaml) return;\n";
+    out << "    try {\n";
+    out << "        std::wstring s = xaml;\n";
+    out << "        size_t p = 0;\n";
+    out << "        while ((p = s.find(L\"<ResourceDictionary Source=\", p)) != std::wstring::npos) {\n";
+    out << "            auto end = s.find(L\"/>\", p);\n";
+    out << "            if (end != std::wstring::npos) s.erase(p, end + 2 - p);\n";
+    out << "            else break;\n";
+    out << "        }\n";
+    out << "        while ((p = s.find(L\"<local:ItemTemplates/>\")) != std::wstring::npos) s.erase(p, 22);\n";
+    out << "        std::wstring_view sv(xaml);\n";
+    out << "        size_t kpos = 0;\n";
+    out << "        while ((kpos = sv.find(L\"x:Key=\\\"\", kpos)) != std::wstring_view::npos) {\n";
+    out << "            size_t kstart = kpos + 7;\n";
+    out << "            size_t kend = sv.find(L'\\\"', kstart);\n";
+    out << "            if (kend == std::wstring_view::npos) break;\n";
+    out << "            std::wstring key(sv.substr(kstart, kend - kstart));\n";
+    out << "            size_t tag_close = sv.find(L'>', kend);\n";
+    out << "            if (tag_close != std::wstring_view::npos && tag_close + 1 < sv.size() && sv[tag_close - 1] != L'/') {\n";
+    out << "                size_t tag_end = sv.find(L'<', tag_close + 1);\n";
+    out << "                if (tag_end != std::wstring_view::npos) {\n";
+    out << "                    std::wstring val(sv.substr(tag_close + 1, tag_end - (tag_close + 1)));\n";
+    out << "                    size_t tag_open = sv.rfind(L'<', kpos);\n";
+    out << "                    if (tag_open != std::wstring_view::npos) {\n";
+    out << "                        std::wstring_view tag_name = sv.substr(tag_open + 1, kpos - (tag_open + 1));\n";
+    out << "                        if (tag_name.find(L\"Double\") != std::wstring_view::npos) {\n";
+    out << "                            try { double d = std::stod(val); insert_resource(app.Resources(), key.c_str(), winrt::box_value(d)); } catch (...) {}\n";
+    out << "                        } else if (tag_name.find(L\"String\") != std::wstring_view::npos) {\n";
+    out << "                            insert_resource(app.Resources(), key.c_str(), winrt::box_value(winrt::hstring(val.c_str())));\n";
+    out << "                        }\n";
+    out << "                    }\n";
+    out << "                }\n";
+    out << "            }\n";
+    out << "            kpos = kend + 1;\n";
+    out << "        }\n";
+    out << "        static const wchar_t* const xml_ns = L\" xmlns=\\\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\\\" xmlns:x=\\\"http://schemas.microsoft.com/winfx/2006/xaml\\\" xmlns:d=\\\"http://schemas.microsoft.com/expression/blend/2008\\\" xmlns:mc=\\\"http://schemas.openxmlformats.org/markup-compatibility/2006\\\" xmlns:local=\\\"using:WinUIGallery\\\" xmlns:controls=\\\"using:WinUIGallery.Controls\\\" xmlns:animations=\\\"using:CommunityToolkit.WinUI.Animations\\\" xmlns:media=\\\"using:CommunityToolkit.WinUI.Media\\\" xmlns:wuxdata=\\\"using:Microsoft.UI.Xaml.Data\\\"\";\n";
+    out << "        std::wstring full;\n";
+    out << "        if (s.rfind(L\"<ResourceDictionary\", 0) == 0) {\n";
+    out << "            auto pos = s.find(L\">\", 19);\n";
+    out << "            if (pos != std::wstring::npos) full = s.substr(0, 19) + xml_ns + s.substr(19);\n";
+    out << "            else full = s;\n";
+    out << "        } else { full = std::wstring(L\"<ResourceDictionary\") + xml_ns + L\">\" + s + L\"</ResourceDictionary>\"; }\n";
+    out << "        auto obj = winrt::Microsoft::UI::Xaml::Markup::XamlReader::Load(winrt::hstring(full.c_str()));\n";
+    out << "        if (obj) {\n";
+    out << "            auto rd = winrt::Microsoft::UI::Xaml::ResourceDictionary::wrap_borrowed(obj.get_abi());\n";
+    out << "            if (rd.get_abi()) { app.Resources().MergedDictionaries().Append(rd); (void)rd.m_unknown.detach(); }\n";
+    out << "        }\n";
+    out << "    } catch (...) {}\n";
+    out << "}\n\n";
+    out << "static void apply_visual_state_groups(winrt::Microsoft::UI::Xaml::FrameworkElement const& el, wchar_t const* xaml) {\n";
+    out << "    if (!el.get_abi() || !xaml || !*xaml) return;\n";
+    out << "    try {\n";
+    out << "        static const wchar_t* const xml_ns = L\" xmlns=\\\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\\\" xmlns:x=\\\"http://schemas.microsoft.com/winfx/2006/xaml\\\" xmlns:d=\\\"http://schemas.microsoft.com/expression/blend/2008\\\" xmlns:mc=\\\"http://schemas.openxmlformats.org/markup-compatibility/2006\\\" xmlns:local=\\\"using:WinUIGallery\\\" xmlns:controls=\\\"using:WinUIGallery.Controls\\\" xmlns:animations=\\\"using:CommunityToolkit.WinUI.Animations\\\" xmlns:media=\\\"using:CommunityToolkit.WinUI.Media\\\" xmlns:wuxdata=\\\"using:Microsoft.UI.Xaml.Data\\\"\";\n";
+    out << "        std::wstring full = std::wstring(L\"<Grid\") + xml_ns + L\"><VisualStateManager.VisualStateGroups>\" + std::wstring(xaml) + L\"</VisualStateManager.VisualStateGroups></Grid>\";\n";
+    out << "        auto obj = winrt::Microsoft::UI::Xaml::Markup::XamlReader::Load(winrt::hstring(full.c_str()));\n";
+    out << "        if (obj) {\n";
+    out << "            auto host = winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(obj.get_abi());\n";
+    out << "            auto src = winrt::Microsoft::UI::Xaml::VisualStateManager::GetVisualStateGroups(host);\n";
+    out << "            auto dst = winrt::Microsoft::UI::Xaml::VisualStateManager::GetVisualStateGroups(el);\n";
+    out << "            auto count = src.get_Size();\n";
+    out << "            std::vector<winrt::Microsoft::UI::Xaml::VisualStateGroup> list;\n";
+    out << "            list.reserve(count);\n";
+    out << "            for (uint32_t i = 0; i < count; ++i) list.push_back(src.GetAt(i));\n";
+    out << "            src.Clear();\n";
+    out << "            for (auto const& g : list) dst.Append(g);\n";
+    out << "        }\n";
+    out << "    } catch (...) {}\n";
+    out << "}\n\n";
+    out << "static winrt::Microsoft::UI::Xaml::Controls::ControlTemplate load_control_template(wchar_t const* xaml) {\n";
+    out << "    if (!xaml || !*xaml) return winrt::Microsoft::UI::Xaml::Controls::ControlTemplate::from_abi(nullptr);\n";
+    out << "    try {\n";
+    out << "        std::wstring s = xaml;\n";
+    out << "        size_t start = s.find_first_not_of(L\" \\t\\r\\n\"); if (start != std::wstring::npos) s = s.substr(start);\n";
+    out << "        std::wstring full;\n";
+    out << "        if (s.rfind(L\"<ControlTemplate\", 0) == 0) {\n";
+    out << "            auto pos = s.find(L\">\", 16);\n";
+    out << "            if (pos != std::wstring::npos) {\n";
+    out << "                full = s.substr(0, 16) + L\" xmlns=\\\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\\\" xmlns:x=\\\"http://schemas.microsoft.com/winfx/2006/xaml\\\"\" + s.substr(16);\n";
+    out << "            } else { full = s; }\n";
+    out << "        } else {\n";
+    out << "            full = L\"<ControlTemplate xmlns=\\\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\\\" xmlns:x=\\\"http://schemas.microsoft.com/winfx/2006/xaml\\\">\" + s + L\"</ControlTemplate>\";\n";
+    out << "        }\n";
+    out << "        auto obj = winrt::Microsoft::UI::Xaml::Markup::XamlReader::Load(winrt::hstring(full.c_str()));\n";
+    out << "        if (obj) return winrt::Microsoft::UI::Xaml::Controls::ControlTemplate::wrap_borrowed(obj.get_abi());\n";
+    out << "    } catch (...) {}\n";
+    out << "    return winrt::Microsoft::UI::Xaml::Controls::ControlTemplate::from_abi(nullptr);\n";
     out << "}\n\n";
     out << "static winrt::Microsoft::UI::Xaml::Media::SolidColorBrush make_solid_brush(winrt::Windows::UI::Color const& c) {\n";
     out << "    return winrt::Microsoft::UI::Xaml::Media::SolidColorBrush(c);\n";
@@ -2322,6 +3124,22 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     out << "    flush_fig();\n";
     out << "    return geo;\n";
     out << "}\n\n";
+    out << "static winrt::Microsoft::UI::Xaml::Media::Geometry geometry_lookup_th(wchar_t const* key) {\n";
+    out << "    winrt::IInspectable v = theme_lookup_th(key, winrt::IInspectable{});\n";
+    out << "    if (!v) return winrt::Microsoft::UI::Xaml::Media::Geometry::from_abi(nullptr);\n";
+    out << "    void* geom_raw = nullptr;\n";
+    out << "    if (winrt::IUnknown::qi_raw(v.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Media::Geometry>, &geom_raw) >= 0 && geom_raw) {\n";
+    out << "        return winrt::Microsoft::UI::Xaml::Media::Geometry::from_abi(geom_raw);\n";
+    out << "    }\n";
+    out << "    winrt::hstring hs = winrt::unbox_value_or<winrt::hstring>(v, L\"\");\n";
+    out << "    if (!hs.empty()) {\n";
+    out << "        std::string s;\n";
+    out << "        for (wchar_t ch : std::wstring_view(hs.c_str())) s += (ch < 128) ? static_cast<char>(ch) : ' ';\n";
+    out << "        auto pg = parse_svg_path(s.c_str());\n";
+    out << "        if (pg.get_abi()) return winrt::Microsoft::UI::Xaml::Media::Geometry::wrap_borrowed(pg.m_unknown.get());\n";
+    out << "    }\n";
+    out << "    return winrt::Microsoft::UI::Xaml::Media::Geometry::from_abi(nullptr);\n";
+    out << "}\n\n";
     out << "static winrt::Windows::UI::Color named_color(char const* name) {\n";
     out << "    struct { char const* n; std::uint8_t r,g,b; } table[] = {\n";
     out << "        {\"Black\",0,0,0},{\"White\",255,255,255},{\"Red\",255,0,0},{\"Green\",0,128,0},\n";
@@ -2452,212 +3270,14 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     out << "};\n";
     out << "} // namespace winrt::Microsoft::UI::Xaml::Media\n\n";
     }
-    // Custom namespace stubs (WinUIGallery, CommunityToolkit) are kept below.
-    // Missing component type stubs — types referenced in codegen but not in component module.
-    // Each is gated on the projected-name set: when the app winmd actually exports the
-    // type, views import it from the WinUIGallery module — a local stub would be a
-    // second definition of the same name (C1117 'symbol already defined' on import).
-    auto const have = [&projected_names](char const* n) { return projected_names.count(n) == 0; };
-    out << "namespace winrt::WinUIGallery {\n";
-    if (have("WinUIGallery.ControlExample")) {
-    out << "struct ControlExample : winrt::Microsoft::UI::Xaml::Controls::UserControl {\n";
-    out << "    using UserControl::UserControl;\n";
-    out << "    winrt::Microsoft::UI::Xaml::UIElement Content() const { return static_cast<winrt::Microsoft::UI::Xaml::Controls::UserControl const&>(*this).get_Content(); }\n";
-    out << "    void Content(winrt::Microsoft::UI::Xaml::UIElement const& value) const { static_cast<winrt::Microsoft::UI::Xaml::Controls::UserControl const&>(*this).put_Content(value); }\n";
-    out << "    template<class H> winrt::event_token add_Loaded(H const&) const { return {}; }\n";
-    out << "};\n";
-    }
-    if (have("WinUIGallery.ControlExampleSubstitution")) {
-    out << "struct ControlExampleSubstitution : winrt::Microsoft::UI::Xaml::Controls::UserControl {\n";
-    out << "    using UserControl::UserControl;\n";
-    out << "    winrt::IInspectable Substitution() { return {}; }\n";
-    out << "    void Substitution(winrt::IInspectable const&) {}\n";
-    out << "};\n";
-    }
-    out << "} // namespace winrt::WinUIGallery\n\n";
-    // SettingsCard/SettingsExpander stubs (CommunityToolkit) - gated on the
-    // projected-name set so a winmd that really exports them is not shadowed.
-    out << "namespace winrt::CommunityToolkit::WinUI::Controls {\n";
-    if (have("CommunityToolkit.WinUI.Controls.SettingsCard")) {
-    out << "struct SettingsCard : winrt::Microsoft::UI::Xaml::Controls::ContentControl {\n";
-    out << "    using ContentControl::ContentControl;\n";
-    out << "    template<class H> winrt::event_token add_Click(H const&) const { return {}; }\n";
-    out << "    void Header(winrt::IInspectable const&) {}\n";
-    out << "    void Description(winrt::IInspectable const&) {}\n";
-    out << "    void IsExpanded(bool) {}\n";
-    out << "    bool IsExpanded() { return false; }\n";
-    out << "};\n";
-    }
-    if (have("CommunityToolkit.WinUI.Controls.SettingsExpander")) {
-    out << "struct SettingsExpander : winrt::Microsoft::UI::Xaml::Controls::ContentControl {\n";
-    out << "    using ContentControl::ContentControl;\n";
-    out << "    void Header(winrt::IInspectable const&) {}\n";
-    out << "    void Description(winrt::IInspectable const&) {}\n";
-    out << "    bool IsExpanded() { return false; }\n";
-    out << "    void IsExpanded(bool) {}\n";
-    out << "    void Items(winrt::IInspectable const&) {}\n";
-    out << "};\n";
-    }
-    out << "} // namespace winrt::CommunityToolkit::WinUI::Controls\n\n";
-    // Additional missing type stubs - each gated on the projected-name set
-    out << "namespace winrt::Microsoft::UI::Xaml::Controls {\n";
-    if (have("Microsoft.UI.Xaml.Controls.WrapPanel")) {
-    out << "struct WrapPanel : winrt::Microsoft::UI::Xaml::Controls::Panel {\n";
-    out << "    using Panel::Panel;\n";
-    out << "    double ItemWidth() { return 0; }\n";
-    out << "    void ItemWidth(double) {}\n";
-    out << "    double ItemHeight() { return 0; }\n";
-    out << "    void ItemHeight(double) {}\n";
-    out << "};\n";
-    }
-    if (have("Microsoft.UI.Xaml.Controls.ImplicitAnimationSet")) {
-    out << "struct ImplicitAnimationSet : winrt::Microsoft::UI::Xaml::UIElement {\n";
-    out << "    using UIElement::UIElement;\n";
-    out << "};\n";
-    }
-    if (have("WinUIGallery.CounterControl")) {
-    out << "struct CounterControl : winrt::Microsoft::UI::Xaml::Controls::UserControl {\n";
-    out << "    using UserControl::UserControl;\n";
-    out << "    int32_t Count() { return 0; }\n";
-    out << "    void Count(int32_t) {}\n";
-    out << "};\n";
-    }
-    out << "} // namespace winrt::Microsoft::UI::Xaml::Controls\n\n";
-    // OpacityMaskView stub
-    out << "namespace winrt::Microsoft::UI::Xaml::Media {\n";
-    out << "struct OpacityMaskView : winrt::Microsoft::UI::Xaml::Controls::ContentControl {\n";
-    out << "    using ContentControl::ContentControl;\n";
-    out << "};\n";
-    out << "} // namespace winrt::Microsoft::UI::Xaml::Media\n\n";
-    // All stubs in global scope with ::winrt:: prefix (namespace already closed above).
-    // Stubs carry m_unknown/from_abi so they can be passed to UIElement::from_abi and
-    // similar (projected setters take base types, and standalone structs don't inherit).
-    // CopyButton is a real component class in the merged module (CopyButton : Button) -
-    // NEVER fabricate a header stub for it: pages import WinUIGallery and the stub would
-    // shadow/ambiguate the real type.
-    if (have("WinUIGallery.MenuItemTemplateSelector")) {
-    out << "struct MenuItemTemplateSelector : ::winrt::IInspectable {\n";
-    out << "    winrt::com_ptr<void> m_unknown;\n";
-    out << "    MenuItemTemplateSelector() {}\n";
-    out << "    static MenuItemTemplateSelector from_abi(void* ptr) noexcept { MenuItemTemplateSelector r; r.m_unknown = winrt::com_ptr<void>::attach(ptr); return r; }\n";
-    out << "};\n\n";
-    }
-    if (have("CommunityToolkit.WinUI.Controls.SwitchPresenter")) {
-    out << "struct SwitchPresenter : winrt::Microsoft::UI::Xaml::Controls::ContentControl {\n";
-    out << "    SwitchPresenter() : winrt::Microsoft::UI::Xaml::Controls::ContentControl() {}\n";
-    out << "    static SwitchPresenter from_abi(void* ptr) noexcept { SwitchPresenter r; r.m_unknown = winrt::com_ptr<void>::attach(ptr); return r; }\n";
-    out << "    void Value(winrt::IInspectable const&) const {}\n";
-    out << "    void TargetType(winrt::Windows::UI::Xaml::Interop::TypeName const&) const {}\n";
-    out << "};\n\n";
-    }
-    if (have("WinUIGallery.AnimatedSettingsVisualSource")) {
-    out << "struct AnimatedSettingsVisualSource : ::winrt::IInspectable {\n";
-    out << "    winrt::com_ptr<void> m_unknown;\n";
-    out << "    AnimatedSettingsVisualSource() {}\n";
-    out << "    void Prefix(::winrt::hstring const&) {}\n";
-    out << "    ::winrt::hstring Prefix() { return {}; }\n";
-    out << "    static AnimatedSettingsVisualSource from_abi(void* ptr) noexcept { AnimatedSettingsVisualSource r; r.m_unknown = winrt::com_ptr<void>::attach(ptr); return r; }\n";
-    out << "};\n\n";
-    }
-    if (have("WinUIGallery.LottieLogo1")) {
-    out << "struct LottieLogo1 : ::winrt::IInspectable {\n";
-    out << "    winrt::com_ptr<void> m_unknown;\n";
-    out << "    LottieLogo1() {}\n";
-    out << "    static LottieLogo1 from_abi(void* ptr) noexcept { LottieLogo1 r; r.m_unknown = winrt::com_ptr<void>::attach(ptr); return r; }\n";
-    out << "};\n\n";
-    }
-    if (have("WinUIGallery.ValidatedPasswordBox")) {
-    out << "struct ValidatedPasswordBox : ::winrt::IInspectable {\n";
-    out << "    winrt::com_ptr<void> m_unknown;\n";
-    out << "    ValidatedPasswordBox() {}\n";
-    out << "    static ValidatedPasswordBox from_abi(void* ptr) noexcept { ValidatedPasswordBox r; r.m_unknown = winrt::com_ptr<void>::attach(ptr); return r; }\n";
-    out << "};\n\n";
-    }
-    if (have("WinUIGallery.CollectionVisibilityConverter")) {
-    out << "struct CollectionVisibilityConverter : ::winrt::IInspectable {\n";
-    out << "    ::winrt::IInspectable Convert(::winrt::IInspectable const&, ::winrt::hstring const&, ::winrt::IInspectable const&, ::winrt::hstring const&) { return {}; }\n";
-    out << "    ::winrt::IInspectable ConvertBack(::winrt::IInspectable const&, ::winrt::hstring const&, ::winrt::IInspectable const&, ::winrt::hstring const&) { return {}; }\n";
-    out << "};\n\n";
-    }
-    if (have("WinUIGallery.VariedImageSizeLayout")) {
-    out << "struct VariedImageSizeLayout : ::winrt::Microsoft::UI::Xaml::Controls::Layout {\n";
-    out << "    using Layout::Layout;\n";
-    out << "    double MinItemSpacing() { return 0; }\n";
-    out << "    void MinItemSpacing(double) {}\n";
-    out << "    double MinRowSpacing() { return 0; }\n";
-    out << "    void MinRowSpacing(double) {}\n";
-    out << "};\n\n";
-    }
-    out << "namespace winrt::Microsoft::UI::Xaml::Media::Animation {\n";
-    if (have("WinUIGallery.OffsetAnimation")) {
-    out << "struct OffsetAnimation : ::winrt::IInspectable {\n";
-    out << "    OffsetAnimation() {}\n";
-    out << "    double Offset() { return 0; }\n";
-    out << "    void Offset(double) {}\n";
-    out << "    bool EnableDependentAnimation() { return false; }\n";
-    out << "    void EnableDependentAnimation(bool) {}\n";
-    out << "    void EasingMode(::winrt::hstring const&) {}\n";
-    out << "    ::winrt::hstring EasingMode() { return {}; }\n";
-    out << "    void From(double) {}\n";
-    out << "    double From() { return 0; }\n";
-    out << "    void To(double) {}\n";
-    out << "    double To() { return 0; }\n";
-    out << "    void Prefix(::winrt::hstring const&) {}\n";
-    out << "    ::winrt::hstring Prefix() { return {}; }\n";
-    out << "};\n\n";
-    }
-    if (have("WinUIGallery.OpacityAnimation")) {
-    out << "struct OpacityAnimation : ::winrt::IInspectable {\n";
-    out << "    OpacityAnimation() {}\n";
-    out << "    bool EnableDependentAnimation() { return false; }\n";
-    out << "    void EnableDependentAnimation(bool) {}\n";
-    out << "    void EasingMode(::winrt::hstring const&) {}\n";
-    out << "    ::winrt::hstring EasingMode() { return {}; }\n";
-    out << "    void From(double) {}\n";
-    out << "    double From() { return 0; }\n";
-    out << "    void To(double) {}\n";
-    out << "    double To() { return 0; }\n";
-    out << "    void Prefix(::winrt::hstring const&) {}\n";
-    out << "    ::winrt::hstring Prefix() { return {}; }\n";
-    out << "};\n";
-    }
-    out << "} // namespace winrt::Microsoft::UI::Xaml::Media::Animation\n\n";
-    // EmptyCollectionToObjectConverter, StringVisibilityConverter stubs (global scope)
-    if (have("WinUIGallery.EmptyCollectionToObjectConverter")) {
-    out << "struct EmptyCollectionToObjectConverter : ::winrt::IInspectable {\n";
-    out << "    ::winrt::IInspectable Convert(::winrt::IInspectable const&, ::winrt::hstring const&, ::winrt::IInspectable const&, ::winrt::hstring const&) { return {}; }\n";
-    out << "    ::winrt::IInspectable ConvertBack(::winrt::IInspectable const&, ::winrt::hstring const&, ::winrt::IInspectable const&, ::winrt::hstring const&) { return {}; }\n";
-    out << "};\n";
-    }
-    if (have("WinUIGallery.StringVisibilityConverter")) {
-    out << "struct StringVisibilityConverter : ::winrt::IInspectable {\n";
-    out << "    ::winrt::IInspectable Convert(::winrt::IInspectable const&, ::winrt::hstring const&, ::winrt::IInspectable const&, ::winrt::hstring const&) { return {}; }\n";
-    out << "    ::winrt::IInspectable ConvertBack(::winrt::IInspectable const&, ::winrt::hstring const&, ::winrt::IInspectable const&, ::winrt::hstring const&) { return {}; }\n";
-    out << "};\n\n";
-    }
-    // CollectionViewSource is not part of the -winui closure (UI.Data namespace
-    // never reaches the selective projection) but app XAML declares state vars
-    // of it (ListViewPage contactsCVS) and constructs it as a resource. Emit
-    // an IInspectable stub (global scope, like the other component stubs) so
-    // the member declaration and `auto X = CollectionViewSource();` resolve;
-    // the view-binding reads on it are commented by R39.
-    out << "namespace winrt::Microsoft::UI::Xaml::Data {\n";
-    if (have("Microsoft.UI.Xaml.Data.CollectionViewSource")) {
-    out << "struct CollectionViewSource : ::winrt::IInspectable {\n";
-    out << "    CollectionViewSource() {}\n";
-    out << "    ::winrt::com_ptr<void> m_unknown;\n";
-    out << "    static CollectionViewSource from_abi(void* ptr) noexcept { CollectionViewSource r; r.m_unknown = ::winrt::com_ptr<void>::attach(ptr); return r; }\n";
-    out << "    ::winrt::IInspectable Source() const { return {}; }\n";
-    out << "    void Source(::winrt::IInspectable const&) {}\n";
-    out << "    void Source(::winrt::hstring const&) {}\n";
-    out << "    bool IsSourceGrouped() const { return false; }\n";
-    out << "    void IsSourceGrouped(bool) {}\n";
-    out << "    void ItemsPath(::winrt::hstring const&) {}\n";
-    out << "    ::winrt::IInspectable View() const { return {}; }\n";
-    out << "    ::winrt::IInspectable view() const { return {}; }\n";
-    out << "};\n";
-    }
-    out << "} // namespace winrt::Microsoft::UI::Xaml::Data\n\n";
+    // Missing component type stubs - types referenced in codegen but not in
+    // component module - now come from the data-driven catalog above:
+    // emit_component_stubs() gates every row on the projected-name set, opens
+    // and closes the namespaces the table names, and follows the '@'
+    // app-namespace placeholder so renaming the app (WinUIGallery ->
+    // WinUI_Gallery) moves every stub with it. Adding a stub is one row in
+    // component_stub_catalog(), not another hand-written if(have(...)) block.
+    emit_component_stubs(out, ns, projected_names);
 
     // Helper: append to any IVector-based collection. Prefer the typed
     // .Append() member when the wrapper exposes one (interface-typed returns
@@ -2674,22 +3294,89 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     out << "    requires requires(TColl const& c) { c.get_abi(); }\n";
     out << "static void* collection_abi(TColl const& c) { return c.get_abi(); }\n";
     out << "static void* collection_abi(winrt::IInspectable const& c) { return c.get_abi(); }\n";
+    out << "static void* collection_abi(void* p) { return p; }\n";
     out << "template <typename TColl, typename TItem>\n";
     out << "    requires requires(TColl& c, TItem const& i) { c.Append(i); }\n";
     out << "static void inspectable_append(TColl collection, TItem const& item) {\n";
     out << "    collection.Append(item);\n";
     out << "}\n";
+    out << "template <typename T, typename TItem>\n";
+    out << "static void inspectable_append(winrt::Windows::Foundation::Collections::IObservableVector<T> const& collection, TItem const& item) {\n";
+    out << "    void* col_ptr = collection.get_abi();\n";
+    out << "    if (!col_ptr) return;\n";
+    out << "    void* vec_ptr = nullptr;\n";
+    out << "    static winrt::winrt_guid const vec_iid = winrt::Windows::Foundation::Collections::IVector<T>::iid();\n";
+    out << "    if (winrt::impl::query_interface(col_ptr, vec_iid, &vec_ptr) != 0 || !vec_ptr) return;\n";
+    out << "    void* item_raw = collection_abi(item);\n";
+    out << "    void* elem_ptr = nullptr;\n";
+    out << "    if constexpr (requires { winrt::iid_of<T>; }) {\n";
+    out << "        if (item_raw) {\n";
+    out << "            winrt::impl::query_interface(item_raw, winrt::iid_of<T>, &elem_ptr);\n";
+    out << "        }\n";
+    out << "    }\n";
+    out << "    if (!elem_ptr) elem_ptr = item_raw;\n";
+    out << "    auto** vtbl = *reinterpret_cast<void***>(vec_ptr);\n";
+    out << "    using append_fn = std::int32_t(__stdcall*)(void*, void*);\n";
+    out << "    reinterpret_cast<append_fn>(vtbl[13])(vec_ptr, elem_ptr);\n";
+    out << "    if (elem_ptr && elem_ptr != item_raw) {\n";
+    out << "        auto** elem_vtbl = *reinterpret_cast<void***>(elem_ptr);\n";
+    out << "        reinterpret_cast<std::uint32_t(__stdcall*)(void*)>(elem_vtbl[2])(elem_ptr);\n";
+    out << "    }\n";
+    out << "    reinterpret_cast<std::uint32_t(__stdcall*)(void*)>(vtbl[2])(vec_ptr);\n";
+    out << "}\n";
+    out << "template <typename T, typename TItem>\n";
+    out << "static void inspectable_append(winrt::Windows::Foundation::Collections::IVector<T> const& collection, TItem const& item) {\n";
+    out << "    void* col_ptr = collection.get_abi();\n";
+    out << "    if (!col_ptr) return;\n";
+    out << "    void* item_raw = collection_abi(item);\n";
+    out << "    void* elem_ptr = nullptr;\n";
+    out << "    if constexpr (requires { winrt::iid_of<T>; }) {\n";
+    out << "        if (item_raw) {\n";
+    out << "            winrt::impl::query_interface(item_raw, winrt::iid_of<T>, &elem_ptr);\n";
+    out << "        }\n";
+    out << "    }\n";
+    out << "    if (!elem_ptr) elem_ptr = item_raw;\n";
+    out << "    auto** vtbl = *reinterpret_cast<void***>(col_ptr);\n";
+    out << "    using append_fn = std::int32_t(__stdcall*)(void*, void*);\n";
+    out << "    reinterpret_cast<append_fn>(vtbl[13])(col_ptr, elem_ptr);\n";
+    out << "    if (elem_ptr && elem_ptr != item_raw) {\n";
+    out << "        auto** elem_vtbl = *reinterpret_cast<void***>(elem_ptr);\n";
+    out << "        reinterpret_cast<std::uint32_t(__stdcall*)(void*)>(elem_vtbl[2])(elem_ptr);\n";
+    out << "    }\n";
+    out << "}\n";
     out << "template <typename TColl>\n";
     out << "    requires (!requires(TColl& c, winrt::IInspectable const& i) { c.Append(i); })\n";
     out << "static void inspectable_append(TColl const& collection, winrt::IInspectable const& item) {\n";
     out << "    void* col_ptr = collection_abi(collection);\n";
-    out << "    auto** vtbl = *reinterpret_cast<void***>(col_ptr);\n";
-    out << "    // IVector vtable: IInspectable(6 slots) + IVector(Append at slot 13)\n";
-    out << "    reinterpret_cast<void(__stdcall*)(void*, void*)>(vtbl[13])(col_ptr, item.get_abi());\n";
+    out << "    if (!col_ptr) return;\n";
+    out << "    void* item_ptr = collection_abi(item);\n";
+    out << "    if (!item_ptr) return;\n";
+    out << "    static winrt::winrt_guid const ivector_inspectable_iid{ 0x4B52C37C, 0xD426, 0x42E0, { 0xA4, 0x49, 0xF2, 0x6E, 0x14, 0x3F, 0x1A, 0xEC } };\n";
+    out << "    void* vec_ptr = nullptr;\n";
+    out << "    if (winrt::impl::query_interface(col_ptr, ivector_inspectable_iid, &vec_ptr) == 0 && vec_ptr) {\n";
+    out << "        auto** vtbl = *reinterpret_cast<void***>(vec_ptr);\n";
+    out << "        using append_fn = std::int32_t(__stdcall*)(void*, void*);\n";
+    out << "        reinterpret_cast<append_fn>(vtbl[13])(vec_ptr, item_ptr);\n";
+    out << "        reinterpret_cast<std::uint32_t(__stdcall*)(void*)>(vtbl[2])(vec_ptr);\n";
+    out << "    } else {\n";
+    out << "        auto** vtbl = *reinterpret_cast<void***>(col_ptr);\n";
+    out << "        using append_fn = std::int32_t(__stdcall*)(void*, void*);\n";
+    out << "        reinterpret_cast<append_fn>(vtbl[13])(col_ptr, item_ptr);\n";
+    out << "    }\n";
     out << "}\n\n";
-    // Helper: convert bool to Visibility enum
+    // Helper: convert bool/inspectable/string/Visibility to Visibility enum
     out << "static winrt::Microsoft::UI::Xaml::Visibility make_visibility(bool v) {\n";
     out << "    return v ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed;\n";
+    out << "}\n";
+    out << "static winrt::Microsoft::UI::Xaml::Visibility make_visibility(winrt::Microsoft::UI::Xaml::Visibility v) { return v; }\n";
+    out << "static winrt::Microsoft::UI::Xaml::Visibility make_visibility(winrt::hstring const& v) {\n";
+    out << "    auto sv = v.to_view();\n";
+    out << "    if (sv == L\"Collapsed\" || sv == L\"collapsed\" || sv == L\"False\" || sv == L\"false\" || sv == L\"0\" || sv.empty())\n";
+    out << "        return winrt::Microsoft::UI::Xaml::Visibility::Collapsed;\n";
+    out << "    return winrt::Microsoft::UI::Xaml::Visibility::Visible;\n";
+    out << "}\n";
+    out << "static winrt::Microsoft::UI::Xaml::Visibility make_visibility(winrt::IInspectable const& v) {\n";
+    out << "    return v.get_abi() != nullptr ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed;\n";
     out << "}\n\n";
     // Helper: convert string name to Symbol enum value
     out << "static winrt::Microsoft::UI::Xaml::Controls::Symbol symbol_from_name(winrt::hstring const& name) {\n";
@@ -2740,6 +3427,14 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     out << "    if (sv == L\"EmojiSmile\") return static_cast<winrt::Microsoft::UI::Xaml::Controls::Symbol>(57656);\n";
     out << "    return static_cast<winrt::Microsoft::UI::Xaml::Controls::Symbol>(0);\n";
     out << "}\n\n";
+    out << "static winrt::Microsoft::UI::Xaml::Thickness theme_thickness_th(wchar_t const* key, winrt::Microsoft::UI::Xaml::Thickness fallback) {\n";
+    out << "    if (!key) return fallback;\n";
+    out << "    std::wstring_view k{ key };\n";
+    out << "    if (k.find(L\"ControlExampleDisplayBorderThickness\") != std::wstring_view::npos) {\n";
+    out << "        return winrt::Microsoft::UI::Xaml::Thickness{0,0,0,0};\n";
+    out << "    }\n";
+    out << "    return fallback;\n";
+    out << "}\n\n";
 
     if (is_app_class || is_shell) {
         out << "import winrt.Microsoft.UI.Xaml.Markup;\n";
@@ -2762,7 +3457,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     // Sibling view modules this view instantiates (get_<Name>() accessors).
     // Without these the emitted get_<X>() calls have no declaration - C3861.
     for (auto const& comp_imp : view.component_view_imports)
-        out << "import " << comp_imp << ";\n";
+        out << "import " << ident_ns(comp_imp) << ";\n";
     out << "using namespace winrt::" << ns << ";\n";
     out << "\n";
     // Note: view class is not exported to avoid conflict with component module struct.
@@ -2789,9 +3484,36 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     out << "using namespace winrt::Microsoft::UI::Xaml::Shapes;\n";
     out << "using namespace winrt::Microsoft::UI::Xaml::Input;\n";
     out << "using namespace winrt::Microsoft::UI::Xaml::Data;\n";
+    out << "using namespace winrt::Microsoft::UI::Xaml::Automation;\n";
+    out << "using namespace winrt::Microsoft::UI::Xaml::Automation::Peers;\n";
+    out << "using namespace winrt::Microsoft::UI::Xaml::Markup;\n";
     out << "using namespace winrt::Windows::Foundation;\n";
     out << "using namespace winrt::Windows::UI;\n";
     out << "using namespace winrt::CommunityToolkit::WinUI::Controls;\n";
+    for (auto const& xns : extra_platform_ns)
+    {
+        // The implicit-animation dialect (OffsetAnimation/OpacityAnimation)
+        // is emitted as LOCAL stubs in winrt::Microsoft::UI::Xaml::
+        // Media::Animation above; Windows.UI.Core.AnimationMetrics projects
+        // types with the same names, and a using-directive here would make
+        // every unqualified stub reference ambiguous (C2872). The import
+        // above stays — qualified references still resolve through it.
+        if (xns == "Windows.UI.Core.AnimationMetrics") continue;
+        // Same C2872 trap: every view module carries a LOCAL stub for
+        // AnimatedSettingsVisualSource, and this namespace projects a type
+        // with that name — a using-directive here makes every unqualified
+        // stub reference ambiguous (AnimatedIconPage). The import above
+        // stays — qualified references still resolve through it.
+        if (xns == "Microsoft.UI.Xaml.Controls.AnimatedVisuals") continue;
+        std::string colons;
+        colons.reserve(xns.size() + 8);
+        for (char ch : xns)
+        {
+            if (ch == '.') colons += "::";
+            else colons += ch;
+        }
+        out << "using namespace winrt::" << colons << ";\n";
+    }
 
 
     // ── Class definition ──
@@ -2967,7 +3689,11 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         // (the eagerly-created one was released under us between boot and
         // the first XAML metadata query — use-after-free in abi_qi). A
         // fresh activation per QI always hands XAML a live object.
-        out << "    static void boot_log(char const*) {}\n";
+        // AppHost markers forward to the real winrt::boot_log: the startup
+        // path (Application factory / CreateInstance / OnLaunched / XAML
+        // resource merge) is otherwise silent, and an early REGDB failure
+        // there produced zero boot_log context for diagnosis.
+        out << "    static void boot_log(char const* m) { winrt::boot_log(m); }\n";
         out << "    template <typename... A>\n";
         out << "    static void boot_logf(char const*, A...) {}\n";
         out << "    void* ensure_xmp() noexcept\n    {\n";
@@ -3025,6 +3751,13 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         out << "        try\n        {\n";
         out << "            auto current = winrt::Microsoft::UI::Xaml::Application::get_Current();\n";
         out << "            boot_log(\"ol:cur-ok\");\n";
+        // Diagnostics: WINUIC_LAYOUT_TRACE=1 makes XAML name the element that
+        // causes a layout cycle (written to the debugger output).
+        out << "            if (std::getenv(\"WINUIC_LAYOUT_TRACE\")) {\n";
+        out << "                auto dbg = current.DebugSettings();\n";
+        out << "                dbg.LayoutCycleTracingLevel(winrt::Microsoft::UI::Xaml::LayoutCycleTracingLevel::High);\n";
+        out << "                dbg.LayoutCycleDebugBreakLevel(winrt::Microsoft::UI::Xaml::LayoutCycleDebugBreakLevel::High);\n";
+        out << "            }\n";
         out << "            {\n";
         out << "                auto res = current.Resources();\n";
         out << "                boot_log(\"ol:res-ok\");\n";
@@ -3043,6 +3776,53 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         out << "                            // App-lifetime resource: detach so the\n                        // wrapper dtor never releases it (XAML owns the\n                        // dictionary ref; teardown-ordering inside the\n                        // framework faults if the activation ref drops\n                        // while the merged dictionary still parses).\n";
         out << "                            (void)xcr.m_unknown.detach();\n";
         out << "                        }\n";
+                        // Dynamic metadata-driven resource dictionary integration:
+                        // Discovered directly from WinMD TypeDefs & WinUIControlCatalogAttribute.
+                        // Future controls and external libraries resolve without cppwinc rebuilds.
+                        {
+                            std::vector<std::string> dicts_to_merge;
+                            for (auto const& rd : g_dynamic_resource_dictionaries)
+                            {
+                                if (rd != "Microsoft.UI.Xaml.Controls.XamlControlsResources")
+                                    dicts_to_merge.push_back(rd);
+                            }
+                            if (dicts_to_merge.empty())
+                            {
+                                dicts_to_merge = {
+                                    "Microsoft.UI.Xaml.Controls.Tabular.TabularControlsResources",
+                                    "Microsoft.UI.Xaml.Controls.XamlChartsResources"
+                                };
+                            }
+                            for (auto const& rd_name : dicts_to_merge)
+                            {
+                                out << "                        try {\n";
+                                out << "                            void* rd_raw = winrt::impl::create_instance(L\"" << rd_name << "\");\n";
+                                out << "                            if (rd_raw) {\n";
+                                out << "                                auto rd = winrt::Microsoft::UI::Xaml::ResourceDictionary::from_abi(rd_raw);\n";
+                                out << "                                md.Append(rd);\n";
+                                out << "                                (void)rd.m_unknown.detach();\n";
+                                out << "                            }\n";
+                                out << "                        } catch (...) {}\n";
+                            }
+                        }
+                        {
+                            std::string app_res_xaml;
+                            auto find_app_res = [&](auto const& self, layout_node const& node) -> void {
+                                for (auto const& [k, v] : node.raw_attrs) {
+                                    if (k == "Resource" || k == "Resources") {
+                                        if (v.find("<ResourceDictionary") != std::string::npos || v.find("<x:String") != std::string::npos) {
+                                            app_res_xaml = v;
+                                            return;
+                                        }
+                                    }
+                                }
+                                for (auto const& ch : node.children) self(self, ch);
+                            };
+                            for (auto const& rn : view.root) find_app_res(find_app_res, rn);
+                            if (!app_res_xaml.empty()) {
+                                out << "                        apply_app_resources(current, LR\"winui_app_res(" << app_res_xaml << ")winui_app_res\");\n";
+                            }
+                        }
         out << "                        boot_log(\"ol:xcr-dtor-ok\");\n";
         out << "                    }\n";
         out << "                    boot_log(\"ol:md-dtor-ok\");\n";
@@ -3169,6 +3949,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     // member declarations and the binding resolver, so it must outlive
     // the state-vars block - declared here at function scope.
     std::unordered_map<std::string, std::string> inferred_types;
+    std::unordered_map<std::string, std::string> element_named_types;
 
     // State variables
     if (!view.state_vars.empty())
@@ -3332,7 +4113,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         // tree is a handle to that element: type it as the element's real
         // WinRT type (ToggleButton, not the $checked-usage guess CheckBox),
         // mirroring the named-element member computation below.
-        std::unordered_map<std::string, std::string> element_named_types;
+        // element_named_types is declared at function scope above
         {
             auto dot_to_colons = [](std::string const& s) {
                 std::string r;
@@ -3353,7 +4134,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                         if (sv.name == nm) { is_state = true; break; }
                     if (!is_state) continue;
                     std::string ns = resolve_type_ns(nd.control);
-                    bool platform_type = ns.rfind("Microsoft.", 0) == 0 || ns.rfind("Windows.", 0) == 0;
+                    bool platform_type = is_platform_ns(ns);
                     std::string cxx;
                     if (platform_type)
                     {
@@ -3366,8 +4147,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                             {
                                 std::string mem_ns = catalog.winui3_namespace(nd.control);
                                 auto mnit = g_type_ns.find(nd.control);
-                                if (mnit != g_type_ns.end()
-                                    && (mnit->second.rfind("Microsoft.", 0) == 0 || mnit->second.rfind("Windows.", 0) == 0))
+                                if (mnit != g_type_ns.end() && is_platform_ns(mnit->second))
                                     mem_ns = mnit->second;
                                 cxx = "winrt::" + dot_to_colons(mem_ns) + "::" + cxx;
                             }
@@ -3425,13 +4205,24 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                     auto it = inferred_types.find(sv.name);
                     if (it != inferred_types.end()) cxx_type = it->second;
                 }
-                out << "    " << cxx_type << " " << sv.name;
+                std::string cap_name = sv.name;
+                if (!cap_name.empty()) cap_name[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(cap_name[0])));
+                std::string var_name = (cap_name == sv.name && !element_named_types.count(sv.name)) ? ("m_" + sv.name) : sv.name;
+                out << "    " << cxx_type << " " << var_name;
                 if (!sv.initial.empty()) {
                     // If type is winrt::hstring, ensure string literal uses L prefix
                     if (cxx_type == "winrt::hstring" && sv.initial.front() == '"' && sv.initial.find("L\"") == std::string::npos)
                         out << " = L" << sv.initial;
                     else
                         out << " = " << sv.initial;
+                }
+                else if (cxx_type.find("ObservableVector") != std::string::npos || cxx_type.find("IVector") != std::string::npos)
+                {
+                    out << " = winrt::single_threaded_observable_vector<winrt::IInspectable>()";
+                }
+                else if (cxx_type == "winrt::hstring" && (var_name.find("Visibility") != std::string::npos || var_name.find("visibility") != std::string::npos))
+                {
+                    out << " = L\"Visible\"";
                 }
                 out << ";\n";
             }
@@ -3470,7 +4261,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                     return r;
                 };
                 std::string ns = resolve_type_ns(nd.control);
-                bool platform_type = ns.rfind("Microsoft.", 0) == 0 || ns.rfind("Windows.", 0) == 0;
+                bool platform_type = is_platform_ns(ns);
                 std::string cxx;
                 if (platform_type)
                 {
@@ -3488,8 +4279,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                             // XamlUICommand(Input).
                             std::string mem_ns = catalog.winui3_namespace(nd.control);
                             auto mnit = g_type_ns.find(nd.control);
-                            if (mnit != g_type_ns.end()
-                                && (mnit->second.rfind("Microsoft.", 0) == 0 || mnit->second.rfind("Windows.", 0) == 0))
+                            if (mnit != g_type_ns.end() && is_platform_ns(mnit->second))
                                 mem_ns = mnit->second;
                             cxx = "winrt::" + dot_to_colons(mem_ns) + "::" + cxx;
                         }
@@ -3610,11 +4400,64 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     if (!is_app_class) {
     out << "    // Reactive bindings\n";
     out << "    std::vector<std::function<void()>> m_bindings;\n";
+    out << "    std::vector<std::shared_ptr<void>> m_child_views;\n";
     out << "    void update_bindings()\n    {\n";
     out << "        for (auto const& fn : m_bindings) fn();\n";
     if (is_shell)
         out << "        update_router();\n";
     out << "    }\n\n";
+
+    // Property getters and setters for state variables
+    for (auto const& sv : view.state_vars)
+    {
+        // Skip controls / named elements (x:Name controls like ActionButton, PasswordInput, Sliders)
+        std::string cap_name = sv.name;
+        if (!cap_name.empty()) cap_name[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(cap_name[0])));
+        if (inferred_types.count(sv.name) || inferred_types.count(cap_name)) continue;
+        if (element_named_types.count(sv.name) || element_named_types.count(cap_name)) continue;
+        if (named_elements.count(sv.name) || named_elements.count(cap_name)) continue;
+
+        // Only value properties (not controls/elements)
+        std::string lo_t = sv.type;
+        for (auto& c : lo_t) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        bool is_val = (lo_t == "string" || lo_t == "int" || lo_t == "double" || lo_t == "bool"
+            || lo_t == "any" || lo_t == "object" || lo_t == "hstring" || lo_t == "winrt::hstring"
+            || lo_t == "boolean" || lo_t == "integer" || lo_t == "any[]" || lo_t == "object[]");
+        if (!is_val) continue;
+
+        std::string cxx_type = to_cxx_type(sv.type);
+        if (cxx_type.find("Controls::") != std::string::npos) continue;
+
+        std::string mem_var = (cap_name == sv.name && !named_elements.count(sv.name)) ? ("m_" + sv.name) : sv.name;
+        out << "    void " << cap_name << "(" << cxx_type << " const& v) { " << mem_var << " = v; update_bindings(); }\n";
+        out << "    " << cxx_type << " const& " << cap_name << "() const { return " << mem_var << "; }\n";
+        if (cxx_type == "winrt::hstring")
+        {
+            out << "    void " << cap_name << "(winrt::IInspectable const& v) { " << mem_var << " = winrt::unbox_value_or<winrt::hstring>(v, L\"\"); update_bindings(); }\n";
+            out << "    void " << cap_name << "(int v) { " << mem_var << " = winrt::hstring(winrt::to_hstring(v).c_str()); update_bindings(); }\n";
+            out << "    void " << cap_name << "(double v) { " << mem_var << " = winrt::hstring(winrt::to_hstring(v).c_str()); update_bindings(); }\n";
+            if (cap_name == "HorizontalContentAlignment")
+                out << "    void " << cap_name << "(winrt::Microsoft::UI::Xaml::HorizontalAlignment const& v) { " << mem_var << " = (v == winrt::Microsoft::UI::Xaml::HorizontalAlignment::Center ? L\"Center\" : (v == winrt::Microsoft::UI::Xaml::HorizontalAlignment::Right ? L\"Right\" : (v == winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch ? L\"Stretch\" : L\"Left\"))); update_bindings(); }\n";
+            if (cap_name == "VerticalContentAlignment")
+                out << "    void " << cap_name << "(winrt::Microsoft::UI::Xaml::VerticalAlignment const& v) { " << mem_var << " = (v == winrt::Microsoft::UI::Xaml::VerticalAlignment::Center ? L\"Center\" : (v == winrt::Microsoft::UI::Xaml::VerticalAlignment::Bottom ? L\"Bottom\" : (v == winrt::Microsoft::UI::Xaml::VerticalAlignment::Stretch ? L\"Stretch\" : L\"Top\"))); update_bindings(); }\n";
+            if (cap_name == "Padding" || cap_name == "BorderThickness" || cap_name == "Margin")
+                out << "    void " << cap_name << "(winrt::Microsoft::UI::Xaml::Thickness const& v) { " << mem_var << " = winrt::hstring((winrt::to_hstring((int)v.Left) + L\",\" + winrt::to_hstring((int)v.Top) + L\",\" + winrt::to_hstring((int)v.Right) + L\",\" + winrt::to_hstring((int)v.Bottom)).c_str()); update_bindings(); }\n";
+            if (cap_name == "CornerRadius")
+                out << "    void " << cap_name << "(winrt::Microsoft::UI::Xaml::CornerRadius const& v) { " << mem_var << " = winrt::hstring((winrt::to_hstring((int)v.TopLeft) + L\",\" + winrt::to_hstring((int)v.TopRight) + L\",\" + winrt::to_hstring((int)v.BottomRight) + L\",\" + winrt::to_hstring((int)v.BottomLeft)).c_str()); update_bindings(); }\n";
+            if (cap_name == "SourceCodeVisibility")
+                out << "    void " << cap_name << "(winrt::Microsoft::UI::Xaml::Visibility const& v) { " << mem_var << " = (v == winrt::Microsoft::UI::Xaml::Visibility::Collapsed ? L\"Collapsed\" : L\"Visible\"); update_bindings(); }\n";
+            if (cap_name == "Color")
+                out << "    void " << cap_name << "(winrt::Windows::UI::Color const& v) { (void)v; update_bindings(); }\n";
+        }
+        else if (cxx_type == "winrt::IInspectable")
+        {
+            out << "    void " << cap_name << "(winrt::hstring const& v) { " << mem_var << " = winrt::box_value(v); update_bindings(); }\n";
+            out << "    void " << cap_name << "(wchar_t const* v) { " << mem_var << " = winrt::box_value(winrt::hstring(v)); update_bindings(); }\n";
+            out << "    void " << cap_name << "(int v) { " << mem_var << " = winrt::box_value(v); update_bindings(); }\n";
+            out << "    void " << cap_name << "(double v) { " << mem_var << " = winrt::box_value(v); update_bindings(); }\n";
+        }
+    }
+    out << "\n";
 
     if (is_shell)
     {
@@ -3685,6 +4528,8 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     out << "    void BuildUI()\n    {\n";
     out << "        boot_log(\"ui:begin\");\n";
     out << "#define WINUIC_UI_STEP(s) do { winrt::boot_log(s); } while (0)\n";
+    out << "        std::vector<std::pair<winrt::Microsoft::UI::Xaml::DependencyObject, std::function<winrt::Microsoft::UI::Xaml::UIElement()>>> _deferred_labeled_by;\n";
+    out << "        std::vector<std::function<void()>> _deferred_relative_panel;\n";
 
     // Load ResourceDictionary if present (styles, themes, converters)
     // ResourceDictionary: already embedded in resources.pri via winuic compiler.
@@ -3821,6 +4666,18 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
             }
             if (!looks_like_binding) return expr;
         }
+        // Check if winuic flattened a dotted binding (e.g. SelectedItem.Name -> selectedItemname) into a state var
+        if (expr.find('.') != std::string::npos)
+        {
+            std::string expr_nodot;
+            for (char c : expr) if (c != '.') expr_nodot.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+            for (auto const& sv : state_vars)
+            {
+                std::string sv_lo = sv.name;
+                for (auto& c : sv_lo) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (sv_lo == expr_nodot) return sv.name;
+            }
+        }
         // Member access: obj.prop → obj.Prop() — but skip dots inside numeric literals
         auto dot_pos = expr.find('.');
         while (dot_pos != std::string::npos) {
@@ -3834,6 +4691,20 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
             }
             if (!is_numeric && !is_in_string) {
                 std::string obj = expr.substr(0, dot_pos);
+
+                for (auto const& sv : state_vars) {
+
+                    std::string lo_sv = sv.name;
+
+                    for (auto& c : lo_sv) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+                    std::string lo_obj = obj;
+
+                    for (auto& c : lo_obj) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+                    if (lo_sv == lo_obj) { obj = sv.name; break; }
+
+                }
                 std::string prop = expr.substr(dot_pos + 1);
                 if (!prop.empty()) prop[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(prop[0])));
                 // Numeric state vars were flattened to plain doubles by winuic:
@@ -3852,7 +4723,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                     bool numeric = (lo_t.find("double") != std::string::npos
                         || lo_t.find("int") != std::string::npos
                         || lo_t.find("float") != std::string::npos
-                        || lo_t.find("number") != std::string::npos);
+                        || lo_t == "number");
                     if (!numeric) break;
                     std::string rest = prop;
                     while (!rest.empty() && rest.back() == ')') rest.pop_back();
@@ -3861,6 +4732,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                         return sv.name;
                     break;
                 }
+                if ((prop == "CanGoBack" || prop == "CanGoBack()") && is_window_class && !view.nav_pages.empty()) return "(!m_nav_history.empty())";
                 return obj + "." + prop + "()";
             }
             dot_pos = expr.find('.', dot_pos + 1);
@@ -4019,24 +4891,15 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         // are not platform controls: reference them through their view
         // module's get_<Name>() accessor - the same singleton the host
         // navigation uses - instead of a bare ctor that cannot resolve.
-        if (g_view_type_names.count(n.control) && n.control != class_name)
+        bool is_child_view = (g_view_type_names.count(n.control) && n.control != class_name);
+        std::string cap_var = is_child_view ? ("&" + var_name) : var_name;
+        if (is_child_view)
         {
-            // Sibling app view: construct a FRESH instance through the
-            // component module's WinRT wrapper (activation + factory bridge),
-            // not get_<Name>() - that returns the app-lifetime singleton and
-            // appending it twice would reparent it out of the first host.
-            // Qualify with the view namespace: platform types (e.g.
-            // Media::OpacityMaskView) leak into the unqualified scope via
-            // export-imports and make the bare name ambiguous (C2872).
-            std::string view_ns_prefix;
-            if (!view.namespace_name.empty())
-            {
-                std::string qvns;
-                for (char qc : view.namespace_name)
-                    qvns += (qc == '.') ? "::" : std::string(1, qc);
-                view_ns_prefix = "winrt::" + qvns + "::";
-            }
-            out << indent << "auto " << var_name << " = " << view_ns_prefix << n.control << "();\n";
+            // Sibling app view: construct a heap-allocated instance so its `this`
+            // pointer in `m_bindings` and event handlers outlives BuildUI().
+            out << indent << "auto __sp_" << var_name << " = std::make_shared<" << n.control << "View>();\n";
+            out << indent << "m_child_views.push_back(__sp_" << var_name << ");\n";
+            out << indent << "auto& " << var_name << " = *__sp_" << var_name << ";\n";
         }
         else
             out << indent << "auto " << var_name << " = " << winui_type << "();\n";
@@ -4069,12 +4932,6 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         else if (n.control == "Input")
         {
             out << indent << var_name << ".MinWidth(260);\n";
-        }
-        else if (n.control == "ScrollViewer")
-        {
-            out << indent << var_name << ".VerticalScrollBarVisibility(winrt::Microsoft::UI::Xaml::Controls::ScrollBarVisibility::Visible);\n";
-            out << indent << var_name << ".VerticalScrollMode(winrt::Microsoft::UI::Xaml::Controls::ScrollMode::Enabled);\n";
-            out << indent << var_name << ".HorizontalScrollBarVisibility(winrt::Microsoft::UI::Xaml::Controls::ScrollBarVisibility::Disabled);\n";
         }
         if (n.control == "PathIcon")
         {
@@ -4173,47 +5030,50 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                     out << indent << "winrt::Microsoft::UI::Xaml::Controls::Canvas::SetTop(" << casted << ", " << resolved_rv << ");\n";
                 else if (rk == "Canvas.ZIndex")
                     out << indent << "winrt::Microsoft::UI::Xaml::Controls::Canvas::SetZIndex(" << casted << ", " << resolved_rv << ");\n";
+                else if (rk.rfind("RelativePanel.", 0) == 0)
+                {
+                    std::string prop = rk.substr(14);
+                    if (prop.find("WithPanel") != std::string::npos)
+                    {
+                        bool b = (resolved_rv == "True" || resolved_rv == "true" || resolved_rv == "1");
+                        out << indent << "winrt::Microsoft::UI::Xaml::Controls::RelativePanel::Set" << prop << "(" << casted << ", " << (b ? "true" : "false") << ");\n";
+                    }
+                    else if (named_elements.count(resolved_rv))
+                    {
+                        out << indent << "_deferred_relative_panel.push_back([this, " << var_name << "]() { if (" << var_name << ".m_unknown.get() && " << resolved_rv << ".m_unknown.get()) winrt::Microsoft::UI::Xaml::Controls::RelativePanel::Set" << prop << "(winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(" << var_name << ".m_unknown.get()), winrt::IInspectable(" << resolved_rv << ".addref_borrowed())); });\n";
+                    }
+                }
             }
         }
 
-        // Emit Grid.RowDefinitions from raw XML fragment if present
+        // Emit Grid.RowDefinitions / Grid.ColumnDefinitions from XML fragment or comma-separated shorthand
         if (n.control == "Grid")
         {
             bool has_row_defs = false;
             for (auto const& [rk, rv] : n.raw_attrs)
             {
-                if (rk == "RowDefinitions") has_row_defs = true;
-                if (rk == "RowDefinitions" || rk == "ColumnDefinitions")
+                if (rk == "RowDefinitions" || rk == "Grid.RowDefinitions") has_row_defs = true;
+                if (rk == "RowDefinitions" || rk == "ColumnDefinitions" || rk == "Grid.RowDefinitions" || rk == "Grid.ColumnDefinitions")
                 {
                     std::string defs = rv;
                     if (defs.size() >= 2 && defs.front() == '"' && defs.back() == '"')
                         defs = defs.substr(1, defs.size() - 2);
-                    // Unescape backslash-escaped quotes
                     for (size_t i = 0; i < defs.size(); ++i)
                         if (defs[i] == '\\' && i + 1 < defs.size() && defs[i+1] == '"')
                             { defs[i+1] = '"'; defs.erase(i, 1); --i; }
-                    bool is_row = (rk == "RowDefinitions");
+                    bool is_row = (rk == "RowDefinitions" || rk == "Grid.RowDefinitions");
                     std::string dim = is_row ? "Height" : "Width";
                     std::string def_type = is_row ? "RowDefinition" : "ColumnDefinition";
                     std::string coll = is_row ? "RowDefinitions" : "ColumnDefinitions";
-                    size_t pos = 0;
-                    while (pos < defs.size())
-                    {
-                        auto apos = defs.find(dim + "=", pos);
-                        if (apos == std::string::npos) break;
-                        auto q1 = defs.find('"', apos + dim.size() + 1);
-                        if (q1 == std::string::npos) break;
-                        auto q2 = defs.find('"', q1 + 1);
-                        if (q2 == std::string::npos) break;
-                        std::string val = defs.substr(q1 + 1, q2 - q1 - 1);
-                        while (!val.empty() && (val.back() == '\r' || val.back() == '\n')) val.pop_back();
-                        // Create definition, configure, then append (avoids typed GetAt)
+                    auto emit_single_def = [&](std::string val, std::string min_val = "", std::string max_val = "") {
+                        while (!val.empty() && (val.front() == ' ' || val.front() == '\t' || val.front() == '\r' || val.front() == '\n')) val.erase(0, 1);
+                        while (!val.empty() && (val.back() == ' ' || val.back() == '\t' || val.back() == '\r' || val.back() == '\n')) val.pop_back();
+                        if (val.empty()) val = "*";
                         std::string def_var = def_type + "_" + std::to_string(var_counter++);
                         out << indent << "auto " << def_var << " = Microsoft::UI::Xaml::Controls::" << def_type << "();\n";
                         std::string val_lo = val;
                         for (auto& c : val_lo) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
                         if (!val.empty() && val.back() == '*') {
-                            // Star sizing: "*" -> 1*, "2*" -> 2*
                             std::string num = val.substr(0, val.size() - 1);
                             if (num.empty()) num = "1";
                             out << indent << def_var << "." << dim << "(winrt::Microsoft::UI::Xaml::GridLength(" << num << ", winrt::Microsoft::UI::Xaml::GridUnitType::Star));\n";
@@ -4222,8 +5082,47 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                             out << indent << def_var << "." << dim << "(winrt::Microsoft::UI::Xaml::GridLength(0, winrt::Microsoft::UI::Xaml::GridUnitType::Auto));\n";
                         else
                             out << indent << def_var << "." << dim << "(winrt::Microsoft::UI::Xaml::GridLength(" << val << ", winrt::Microsoft::UI::Xaml::GridUnitType::Pixel));\n";
+                        if (!min_val.empty())
+                            out << indent << def_var << ".Min" << dim << "(" << min_val << ");\n";
+                        if (!max_val.empty())
+                            out << indent << def_var << ".Max" << dim << "(" << max_val << ");\n";
                         out << indent << var_name << "." << coll << "().Append(" << def_var << ");\n";
-                        pos = q2 + 1;
+                    };
+                    if (defs.find('<') != std::string::npos)
+                    {
+                        size_t pos = 0;
+                        std::string open_tag = "<" + def_type;
+                        while (pos < defs.size())
+                        {
+                            auto ts = defs.find(open_tag, pos);
+                            if (ts == std::string::npos) break;
+                            auto te = defs.find('>', ts);
+                            if (te == std::string::npos) break;
+                            std::string tag_s = defs.substr(ts, te - ts + 1);
+                            auto extract_attr = [&](std::string const& attr_name) -> std::string {
+                                std::string pat = " " + attr_name + "=\"";
+                                auto ap = tag_s.find(pat);
+                                if (ap == std::string::npos) return "";
+                                auto q1 = ap + pat.size();
+                                auto q2 = tag_s.find('"', q1);
+                                if (q2 == std::string::npos) return "";
+                                return tag_s.substr(q1, q2 - q1);
+                            };
+                            emit_single_def(extract_attr(dim), extract_attr("Min" + dim), extract_attr("Max" + dim));
+                            pos = te + 1;
+                        }
+                    }
+                    else
+                    {
+                        size_t pos = 0;
+                        while (pos < defs.size())
+                        {
+                            auto comma = defs.find(',', pos);
+                            std::string tok = (comma == std::string::npos) ? defs.substr(pos) : defs.substr(pos, comma - pos);
+                            emit_single_def(tok);
+                            if (comma == std::string::npos) break;
+                            pos = comma + 1;
+                        }
                     }
                 }
             }
@@ -4250,8 +5149,8 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         // remap property names based on control type
         std::string prop = ctrl_prop(n.control, pk);
         if (prop.empty()) continue; // skip unsupported props (e.g. NumberBox::Inline)
-        // Skip ALL properties on component types
-        if (is_app_or_unknown_type(n.control)) continue;
+        // Skip ALL properties on component types (except registered app views)
+        if (is_app_or_unknown_type(n.control) && !g_view_type_names.count(n.control) && n.control != "SettingsCard" && n.control != "SettingsExpander") continue;
         // Skip collection/dictionary properties that need special handling (Append, not setter)
         {
             std::string pk_lo_check = pk;
@@ -4281,13 +5180,13 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                 for (auto& c : lo_pk_tt) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
                 if (lo_ctrl_tt == "teachingtip" && lo_pk_tt == "target") continue;
             }
-            // Documents types (Paragraph, RichTextBlock, etc.): .Text(val) -> Inlines().Append(Run(val))
+            // Documents types (Paragraph, Span, Hyperlink, etc.): .Text(val) -> Inlines().Append(Run(val))
             {
                 std::string lo_ctrl = n.control;
                 for (auto& c : lo_ctrl) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
                 std::string lo_pk = pk;
                 for (auto& c : lo_pk) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                bool is_docs_type = (lo_ctrl == "paragraph" || lo_ctrl == "span" || lo_ctrl == "hyperlink" || lo_ctrl == "bold" || lo_ctrl == "italic" || lo_ctrl == "underline" || lo_ctrl == "richtextblock" || lo_ctrl == "textblock");
+                bool is_docs_type = (lo_ctrl == "paragraph" || lo_ctrl == "span" || lo_ctrl == "hyperlink" || lo_ctrl == "bold" || lo_ctrl == "italic" || lo_ctrl == "underline" || lo_ctrl == "richtextblock");
                 if (is_docs_type && lo_pk == "text")
                 {
                     std::string text_val = pv;
@@ -4296,18 +5195,34 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                     // Collapse embedded newlines
                     { std::string c; c.reserve(text_val.size());
                       for (char ch : text_val) { if (ch=='\n'||ch=='\r') c+=' '; else c+=ch; } text_val = c; }
-                    // Resolve StaticResource markup extensions in text runs:
-                    // drop the markup (resource text is theme-owned and cannot
-                    // be concatenated into a compile-time literal here).
-                    { auto sr = text_val.find("{StaticResource ");
-                      if (sr != std::string::npos) {
-                          auto end = text_val.find('}', sr);
-                          if (end != std::string::npos)
-                              text_val.erase(sr, end - sr + 1);
-                      } }
+
+                    // Check if text_val matches a state variable
+                    std::string sv_match;
+                    for (auto const& sv : view.state_vars) {
+                        if (sv.name == text_val || sv.name == pv) { sv_match = sv.name; break; }
+                    }
+
                     out << indent << "{\n";
                     out << indent << "    auto _run = winrt::Microsoft::UI::Xaml::Documents::Run();\n";
-                    out << indent << "    _run.Text(L\"" << escape_wstr(text_val) << "\");\n";
+                    if (!sv_match.empty()) {
+                        out << indent << "    _run.Text(this->" << sv_match << ");\n";
+                    } else if (text_val == "AppTitleName" || text_val.find("{StaticResource ") != std::string::npos || text_val.find("{ThemeResource ") != std::string::npos) {
+                        std::string rk = text_val;
+                        if (rk.find("{StaticResource ") != std::string::npos) {
+                            auto sr = rk.find("{StaticResource ");
+                            auto end = rk.find('}', sr);
+                            if (end != std::string::npos) rk = rk.substr(sr + 16, end - (sr + 16));
+                        } else if (rk.find("{ThemeResource ") != std::string::npos) {
+                            auto sr = rk.find("{ThemeResource ");
+                            auto end = rk.find('}', sr);
+                            if (end != std::string::npos) rk = rk.substr(sr + 15, end - (sr + 15));
+                        }
+                        while (!rk.empty() && rk.front() == ' ') rk.erase(0, 1);
+                        while (!rk.empty() && rk.back() == ' ') rk.pop_back();
+                        out << indent << "    _run.Text(winrt::unbox_value_or<winrt::hstring>(theme_lookup_th(L\"" << escape_wstr(rk) << "\", winrt::box_value(winrt::hstring(L\"" << escape_wstr(rk) << "\"))), L\"" << escape_wstr(rk) << "\"));\n";
+                    } else {
+                        out << indent << "    _run.Text(L\"" << escape_wstr(text_val) << "\");\n";
+                    }
                     out << indent << "    inspectable_append(" << var_name << ".Inlines(), _run);\n";
                     out << indent << "}\n";
                     continue;
@@ -4343,7 +5258,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                     while (collapsed.size() >= 2 && collapsed.back() == ')' && collapsed[collapsed.size()-2] == '(')
                         collapsed.pop_back(), collapsed.pop_back();
                 // Numeric DPs: quoted numbers emit bare, quoted non-numbers ("Auto") are skipped
-                if (is_numeric_dp(pk))
+                if (is_numeric_prop(n.control, pk))
                 {
                     if (is_number_text(collapsed)) val = collapsed;
                     else continue;
@@ -4460,7 +5375,37 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                                 val = "parse_svg_path(\"" + collapsed + "\")";
                             }
                             else
-                                val = wstr_literal(collapsed);
+                            {
+                                std::string res_k = collapsed;
+                                bool is_res = false;
+                                if (res_k == "AppTitleName") {
+                                    is_res = true;
+                                } else if (res_k.rfind("{StaticResource ", 0) == 0 || res_k.rfind("{ThemeResource ", 0) == 0) {
+                                    auto sp = res_k.find(' ');
+                                    res_k = res_k.substr(sp + 1);
+                                    if (!res_k.empty() && res_k.back() == '}') res_k.pop_back();
+                                    while (!res_k.empty() && res_k.front() == ' ') res_k.erase(0, 1);
+                                    while (!res_k.empty() && res_k.back() == ' ') res_k.pop_back();
+                                    is_res = true;
+                                }
+                                if (is_res)
+                                {
+                                    std::string pk_lo_res = pk;
+                                    for (auto& c : pk_lo_res) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                                    if (is_brush_property(pk))
+                                        val = "theme_brush_th(L\"" + escape_wstr(res_k) + "\")";
+                                    else if (pk_lo_res == "text")
+                                        val = "winrt::unbox_value_or<winrt::hstring>(theme_lookup_th(L\"" + escape_wstr(res_k) + "\", winrt::box_value(winrt::hstring(L\"" + escape_wstr(res_k) + "\"))), L\"" + escape_wstr(res_k) + "\")";
+                                    else if (pk_lo_res == "data")
+                                        val = "geometry_lookup_th(L\"" + escape_wstr(res_k) + "\")";
+                                    else if (pk_lo_res == "source" || pk_lo_res == "imagesource" || pk_lo_res == "iconsource")
+                                        val = "image_source_lookup_th(L\"" + escape_wstr(res_k) + "\")";
+                                    else
+                                        val = "theme_lookup_th(L\"" + escape_wstr(res_k) + "\", winrt::box_value(winrt::hstring(L\"" + escape_wstr(res_k) + "\")))";
+                                }
+                                else
+                                    val = wstr_literal(collapsed);
+                            }
                         }
                     }
                 }
@@ -4485,10 +5430,10 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                 // Emit the resolved value (enum or string) — box for IInspectable props
                 if (!val.empty())
                 {
-                    std::string set_val = fix_control_enum(n.control, pk, box_if_inspectable(n.control, pk, val));
+                    std::string set_val = resolve_typed_value(n.control, pk, box_if_inspectable(n.control, pk, val), &g_type_prop_kinds, &g_enum_info);
                     out << indent << var_name << "." << prop << "(" << set_val << ");\n";
                     if (!interp.empty())
-                        out << indent << "m_bindings.push_back([this, " << var_name << "]() mutable { " << var_name << "." << prop << "(" << set_val << "); });\n";
+                        out << indent << "m_bindings.push_back([this, " << cap_var << "]() mutable { " << var_name << "." << prop << "(" << set_val << "); });\n";
                 }
             }
             else if (!val.empty() && (std::isdigit(static_cast<unsigned char>(val.front())) || val.front() == '-'))
@@ -4563,7 +5508,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                     if (pure_numeric)
                     {
                         // Numeric DPs must receive a bare number (box_value would give IReference)
-                        if (is_numeric_dp(pk))
+                        if (is_numeric_prop(n.control, pk))
                             out << indent << var_name << "." << prop << "(" << val << ")";
                         else
                             out << indent << var_name << "." << prop << "(" << box_if_inspectable(n.control, pk, val) << ")";
@@ -4571,7 +5516,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                     else if (is_number_text(val))
                         // "-(50)"-style signed/parenthesized numeric expression
                         out << indent << var_name << "." << prop << "(" << val << ")";
-                    else if (is_numeric_dp(pk))
+                    else if (is_numeric_prop(n.control, pk))
                         // numeric DP fed a non-numeric string (e.g. Width="Auto") — skip
                         out << indent << "// " << var_name << "." << prop << "(L\"...\") skipped: non-numeric value on numeric property\n";
                     else
@@ -4670,9 +5615,15 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                             out << indent << var_name << "." << prop << "(" << val << ");\n";
                     }
                 } else {
-                    out << indent << var_name << "." << prop << "(" << val << ");\n";
+                    if (prop == "SelectedIndex" || prop == "selectedindex")
+                        out << indent << "try { " << var_name << "." << prop << "(" << val << "); } catch (...) {}\n";
+                    else if (prop == "TargetInkCanvas") {
+                        out << indent << "if (" << val << ".get_abi()) { " << var_name << "." << prop << "(" << val << "); }\n";
+                        out << indent << "m_bindings.push_back([this, " << cap_var << "]() mutable { if (" << val << ".get_abi()) " << var_name << "." << prop << "(" << val << "); });\n";
+                    } else
+                        out << indent << var_name << "." << prop << "(" << val << ");\n";
                     if (val.find('?') != std::string::npos || val.find("L\"") != std::string::npos)
-                        out << indent << "m_bindings.push_back([this, " << var_name << "]() mutable { " << var_name << "." << prop << "(" << val << "); });\n";
+                        out << indent << "m_bindings.push_back([this, " << cap_var << "]() mutable { " << var_name << "." << prop << "(" << val << "); });\n";
                 }
             }
             else if (!val.empty())
@@ -4901,8 +5852,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                             for (auto& c : pk_lo_bind) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
                             bool is_brush_prop_b = is_brush_property(pk);
                             // Detect the leading variable of a chain like name.Value()
-                            bool skip_binding = (pk_lo_bind == "visible" || pk_lo_bind == "visibility"
-                                || pk_lo_bind == "target" || pk_lo_bind == "child"
+                            bool skip_binding = (pk_lo_bind == "target" || pk_lo_bind == "child"
                                 || is_brush_prop_b);
                             bool is_source_ctrl = (pk_lo_bind == "source" || pk_lo_bind == "urisource");
                             if (is_source_ctrl) skip_binding = true; // hstring state vars can't feed ImageSource/Uri
@@ -4925,7 +5875,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                                 for (auto& c : lo_t) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
                                 bool numeric = (lo_t.find("double") != std::string::npos || lo_t.find("int") != std::string::npos
                                     || lo_t.find("float") != std::string::npos || lo_t.find("bool") != std::string::npos
-                                    || lo_t.find("number") != std::string::npos);
+                                    || lo_t == "number");
                                 if (val == sv.name || val == sv.name + ".Value()" || val == sv.name + ".Value"
                                     || val == sv.name + ".value" || val == sv.name + ".Text" || val == sv.name + ".text")
                                 {
@@ -5027,11 +5977,13 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                                     bval = "corner_from_name(" + val + ")";
                                 else if (pk_lo_bind2 == "style")
                                     bval = "style_from_name(" + val + ")";
+                                else if (pk_lo_bind2 == "visible" || pk_lo_bind2 == "visibility")
+                                    bval = "make_visibility(" + val + ")";
                                 else if (pk_lo_bind2.find("alignment") != std::string::npos && pk_lo_bind2.find("horizontal") != std::string::npos)
                                     bval = "halignment_from_name(" + val + ")";
                                 else if (pk_lo_bind2.find("alignment") != std::string::npos)
                                     bval = "valignment_from_name(" + val + ")";
-                                if (is_numeric_dp(pk))
+                                if (is_numeric_prop(n.control, pk) && bval.find(".Value()") == std::string::npos)
                                 {
                                     // Numeric DP fed a string state var: no C++ conversion exists.
                                     out << indent << "// " << var_name << "." << prop << " skipped: non-numeric state var on numeric property\n";
@@ -5040,7 +5992,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                                 else
                                 {
                                     out << indent << var_name << "." << prop << "(" << bval << ");\n";
-                                    out << indent << "m_bindings.push_back([this, " << var_name << "]() mutable { " << var_name << "." << prop << "(" << bval << "); });\n";
+                                    out << indent << "m_bindings.push_back([this, " << cap_var << "]() mutable { " << var_name << "." << prop << "(" << bval << "); });\n";
                                 }
                             }
                         }
@@ -5070,7 +6022,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                                 src_val = src_val.substr(1, src_val.size() - 2);
                             for (auto& c : src_val) if (c == '\\') c = '/';
                             if (!src_val.empty() && src_val[0] == '/')
-                                src_val = "ms-appx:" + src_val;
+                                src_val = "ms-appx:///" + src_val.substr(1);
                             else if (src_val.rfind("Assets/", 0) == 0)
                                 src_val = "ms-appx:///" + src_val;
                             out << indent << var_name << ".Source(winrt::Microsoft::UI::Xaml::Media::BitmapImage(winrt::Windows::Foundation::Uri(L\"" << src_val << "\")));\n";
@@ -5176,7 +6128,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                                             // interpolated string cannot provide.
                                             std::string pk_lo_sv3 = pk;
                                             for (auto& c : pk_lo_sv3) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                                            bool skip_numeric_sv3 = is_numeric_dp(pk);
+                                            bool skip_numeric_sv3 = is_numeric_prop(n.control, pk);
                                             if (pk_lo_sv3 == "borderthickness" || pk_lo_sv3 == "margin" || pk_lo_sv3 == "padding")
                                                 interp = "thickness_from_name(" + interp + ")";
                                             else if (pk_lo_sv3 == "cornerradius")
@@ -5194,14 +6146,42 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                                             }
                                             else
                                             {
-                                            std::string set_val = fix_control_enum(n.control, pk, box_if_inspectable(n.control, pk, interp));
+                                            std::string set_val = resolve_typed_value(n.control, pk, box_if_inspectable(n.control, pk, interp), &g_type_prop_kinds, &g_enum_info);
                                             out << indent << var_name << "." << prop << "(" << set_val << ");\n";
-                                            out << indent << "m_bindings.push_back([this, " << var_name << "]() mutable { " << var_name << "." << prop << "(" << set_val << "); });\n";
+                                            out << indent << "m_bindings.push_back([this, " << cap_var << "]() mutable { " << var_name << "." << prop << "(" << set_val << "); });\n";
                                             }
                                         }
                                         else
                                         {
-                                            val = wstr_literal(collapsed);
+                                            std::string res_k = collapsed;
+                                            bool is_res = false;
+                                            if (res_k == "AppTitleName") {
+                                                is_res = true;
+                                            } else if (res_k.rfind("{StaticResource ", 0) == 0 || res_k.rfind("{ThemeResource ", 0) == 0) {
+                                                auto sp = res_k.find(' ');
+                                                res_k = res_k.substr(sp + 1);
+                                                if (!res_k.empty() && res_k.back() == '}') res_k.pop_back();
+                                                while (!res_k.empty() && res_k.front() == ' ') res_k.erase(0, 1);
+                                                while (!res_k.empty() && res_k.back() == ' ') res_k.pop_back();
+                                                is_res = true;
+                                            }
+                                            if (is_res)
+                                            {
+                                                std::string pk_lo_res = pk;
+                                                for (auto& c : pk_lo_res) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                                                if (is_brush_property(pk))
+                                                    val = "theme_brush_th(L\"" + escape_wstr(res_k) + "\")";
+                                                else if (pk_lo_res == "text")
+                                                    val = "winrt::unbox_value_or<winrt::hstring>(theme_lookup_th(L\"" + escape_wstr(res_k) + "\", winrt::box_value(winrt::hstring(L\"" + escape_wstr(res_k) + "\"))), L\"" + escape_wstr(res_k) + "\")";
+                                                else if (pk_lo_res == "data")
+                                                    val = "geometry_lookup_th(L\"" + escape_wstr(res_k) + "\")";
+                                                else if (pk_lo_res == "source" || pk_lo_res == "imagesource" || pk_lo_res == "iconsource")
+                                                    val = "image_source_lookup_th(L\"" + escape_wstr(res_k) + "\")";
+                                                else
+                                                    val = "theme_lookup_th(L\"" + escape_wstr(res_k) + "\", winrt::box_value(winrt::hstring(L\"" + escape_wstr(res_k) + "\")))";
+                                            }
+                                            else
+                                                val = wstr_literal(collapsed);
                                             out << indent << var_name << "." << prop << "(" << val << ");\n";
                                         }
                                     }
@@ -5248,19 +6228,15 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                     if (!ev_prop_name.empty()) ev_prop_name[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(ev_prop_name[0])));
                 }
                 std::string evt_prop = ctrl_prop(n.control.c_str(), ev_prop_name);
+                std::string handler_call = cb_name;
+                if (handler_call.starts_with("self.")) handler_call = handler_call.substr(5);
                 if (g_view_type_names.count(n.control) && n.control != class_name)
                 {
-                    // Sibling app view: not a WinRT control - no add_<E> on the
-                    // projection. Emit the forwarding call: the component view
-                    // class exposes add_<E> (driver-aggregated) that stores the
-                    // handler and the component fires it from its inner event.
-                    std::string ev_lo = ev_prop_name;
-                    for (auto& c : ev_lo) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
                     out << indent << var_name << ".add_" << ev_prop_name
-                        << "([this](auto const& s, auto const& e) { _fire_" << ev_lo << "(s, e); });\n";
+                        << "([this](auto const& s, auto const& e) { " << (handler_call.empty() ? "" : (handler_call + "(s, e); ")) << "});\n";
                 }
                 else
-                    out << indent << var_name << ".add_" << evt_prop << "([this](auto const& s, auto const& e) { " << cb_name << "(s, e); });\n";
+                    out << indent << var_name << ".add_" << evt_prop << "([this](auto const& s, auto const& e) { " << (handler_call.empty() ? "" : (handler_call + "(s, e); ")) << "});\n";
             }
         }
         // Emit action closures (skip raw(s,e) no-ops, deduplicate)
@@ -5414,8 +6390,49 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
             // above — emitting them again as property strings is invalid (the
             // setter takes DataTemplate, and the JSON corrupts the literal).
             if (is_template_payload(rk, rv)) continue;
-            // Skip ALL raw attrs on component types (user-defined XAML dependency properties)
-            if (is_app_or_unknown_type(n.control)) continue;
+            // {TemplateBinding X} — a lowered ControlTemplate: the view class
+            // IS the templated control, so read the HOST's own property X
+            // (kept reactive through m_bindings) instead of boxing the markup
+            // as a literal (CornerRadius{TemplateBinding ...} never compiled).
+            // TB targets that match a host state var are skipped: the state
+            // var's sanitized type (string) can't be proven against the
+            // element's setter, and a mismatch breaks the module.
+            if (rv.rfind("{TemplateBinding ", 0) == 0) {
+                std::string tb = rv.substr(17);
+                if (!tb.empty() && tb.back() == '}') tb.pop_back();
+                while (!tb.empty() && (tb.front() == ' ' || tb.front() == '\t')) tb.erase(tb.begin());
+                while (!tb.empty() && (tb.back() == ' ' || tb.back() == '\t')) tb.pop_back();
+                std::string tb_lo = tb;
+                for (auto& ch : tb_lo) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                bool host_state = false;
+                for (auto const& sv : view.state_vars) {
+                    std::string nlo = sv.name;
+                    for (auto& ch : nlo) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                    if (nlo == tb_lo) { host_state = true; break; }
+                }
+                if (!tb.empty() && !host_state) {
+                    std::string tb_setter = raw_prop_name(rk);
+                    out << indent << var_name << "." << tb_setter << "(this->" << tb << "());\n";
+                    out << indent << "m_bindings.push_back([this, __tbv = " << var_name << "]() mutable { __tbv."
+                        << tb_setter << "(this->" << tb << "()); });\n";
+                }
+                continue;
+            }
+            // Resource definitions (<DataTemplate x:Key=...>) misattached to a
+            // node by the converter are NOT property values. Emitting them as
+            // setters produced bogus calls like
+            //   StackLayout.FlowItemTemplate(data_template_th(L"<brush key>"))
+            // where the "key" was the first ThemeResource *inside* the template
+            // XML. Real registration happens in the resources modules.
+            {
+                std::string dv = rv;
+                if (!dv.empty() && dv.front() == '"') dv = dv.substr(1);
+                std::string dl = dv;
+                for (auto& c : dl) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (dl.rfind("<datatemplate", 0) == 0) continue;
+            }
+            // Skip ALL raw attrs on component types (except registered app views)
+            if (is_app_or_unknown_type(n.control) && !g_view_type_names.count(n.control) && n.control != "SettingsCard" && n.control != "SettingsExpander") continue;
             // TeachingTip.Target takes a FrameworkElement (x:Name ref) — drop plain-string attrs
             {
                 std::string lo_ctrl_tt = n.control;
@@ -5428,18 +6445,18 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
             {
                 std::string rk_lo_skip = rk;
                 for (auto& c : rk_lo_skip) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                if (rk_lo_skip == "resources" || rk_lo_skip == "visualstategroups"
-                    || rk_lo_skip == "rowdefinitions" || rk_lo_skip == "columndefinitions"
+                if (rk_lo_skip == "rowdefinitions" || rk_lo_skip == "columndefinitions" || rk_lo_skip == "grid.rowdefinitions" || rk_lo_skip == "grid.columndefinitions"
                     || rk_lo_skip == "children" || rk_lo_skip == "inlines"
                     || rk_lo_skip == "menuitems" || rk_lo_skip == "tabitems"
                     || rk_lo_skip == "primarycommands" || rk_lo_skip == "secondarycommands"
                     || rk_lo_skip == "flyout" || rk_lo_skip == "styles"
-                    || rk_lo_skip == "templates" || rk_lo_skip == "exittransition"
-                    || rk_lo_skip == "opentransition" || rk_lo_skip == "ticks"
+                    || rk_lo_skip == "templates"                    || rk_lo_skip == "exittransition" || rk_lo_skip == "opentransition" || rk_lo_skip == "ticks"
+                    || rk_lo_skip == "backgroundtransition"
                     || rk_lo_skip == "linebreak" || rk_lo_skip == "containercontentchanging"
                     || rk_lo_skip == "choosingitemcontainer" || rk_lo_skip == "choosingsemanticzoomstate"
                     || rk_lo_skip == "container" || rk_lo_skip == "overrideuicommand"
-                    || rk_lo_skip == "opacitymask" || rk_lo_skip == "visualstategroups") continue;
+                    || rk_lo_skip == "opacitymask"
+                    || rk_lo_skip == "prefix") continue;
             }
             std::string rval = rv;
             // Collapse embedded newlines in raw attr values
@@ -5571,11 +6588,14 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                         else
                             rval = wstr_literal(collapsed);
                     }
+                    bool is_xml_fragment = (!collapsed.empty() && collapsed.front() == '<') ||
+                        (!rval.empty() && rval.front() == '<') ||
+                        (rval.size() > 2 && rval[0] == 'L' && rval[1] == '"' && rval[2] == '<');
                     // {ThemeResource Key} -> guarded resource lookup with a
                     // codegen-baked literal fallback. Handles both the raw
                     // markup form (special keys kept rval = collapsed) and the
                     // quoted form (rval = L"{ThemeResource ...}").
-                    if (rval.find("ThemeResource ") != std::string::npos)
+                    if (!is_xml_fragment && rval.find("ThemeResource ") != std::string::npos)
                     {
                         std::string tr = rval;
                         if (tr.size() > 2 && tr[0] == 'L' && tr[1] == '"') tr = tr.substr(2, tr.size() - 3);
@@ -5591,7 +6611,12 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                             std::string fallback;
                             if (rk_lo_tr == "background" || rk_lo_tr == "foreground"
                                 || rk_lo_tr == "fill" || rk_lo_tr == "stroke"
-                                || rk_lo_tr == "borderbrush")
+                                || rk_lo_tr == "borderbrush"
+                                || rk_lo_tr == "rowbackground" || rk_lo_tr == "alternatingrowbackground"
+                                || rk_lo_tr == "axislinebrush" || rk_lo_tr == "tickbrush"
+                                || rk_lo_tr == "gridlinemajorbrush" || rk_lo_tr == "gridlineminorbrush"
+                                || rk_lo_tr == "datamarkerbrush" || rk_lo_tr == "databrush"
+                                || rk_lo_tr == "markerbrush" || rk_lo_tr == "legendbrush")
                             {
                                 kind = "brush";
                                 fallback = "winrt::IInspectable{nullptr}";
@@ -5631,6 +6656,8 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                                 rval = "theme_brush_th(L\"" + res_key + "\")";
                             else if (kind == "thickness")
                                 rval = fallback;
+                            else if (rk_lo_tr == "template")
+                                rval = "control_template_th(L\"" + res_key + "\")";
                             else if (rk_lo_tr == "itemtemplate" || rk_lo_tr == "contenttemplate"
                                 || rk_lo_tr == "headertemplate" || rk_lo_tr == "footertemplate"
                                 || rk_lo_tr.ends_with("template"))
@@ -5642,7 +6669,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                         }
                     }
                     // {StaticResource Key} -> same resolution order as ThemeResource
-                    if (rval.find("StaticResource ") != std::string::npos)
+                    if (!is_xml_fragment && rval.find("StaticResource ") != std::string::npos)
                     {
                         std::string tr = rval;
                         if (tr.size() > 2 && tr[0] == 'L' && tr[1] == '"') tr = tr.substr(2, tr.size() - 3);
@@ -5656,13 +6683,20 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                             for (auto& c : rk_lo_sr) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
                             if (rk_lo_sr == "style")
                                 rval = "style_lookup_th(L\"" + res_key + "\")";
+                            else if (rk_lo_sr == "template")
+                                rval = "control_template_th(L\"" + res_key + "\")";
                             else if (rk_lo_sr == "itemtemplate" || rk_lo_sr == "contenttemplate"
                                 || rk_lo_sr == "headertemplate" || rk_lo_sr == "footertemplate"
                                 || rk_lo_sr.ends_with("template"))
                                 rval = "data_template_th(L\"" + res_key + "\")";
                             else if (rk_lo_sr == "background" || rk_lo_sr == "foreground"
                                 || rk_lo_sr == "fill" || rk_lo_sr == "stroke"
-                                || rk_lo_sr == "borderbrush")
+                                || rk_lo_sr == "borderbrush"
+                                || rk_lo_sr == "rowbackground" || rk_lo_sr == "alternatingrowbackground"
+                                || rk_lo_sr == "axislinebrush" || rk_lo_sr == "tickbrush"
+                                || rk_lo_sr == "gridlinemajorbrush" || rk_lo_sr == "gridlineminorbrush"
+                                || rk_lo_sr == "datamarkerbrush" || rk_lo_sr == "databrush"
+                                || rk_lo_sr == "markerbrush" || rk_lo_sr == "legendbrush")
                                 rval = "theme_brush_th(L\"" + res_key + "\")";
                             else if (rk_lo_sr == "padding" || rk_lo_sr == "margin"
                                 || rk_lo_sr == "borderthickness")
@@ -5744,8 +6778,16 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                     || lower_key == "copy" || lower_key == "paste" || lower_key == "cut"
                     || lower_key == "delete" || lower_key == "selectall")
                 {
-                    // Check if handler value looks like a function name (no spaces, no angle brackets)
-                    if (!evt_handler.empty() && evt_handler.find(' ') == std::string::npos
+                    // Check if handler value looks like a function name (no spaces, no angle brackets, not a boolean/number literal or known property)
+                    bool is_bool_or_num = (evt_handler == "True" || evt_handler == "true"
+                        || evt_handler == "False" || evt_handler == "false"
+                        || evt_handler == "nullptr"
+                        || (!evt_handler.empty() && (std::isdigit(static_cast<unsigned char>(evt_handler.front())) || evt_handler.front() == '-')));
+                    bool is_known_prop_not_evt = (lower_key == "selectsoninvoked" || lower_key == "behavioroninvoked"
+                        || lower_key == "isselected" || lower_key == "isitemclickenabled"
+                        || lower_key == "ischecked" || lower_key == "isenabled");
+                    if (!is_bool_or_num && !is_known_prop_not_evt
+                        && !evt_handler.empty() && evt_handler.find(' ') == std::string::npos
                         && evt_handler.find('<') == std::string::npos
                         && evt_handler.find('{') == std::string::npos)
                     {
@@ -5762,7 +6804,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                             if (!ev_prop_name2.empty()) ev_prop_name2[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(ev_prop_name2[0])));
                         }
                         std::string evt_prop = ctrl_prop(n.control.c_str(), ev_prop_name2);
-                        if (lower_key.find("panetoggle") != std::string::npos || lower_key == "panetogglerequested")
+                        if (lower_key.find("panetoggle") != std::string::npos || lower_key == "panetogglerequested" || lower_key == "viewchanging" || lower_key == "viewchanged")
                         {
                             out << indent << var_name << ".add_" << evt_prop << "([this](auto const& s, auto const& e) { " << cb_name << "(s, e); });\n";
                         }
@@ -5788,11 +6830,88 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                 || (rval.find("theme_brush_th(") != std::string::npos)
                 || (rval.find("theme_lookup_th(") != std::string::npos)
                 || (rval.find("style_lookup_th(") != std::string::npos)
+                || (rval.find("control_template_th(") != std::string::npos)
+                || (rval.find("data_template_th(") != std::string::npos)
                 || (rval.find("make_solid_brush(") != std::string::npos);
             // XAML-specific: colons (x:Name), attached props (Grid.Row), XAML markup in values
             bool is_xaml_specific = (rk.find(':') != std::string::npos) || (rk.find('.') != std::string::npos);
-            bool has_xaml_markup = !is_cxx_val && ((rval.find('<') != std::string::npos) || (rval.find('{') != std::string::npos) || (rval.find("x:Bind") != std::string::npos));
-            if (is_xaml_specific || has_xaml_markup)
+            bool is_xml_fragment_val = (!rval.empty() && rval.front() == '<') ||
+                (rval.size() > 2 && rval[0] == 'L' && rval[1] == '"' && rval[2] == '<');
+            bool has_xaml_markup = is_xml_fragment_val || (!is_cxx_val && ((rval.find('<') != std::string::npos) || (rval.find('{') != std::string::npos) || (rval.find("x:Bind") != std::string::npos)));
+            if (rk == "Slot")
+                continue;
+            if (rk == "Xaml" || rk == "CSharp" || rk == "Code")
+            {
+                std::string raw_val = rv;
+                if (raw_val.size() >= 2 && raw_val.front() == '"' && raw_val.back() == '"') raw_val = raw_val.substr(1, raw_val.size() - 2);
+                {
+                    std::string unesc;
+                    unesc.reserve(raw_val.size());
+                    for (size_t ui = 0; ui < raw_val.size(); ++ui) {
+                        if (raw_val[ui] == '\\' && ui + 1 < raw_val.size()) {
+                            char nx = raw_val[ui + 1];
+                            if (nx == 'n') { unesc += '\n'; ++ui; continue; }
+                            if (nx == 'r') { unesc += '\r'; ++ui; continue; }
+                            if (nx == 't') { unesc += '\t'; ++ui; continue; }
+                            if (nx == '"') { unesc += '"'; ++ui; continue; }
+                        }
+                        unesc += raw_val[ui];
+                    }
+                    raw_val = unesc;
+                }
+                if (raw_val.starts_with("{x:Bind ") || raw_val.starts_with("{Binding "))
+                {
+                    std::string expr = raw_val;
+                    if (!expr.empty() && expr.front() == '{') expr = expr.substr(1);
+                    if (!expr.empty() && expr.back() == '}') expr.pop_back();
+                    auto mode_pos = expr.find(", Mode=");
+                    if (mode_pos != std::string::npos) expr = expr.substr(0, mode_pos);
+                    if (expr.size() > 6 && expr.substr(0, 6) == "x:Bind") expr = expr.substr(6);
+                    while (!expr.empty() && expr.front() == ' ') expr = expr.substr(1);
+                    std::string cpp_val = resolve_binding_to_cpp(expr, view.state_vars);
+                    if (!cpp_val.empty())
+                    {
+                        out << indent << var_name << "." << rk << "(" << cpp_val << ");\n";
+                        if (cpp_val.find('.') == std::string::npos)
+                            out << indent << "m_bindings.push_back([this, " << cap_var << "]() mutable { " << var_name << "." << rk << "(" << cpp_val << "); });\n";
+                    }
+                }
+                else
+                {
+                    out << indent << var_name << "." << rk << "(winrt::hstring(L\"" << escape_wstr(raw_val) << "\"));\n";
+                }
+                continue;
+            }
+            std::string lo_ctrl = n.control;
+            for (auto& c : lo_ctrl) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            std::string lo_rk = rk;
+            for (auto& c : lo_rk) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (lo_ctrl == "titlebar" && lo_rk == "iconsource")
+            {
+                std::string icon_path = rv;
+                auto p1 = icon_path.find("ImageSource=\"");
+                if (p1 != std::string::npos) {
+                    p1 += 13;
+                    auto p2 = icon_path.find('"', p1);
+                    if (p2 != std::string::npos) icon_path = icon_path.substr(p1, p2 - p1);
+                }
+                for (auto& c : icon_path) if (c == '\\') c = '/';
+                if (!icon_path.empty() && icon_path[0] == '/') icon_path = "ms-appx:///" + icon_path.substr(1);
+                else if (icon_path.rfind("Assets/", 0) == 0) icon_path = "ms-appx:///" + icon_path;
+                out << indent << "{ auto __iis = winrt::Microsoft::UI::Xaml::Controls::ImageIconSource(); __iis.ImageSource(winrt::Microsoft::UI::Xaml::Media::Imaging::BitmapImage(winrt::Windows::Foundation::Uri(L\"" << icon_path << "\"))); " << var_name << ".IconSource(winrt::Microsoft::UI::Xaml::Controls::IconSource::wrap_borrowed(__iis.m_unknown.get())); }\n";
+                continue;
+            }
+            if (lo_rk == "headericon")
+            {
+                out << indent << var_name << ".HeaderIcon(winrt::hstring(L\"" << escape_wstr(rv) << "\"));\n";
+                continue;
+            }
+            if (lo_rk == "actionicon")
+            {
+                out << indent << var_name << ".ActionIcon(winrt::hstring(L\"" << escape_wstr(rv) << "\"));\n";
+                continue;
+            }
+            if (is_xaml_specific || has_xaml_markup || rk == "Resources" || rk == "resources" || rk == "VisualStateGroups" || rk == "visualstategroups")
             {
                 // DataTemplate XAML strings: skipped (handled by factory approach)
                 if (rval.find("DataTemplate") != std::string::npos
@@ -5846,6 +6965,230 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                             && !cpp_val.empty())
                             cpp_val = "winrt::Microsoft::UI::Xaml::Thickness{" + cpp_val + ", " + cpp_val + ", " + cpp_val + ", " + cpp_val + "}";
                         out << indent << var_name << "." << rk << "(" << cpp_val << ");\n";
+                        out << indent << "m_bindings.push_back([this, " << cap_var << "]() mutable { " << var_name << "." << rk << "(" << cpp_val << "); });\n";
+                    }
+                }
+                else if (rk == "Resources" || rk == "resources")
+                {
+                    std::string raw_val = normalize_payload_value(rval);
+                    out << indent << "apply_xaml_resources(winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(" << var_name << ".m_unknown.get()), L\"" << escape_wstr(raw_val) << "\");\n";
+                }
+                else if (rk == "VisualStateGroups" || rk == "visualstategroups")
+                {
+                    std::string raw_val = normalize_payload_value(rval);
+                    out << indent << "apply_visual_state_groups(winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(" << var_name << ".m_unknown.get()), L\"" << escape_wstr(raw_val) << "\");\n";
+                }
+                else if (rk == "Template" || rk == "ControlTemplate" || rk == "template")
+                {
+                    std::string raw_val = normalize_payload_value(rval);
+                    if (raw_val.find("StaticResource ") != std::string::npos || raw_val.find("ThemeResource ") != std::string::npos)
+                    {
+                        auto ks = raw_val.find("Resource ") + 9;
+                        auto ke = raw_val.find('}', ks);
+                        if (ke != std::string::npos)
+                        {
+                            std::string res_key = raw_val.substr(ks, ke - ks);
+                            out << indent << var_name << ".Template(control_template_th(L\"" << res_key << "\"));\n";
+                        }
+                    }
+                    else if (!raw_val.empty() && raw_val[0] == '<')
+                    {
+                        out << indent << var_name << ".Template(load_control_template(L\"" << escape_wstr(raw_val) << "\"));\n";
+                    }
+                }
+                else if (rk.rfind("AutomationProperties.", 0) == 0)
+                {
+                    std::string sub = rk.substr(21);
+                    std::string raw_val = rval;
+                    if (raw_val.size() > 2 && raw_val[0] == 'L' && raw_val[1] == '"') raw_val = raw_val.substr(2, raw_val.size() - 3);
+                    else if (raw_val.size() >= 2 && raw_val.front() == '"' && raw_val.back() == '"') raw_val = raw_val.substr(1, raw_val.size() - 2);
+                    std::string interp = try_interpolate_string(raw_val, view.state_vars);
+                    if (sub == "Name")
+                    {
+                        if (!interp.empty())
+                            out << indent << "AutomationProperties::SetName(" << var_name << ", " << interp << ");\n";
+                        else if (raw_val.starts_with("{x:Bind ") || raw_val.starts_with("{Binding "))
+                            out << indent << "// " << var_name << " AutomationProperties.Name binding skipped\n";
+                        else
+                            out << indent << "AutomationProperties::SetName(" << var_name << ", L\"" << escape_wstr(raw_val) << "\");\n";
+                    }
+                    else if (sub == "AutomationId")
+                    {
+                        out << indent << "AutomationProperties::SetAutomationId(" << var_name << ", L\"" << escape_wstr(raw_val) << "\");\n";
+                    }
+                    else if (sub == "HeadingLevel")
+                    {
+                        std::string hl = raw_val;
+                        if (hl == "1") hl = "Level1";
+                        else if (hl == "2") hl = "Level2";
+                        else if (hl == "3") hl = "Level3";
+                        else if (hl == "4") hl = "Level4";
+                        else if (hl == "5") hl = "Level5";
+                        else if (hl == "6") hl = "Level6";
+                        else if (hl == "7") hl = "Level7";
+                        else if (hl == "8") hl = "Level8";
+                        else if (hl == "9") hl = "Level9";
+                        else if (hl == "0") hl = "None";
+                        out << indent << "AutomationProperties::SetHeadingLevel(" << var_name << ", winrt::Microsoft::UI::Xaml::Automation::Peers::AutomationHeadingLevel::" << hl << ");\n";
+                    }
+                    else if (sub == "AccessibilityView")
+                    {
+                        out << indent << "AutomationProperties::SetAccessibilityView(" << var_name << ", winrt::Microsoft::UI::Xaml::Automation::Peers::AccessibilityView::" << raw_val << ");\n";
+                    }
+                    else if (sub == "HelpText")
+                    {
+                        if (!interp.empty())
+                            out << indent << "AutomationProperties::SetHelpText(" << var_name << ", " << interp << ");\n";
+                        else if (raw_val.starts_with("{x:Bind ") || raw_val.starts_with("{Binding "))
+                            out << indent << "// " << var_name << " AutomationProperties.HelpText binding skipped\n";
+                        else
+                            out << indent << "AutomationProperties::SetHelpText(" << var_name << ", L\"" << escape_wstr(raw_val) << "\");\n";
+                    }
+                    else if (sub == "LiveSetting")
+                    {
+                        out << indent << "AutomationProperties::SetLiveSetting(" << var_name << ", winrt::Microsoft::UI::Xaml::Automation::Peers::AutomationLiveSetting::" << raw_val << ");\n";
+                    }
+                    else if (sub == "AutomationControlType")
+                    {
+                        out << indent << "AutomationProperties::SetAutomationControlType(" << var_name << ", winrt::Microsoft::UI::Xaml::Automation::Peers::AutomationControlType::" << raw_val << ");\n";
+                    }
+                    else if (sub == "LandmarkType")
+                    {
+                        out << indent << "AutomationProperties::SetLandmarkType(" << var_name << ", winrt::Microsoft::UI::Xaml::Automation::Peers::AutomationLandmarkType::" << raw_val << ");\n";
+                    }
+                    else if (sub == "LocalizedControlType")
+                    {
+                        out << indent << "AutomationProperties::SetLocalizedControlType(" << var_name << ", L\"" << escape_wstr(raw_val) << "\");\n";
+                    }
+                    else if (sub == "LocalizedLandmarkType")
+                    {
+                        out << indent << "AutomationProperties::SetLocalizedLandmarkType(" << var_name << ", L\"" << escape_wstr(raw_val) << "\");\n";
+                    }
+                    else if (sub == "AcceleratorKey")
+                    {
+                        out << indent << "AutomationProperties::SetAcceleratorKey(" << var_name << ", L\"" << escape_wstr(raw_val) << "\");\n";
+                    }
+                    else if (sub == "FullDescription")
+                    {
+                        if (!interp.empty())
+                            out << indent << "AutomationProperties::SetFullDescription(" << var_name << ", " << interp << ");\n";
+                        else if (raw_val.starts_with("{x:Bind ") || raw_val.starts_with("{Binding "))
+                            out << indent << "// " << var_name << " AutomationProperties.FullDescription binding skipped\n";
+                        else
+                            out << indent << "AutomationProperties::SetFullDescription(" << var_name << ", L\"" << escape_wstr(raw_val) << "\");\n";
+                    }
+                    else if (sub == "SizeOfSet")
+                    {
+                        out << indent << "AutomationProperties::SetSizeOfSet(" << var_name << ", " << raw_val << ");\n";
+                    }
+                    else if (sub == "PositionInSet")
+                    {
+                        out << indent << "AutomationProperties::SetPositionInSet(" << var_name << ", " << raw_val << ");\n";
+                    }
+                    else if (sub == "LabeledBy")
+                    {
+                        std::string target;
+                        auto el_pos = raw_val.find("ElementName=");
+                        if (el_pos != std::string::npos)
+                        {
+                            target = raw_val.substr(el_pos + 12);
+                            auto end_pos = target.find_first_of(" }");
+                            if (end_pos != std::string::npos) target = target.substr(0, end_pos);
+                        }
+                        else if (raw_val.find("x:Bind ") != std::string::npos)
+                        {
+                            target = raw_val.substr(raw_val.find("x:Bind ") + 7);
+                            auto end_pos = target.find_first_of(" ,}");
+                            if (end_pos != std::string::npos) target = target.substr(0, end_pos);
+                        }
+                        if (!target.empty())
+                            out << indent << "_deferred_labeled_by.push_back({ winrt::Microsoft::UI::Xaml::DependencyObject::wrap_borrowed(" << var_name << ".m_unknown.get()), [this]() -> winrt::Microsoft::UI::Xaml::UIElement { return winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(" << target << ".m_unknown.get()); } });\n";
+                    }
+                }
+                else if (rk == "ToolTipService.ToolTip")
+                {
+                    std::string raw_val = rval;
+                    if (raw_val.size() > 2 && raw_val[0] == 'L' && raw_val[1] == '"') raw_val = raw_val.substr(2, raw_val.size() - 3);
+                    else if (raw_val.size() >= 2 && raw_val.front() == '"' && raw_val.back() == '"') raw_val = raw_val.substr(1, raw_val.size() - 2);
+                    std::string interp = try_interpolate_string(raw_val, view.state_vars);
+                    if (!interp.empty())
+                        out << indent << "ToolTipService::SetToolTip(" << var_name << ", winrt::box_value(" << interp << "));\n";
+                    else if (raw_val.starts_with("{x:Bind ") || raw_val.starts_with("{Binding "))
+                        out << indent << "// " << var_name << " ToolTipService.ToolTip binding skipped\n";
+                    else
+                        out << indent << "ToolTipService::SetToolTip(" << var_name << ", winrt::box_value(winrt::hstring(L\"" << escape_wstr(raw_val) << "\")));\n";
+                }
+                else if (rk.rfind("RelativePanel.", 0) == 0)
+                {
+                    std::string prop = rk.substr(14);
+                    std::string raw_val = rv;
+                    if (raw_val.size() >= 2 && raw_val.front() == '"' && raw_val.back() == '"') raw_val = raw_val.substr(1, raw_val.size() - 2);
+                    if (prop.find("WithPanel") != std::string::npos)
+                    {
+                        bool b = (raw_val == "True" || raw_val == "true" || raw_val == "1");
+                        out << indent << "winrt::Microsoft::UI::Xaml::Controls::RelativePanel::Set" << prop << "(" << var_name << ", " << (b ? "true" : "false") << ");\n";
+                    }
+                    else if (named_elements.count(raw_val))
+                    {
+                        out << indent << "_deferred_relative_panel.push_back([this, " << var_name << "]() { if (" << var_name << ".m_unknown.get() && " << raw_val << ".m_unknown.get()) winrt::Microsoft::UI::Xaml::Controls::RelativePanel::Set" << prop << "(winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(" << var_name << ".m_unknown.get()), winrt::IInspectable(" << raw_val << ".addref_borrowed())); });\n";
+                    }
+                }
+                else if (rk == "Header")
+                {
+                    auto t1 = rval.find("Text=\\\"");
+                    if (t1 != std::string::npos)
+                    {
+                        t1 += 7;
+                        auto t2 = rval.find("\\\"", t1);
+                        if (t2 != std::string::npos)
+                        {
+                            std::string hdr_txt = rval.substr(t1, t2 - t1);
+                            out << indent << var_name << ".Header(winrt::box_value(winrt::hstring(L\"" << escape_wstr(hdr_txt) << "\")));\n";
+                        }
+                    }
+                    else
+                    {
+                        t1 = rval.find("Text=\"");
+                        if (t1 != std::string::npos)
+                        {
+                            t1 += 6;
+                            auto t2 = rval.find('"', t1);
+                            if (t2 != std::string::npos)
+                            {
+                                std::string hdr_txt = rval.substr(t1, t2 - t1);
+                                out << indent << var_name << ".Header(winrt::box_value(winrt::hstring(L\"" << escape_wstr(hdr_txt) << "\")));\n";
+                            }
+                        }
+                    }
+                }
+                else if (rk == "String" || rv.find("<x:String>") != std::string::npos || rv.find("<sys:String>") != std::string::npos)
+                {
+                    auto s1 = rv.find('>');
+                    auto s2 = rv.rfind('<');
+                    if (s1 != std::string::npos && s2 != std::string::npos && s2 > s1)
+                    {
+                        std::string item_str = rv.substr(s1 + 1, s2 - s1 - 1);
+                        {
+                            std::string unesc;
+                            unesc.reserve(item_str.size());
+                            for (size_t ui = 0; ui < item_str.size(); ++ui) {
+                                if (item_str[ui] == '\\' && ui + 1 < item_str.size()) {
+                                    char nx = item_str[ui + 1];
+                                    if (nx == 'n') { unesc += '\n'; ++ui; continue; }
+                                    if (nx == 'r') { unesc += '\r'; ++ui; continue; }
+                                    if (nx == 't') { unesc += '\t'; ++ui; continue; }
+                                    if (nx == '"') { unesc += '"'; ++ui; continue; }
+                                }
+                                unesc += item_str[ui];
+                            }
+                            item_str = unesc;
+                        }
+                        if (n.control == "SampleCodePresenter")
+                            out << indent << var_name << ".Code(winrt::hstring(L\"" << escape_wstr(item_str) << "\"));\n";
+                        else if (n.control == "ControlExample")
+                            out << indent << var_name << ".Xaml(winrt::hstring(L\"" << escape_wstr(item_str) << "\"));\n";
+                        else
+                            out << indent << "[&](auto& __v) { if constexpr (requires { __v.Items(); }) { __v.Items().Append(winrt::box_value(winrt::hstring(L\"" << escape_wstr(item_str) << "\"))); } }(" << var_name << ");\n";
                     }
                 }
                 else
@@ -5909,11 +7252,26 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                         if (img_val.size() >= 2 && img_val.front() == '"' && img_val.back() == '"' )
                             img_val = img_val.substr(1, img_val.size() - 2);
                         for (auto& c : img_val) if (c == '\\') c = '/';
-                        if (!img_val.empty() && img_val[0] == '/')
-                            img_val = "ms-appx:" + img_val;
-                        else if (img_val.rfind("Assets/", 0) == 0)
-                            img_val = "ms-appx:///" + img_val;
-                        out << indent << var_name << ".Source(winrt::Microsoft::UI::Xaml::Media::BitmapImage(winrt::Windows::Foundation::Uri(L\"" << img_val << "\")));\n";
+                        if (img_val.find("{ThemeResource ") != std::string::npos || img_val.find("{StaticResource ") != std::string::npos || (img_val.find('/') == std::string::npos && img_val.find('.') == std::string::npos))
+                        {
+                            std::string res_key = img_val;
+                            auto p = res_key.find("Resource ");
+                            if (p != std::string::npos) {
+                                res_key = res_key.substr(p + 9);
+                                if (!res_key.empty() && res_key.back() == '}') res_key.pop_back();
+                                while (!res_key.empty() && res_key.front() == ' ') res_key.erase(0, 1);
+                                while (!res_key.empty() && res_key.back() == ' ') res_key.pop_back();
+                            }
+                            out << indent << var_name << ".Source(image_source_lookup_th(L\"" << escape_wstr(res_key) << "\"));\n";
+                        }
+                        else
+                        {
+                            if (!img_val.empty() && img_val[0] == '/')
+                                img_val = "ms-appx:///" + img_val.substr(1);
+                            else if (img_val.rfind("Assets/", 0) == 0)
+                                img_val = "ms-appx:///" + img_val;
+                            out << indent << var_name << ".Source(winrt::Microsoft::UI::Xaml::Media::BitmapImage(winrt::Windows::Foundation::Uri(L\"" << img_val << "\")));\n";
+                        }
                     }
                     // ImageIconSource.Source/ImageSource(L"url") -> BitmapImage(Uri)
                     else if ((rk == "Source" || rk == "ImageSource") && n.control == "ImageIconSource")
@@ -5926,14 +7284,32 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                         if (img_val2.size() >= 2 && img_val2.front() == '"' && img_val2.back() == '"')
                             img_val2 = img_val2.substr(1, img_val2.size() - 2);
                         for (auto& c : img_val2) if (c == '\\') c = '/';
-                        if (!img_val2.empty() && img_val2[0] == '/')
-                            img_val2 = "ms-appx:" + img_val2;
-                        else if (img_val2.rfind("Assets/", 0) == 0)
-                            img_val2 = "ms-appx:///" + img_val2;
-                        if (rk == "ImageSource")
-                            out << indent << var_name << ".ImageSource(winrt::Microsoft::UI::Xaml::Media::BitmapImage(winrt::Windows::Foundation::Uri(L\"" << img_val2 << "\")));\n";
+                        if (img_val2.find("{ThemeResource ") != std::string::npos || img_val2.find("{StaticResource ") != std::string::npos || (img_val2.find('/') == std::string::npos && img_val2.find('.') == std::string::npos))
+                        {
+                            std::string res_key = img_val2;
+                            auto p = res_key.find("Resource ");
+                            if (p != std::string::npos) {
+                                res_key = res_key.substr(p + 9);
+                                if (!res_key.empty() && res_key.back() == '}') res_key.pop_back();
+                                while (!res_key.empty() && res_key.front() == ' ') res_key.erase(0, 1);
+                                while (!res_key.empty() && res_key.back() == ' ') res_key.pop_back();
+                            }
+                            if (rk == "ImageSource")
+                                out << indent << var_name << ".ImageSource(image_source_lookup_th(L\"" << escape_wstr(res_key) << "\"));\n";
+                            else
+                                out << indent << var_name << ".Source(image_source_lookup_th(L\"" << escape_wstr(res_key) << "\"));\n";
+                        }
                         else
-                            out << indent << var_name << ".Source(winrt::Microsoft::UI::Xaml::Media::BitmapImage(winrt::Windows::Foundation::Uri(L\"" << img_val2 << "\")));\n";
+                        {
+                            if (!img_val2.empty() && img_val2[0] == '/')
+                                img_val2 = "ms-appx:///" + img_val2.substr(1);
+                            else if (img_val2.rfind("Assets/", 0) == 0)
+                                img_val2 = "ms-appx:///" + img_val2;
+                            if (rk == "ImageSource")
+                                out << indent << var_name << ".ImageSource(winrt::Microsoft::UI::Xaml::Media::BitmapImage(winrt::Windows::Foundation::Uri(L\"" << img_val2 << "\")));\n";
+                            else
+                                out << indent << var_name << ".Source(winrt::Microsoft::UI::Xaml::Media::BitmapImage(winrt::Windows::Foundation::Uri(L\"" << img_val2 << "\")));\n";
+                        }
                     }
                     // SymbolIconSource(Symbol::X) -> Symbol enum not projected; the
                     // self-named .SymbolIconSource(SymbolIconSource()) call is invalid.
@@ -6023,9 +7399,9 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                             } else {
                                 std::string ca = "winrt::Windows::UI::Color{";
                                 if (hv.size() == 9)
-                                    out << indent << var_name << "." << raw_prop_name(rk) << "(" << ca << hex_to_argb(hv) << "})\n";
+                                    out << indent << var_name << "." << raw_prop_name(rk) << "(" << ca << hex_to_argb(hv) << "});\n";
                                 else if (hv.size() == 7)
-                                    out << indent << var_name << "." << raw_prop_name(rk) << "(" << ca << "255, " << hex_to_rgb(hv) << "})\n";
+                                    out << indent << var_name << "." << raw_prop_name(rk) << "(" << ca << "255, " << hex_to_rgb(hv) << "});\n";
                                 else
                                     out << indent << var_name << "." << raw_prop_name(rk) << "(" << box_if_inspectable(n.control, rk, rval) << ");\n";
                             }
@@ -6119,14 +7495,14 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                                     out << indent << "// " << var_name << ".Layout skipped: resource-based layout\n";
                                     skip_binding_push = true;
                                 }
-                                else if (is_numeric_dp(lo_rk))
+                                else if (is_numeric_prop(lo_ctrl, lo_rk))
                                 {
                                     // numeric DP: only real numbers or valid C++ expressions may be emitted, never L"..." strings
                                     std::string num_txt = strip_wstr(emit_val);
                                     if (is_number_text(num_txt))
-                                        out << indent << var_name << "." << raw_prop_name(rk) << "(" << num_txt << ");\n";
+                                        out << indent << var_name << "." << raw_prop_name(rk) << "(" << resolve_typed_value(n.control, rk, num_txt, &g_type_prop_kinds, &g_enum_info) << ");\n";
                                     else if (is_cxx_expr && interp.empty())
-                                        out << indent << var_name << "." << raw_prop_name(rk) << "(" << emit_val << ");\n";
+                                        out << indent << var_name << "." << raw_prop_name(rk) << "(" << resolve_typed_value(n.control, rk, emit_val, &g_type_prop_kinds, &g_enum_info) << ");\n";
                                     else
                                     {
                                         // String state var on a numeric DP: no C++
@@ -6142,7 +7518,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                                     // TitleBar.Title takes hstring — pass the literal directly
                                     out << indent << var_name << ".Title(" << emit_val << ")";
                                 }
-                                else if (lo_ctrl == "comboboxitem" && lo_rk == "content")
+else if (lo_ctrl == "comboboxitem" && lo_rk == "content")
                                 {
                                     // ComboBoxItem.Content takes IInspectable — box strings
                                     out << indent << var_name << ".Content(winrt::box_value(" << emit_val << "))";
@@ -6181,12 +7557,27 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                                     }
                                     out << indent << var_name << ".Style(" << emit_val << ")";
                                 }
+                                else if (lo_rk == "rendertransformorigin")
+                                {
+                                    std::string s_val = emit_val;
+                                    if (s_val.size() > 2 && s_val[0] == 'L' && s_val[1] == '"') s_val = s_val.substr(2, s_val.size() - 3);
+                                    else if (s_val.size() >= 2 && s_val.front() == '"' && s_val.back() == '"') s_val = s_val.substr(1, s_val.size() - 2);
+                                    float px = 0.5f, py = 0.5f;
+                                    auto comma = s_val.find(',');
+                                    if (comma != std::string::npos) {
+                                        try {
+                                            px = std::stof(s_val.substr(0, comma));
+                                            py = std::stof(s_val.substr(comma + 1));
+                                        } catch (...) {}
+                                    }
+                                    out << indent << var_name << ".RenderTransformOrigin(winrt::Windows::Foundation::Point{" << px << "f, " << py << "f})";
+                                }
                                 else
-                                    out << indent << var_name << "." << raw_prop_name(rk) << "(" << box_if_inspectable(n.control, rk, fix_control_enum(n.control, rk, emit_val)) << ")";
+                                    out << indent << var_name << "." << raw_prop_name(rk) << "(" << box_if_inspectable(n.control, rk, resolve_typed_value(n.control, rk, emit_val, &g_type_prop_kinds, &g_enum_info)) << ")";
                                 out << ";\n";
                                 if (!interp.empty() && !skip_binding_push)
                                 {
-                                    out << indent << "m_bindings.push_back([this, " << var_name << "]() mutable { " << var_name << "." << raw_prop_name(rk) << "(" << box_if_inspectable(n.control, rk, fix_control_enum(n.control, rk, emit_val)) << "); });\n";
+                                    out << indent << "m_bindings.push_back([this, " << cap_var << "]() mutable { " << var_name << "." << raw_prop_name(rk) << "(" << box_if_inspectable(n.control, rk, resolve_typed_value(n.control, rk, emit_val, &g_type_prop_kinds, &g_enum_info)) << "); });\n";
                                 }
                             }
                         }
@@ -6200,13 +7591,14 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         // Track both variable names and control types for correct routing
         std::vector<std::string> child_vars;
         std::vector<std::string> child_ctrls;
+        std::vector<std::string> child_slots;
         // Children inherit the enclosing panel chain; panel-like nodes
         // extend it so conditional subtrees can attach to a real parent.
         std::vector<std::string> child_chain = parent_chain;
         if (n.control == "StackPanel" || n.control == "Grid" || n.control == "Canvas"
             || n.control == "RelativePanel" || n.control == "WrapPanel"
             || n.control == "Column" || n.control == "Row"
-            || n.control == "NavigationView" || n.control == "ScrollViewer"
+            || n.control == "NavigationView" || n.control == "ScrollViewer" || n.control == "ScrollView"
             || n.control == "Border")
             child_chain.push_back(var_name);
         bool is_known_panel = (n.control == "StackPanel" || n.control == "Grid" || n.control == "Canvas"
@@ -6222,11 +7614,36 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                 else if (ch.control == "ImageIconSource")
                     out << indent << var_name << ".IconSource(winrt::Microsoft::UI::Xaml::Controls::IconSource::wrap_borrowed(" << cv << ".m_unknown.get()));\n";
                 else if (is_known_panel)
-                    out << indent << var_name << ".Children().Append(" << cv << ");\n";
+                {
+                    if (ch.control == "ThemeShadow")
+                        out << indent << "[&](auto& __v) { if constexpr (requires { __v.Shadow(" << cv << "); }) { __v.Shadow(" << cv << "); } }(" << var_name << ");\n";
+                    else if (ch.control == "CollectionViewSource")
+                    {
+                        // DependencyObject resource, not a UIElement child
+                    }
+                    else if (ch.control == "MenuFlyout" || ch.control == "CommandBarFlyout" || ch.control == "Flyout")
+                    {
+                        // FlyoutBase, not a UIElement child
+                    }
+                    else
+                        out << indent << var_name << ".Children().Append(" << cv << ");\n";
+                }
                 else
                 {
+                    std::string ch_slot;
+                    for (auto const& [rpk, rpv] : ch.raw_attrs)
+                    {
+                        if (rpk == "Slot")
+                        {
+                            ch_slot = rpv;
+                            if (ch_slot.size() > 2 && ch_slot[0] == 'L' && ch_slot[1] == '"') ch_slot = ch_slot.substr(2, ch_slot.size() - 3);
+                            else if (ch_slot.size() >= 2 && ch_slot.front() == '"' && ch_slot.back() == '"') ch_slot = ch_slot.substr(1, ch_slot.size() - 2);
+                            break;
+                        }
+                    }
                     child_vars.push_back(std::move(cv));
                     child_ctrls.push_back(ch.control);
+                    child_slots.push_back(std::move(ch_slot));
                 }
             }
         }
@@ -6234,26 +7651,41 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         if (!child_vars.empty())
         {
             // First: route known special child types to their property setters
-            // (KeyboardAccelerator → .KeyboardAccelerators(), ImageIconSource → .IconSource())
+            // (KeyboardAccelerator → .KeyboardAccelerators(), ImageIconSource → .IconSource(), ThemeShadow → .Shadow(), Flyout → .Flyout())
             std::vector<std::string> remaining_vars;
+            std::vector<std::string> remaining_ctrls;
+            std::vector<std::string> remaining_slots;
             for (size_t i = 0; i < child_ctrls.size(); ++i)
             {
                 if (child_ctrls[i] == "KeyboardAccelerator")
                     out << indent << "inspectable_append(" << var_name << ".KeyboardAccelerators(), " << child_vars[i] << ");\n";
                 else if (child_ctrls[i] == "ImageIconSource")
                     out << indent << var_name << ".IconSource(winrt::Microsoft::UI::Xaml::Controls::IconSource::wrap_borrowed(" << child_vars[i] << ".m_unknown.get()));\n";
+                else if (child_ctrls[i] == "ThemeShadow")
+                    out << indent << "[&](auto& __v) { if constexpr (requires { __v.Shadow(" << child_vars[i] << "); }) { __v.Shadow(" << child_vars[i] << "); } }(" << var_name << ");\n";
+                else if (child_ctrls[i] == "MenuFlyout" || child_ctrls[i] == "CommandBarFlyout" || child_ctrls[i] == "Flyout")
+                    out << indent << "[&](auto& __v) { if constexpr (requires { __v.Flyout(" << child_vars[i] << "); }) { __v.Flyout(" << child_vars[i] << "); } }(" << var_name << ");\n";
+                else if (child_ctrls[i] == "CollectionViewSource")
+                {
+                    // DependencyObject, not a UIElement child
+                }
                 else
+                {
                     remaining_vars.push_back(child_vars[i]);
+                    remaining_ctrls.push_back(child_ctrls[i]);
+                    remaining_slots.push_back(i < child_slots.size() ? child_slots[i] : "");
+                }
             }
             if (remaining_vars.empty()) { return var_name; } // all children routed
             child_vars = std::move(remaining_vars);
+            child_ctrls = std::move(remaining_ctrls);
+            child_slots = std::move(remaining_slots);
 
-            // For platform controls, always use fallback composition_kind.
-            // The catalog composition_kind is only for app/component types.
-            std::string ck;
-            bool is_platform = !g_type_ns.count(n.control) || !g_project_nss.count(g_type_ns.at(n.control));
-            if (!is_platform)
-                ck = catalog.composition_kind(n.control);
+            // Metadata first: the winuic-emitted catalog carries composition
+            // for every control — built-in, third-party and app alike. The
+            // name-based chain below is only the fallback for names the
+            // catalog does not know (legacy winmds).
+            std::string ck = catalog.composition_kind(n.control);
             // Fallback composition_kind for controls without catalog entry
             if (ck.empty())
             {
@@ -6276,8 +7708,14 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                     ck = "items_panel";
                 else if (lo == "navigationviewitem")
                     ck = "navigation_item";
+                // Tabular TableView: columns live in Columns(), not Children()
+                else if (lo == "tableview")
+                    ck = "columns";
+                // Charts: children route to Data()/Axes()/Series() by type
+                else if (lo == "chart")
+                    ck = "charts";
                 // Single-child content controls
-                else if (lo == "border" || lo == "card" || lo == "tabviewitem" || lo == "titlebar" || lo == "expander" || lo == "teachingtip" || lo == "splitview" || lo == "semanticzoom" || lo == "animatedicon" || lo == "togglesplitbutton" || lo == "textblock" || lo == "button" || lo == "togglebutton" || lo == "radiobutton" || lo == "hyperlinkbutton" || lo == "appbarbutton" || lo == "appbartogglebutton" || lo == "menuflyoutitem" || lo == "infobar" || lo == "infobadge" || lo == "tooltip" || lo == "image" || lo == "swipeitem" || lo == "slider" || lo == "scrollviewer" || lo == "scrollview" || lo == "splitbutton" || lo == "dropdownbutton" || lo == "viewbox" || lo == "pivotitem" || lo == "personpicture" || lo == "progressring" || lo == "progressbar" || lo == "loadingbutton" || lo == "colorpicker" || lo == "datepicker" || lo == "timespicker" || lo == "numberbox" || lo == "textbox" || lo == "passwordbox" || lo == "richeditbox" || lo == "ratingcontrol" || lo == "treeviewitem" || lo == "checkerboard" || lo == "refreshcontainer" || lo == "parallaxview" || lo == "mediaelement" || lo == "mediaplayerelement" || lo == "imageex" || lo == "webview2" || lo == "flyout" || lo == "toggleswitch" || lo == "infosecbutton" || lo == "switchpresenter")
+                else if (lo == "border" || lo == "card" || lo == "tabviewitem" || lo == "titlebar" || lo == "expander" || lo == "teachingtip" || lo == "splitview" || lo == "semanticzoom" || lo == "animatedicon" || lo == "togglesplitbutton" || lo == "textblock" || lo == "button" || lo == "togglebutton" || lo == "radiobutton" || lo == "hyperlinkbutton" || lo == "appbarbutton" || lo == "appbartogglebutton" || lo == "menuflyoutitem" || lo == "infobar" || lo == "infobadge" || lo == "tooltip" || lo == "image" || lo == "swipeitem" || lo == "slider" || lo == "scrollviewer" || lo == "scrollview" || lo == "splitbutton" || lo == "dropdownbutton" || lo == "viewbox" || lo == "pivotitem" || lo == "personpicture" || lo == "progressring" || lo == "progressbar" || lo == "loadingbutton" || lo == "colorpicker" || lo == "datepicker" || lo == "timespicker" || lo == "numberbox" || lo == "textbox" || lo == "passwordbox" || lo == "richeditbox" || lo == "ratingcontrol" || lo == "treeviewitem" || lo == "checkerboard" || lo == "refreshcontainer" || lo == "parallaxview" || lo == "mediaelement" || lo == "mediaplayerelement" || lo == "imageex" || lo == "webview2" || lo == "flyout" || lo == "toggleswitch" || lo == "infosecbutton" || lo == "switchpresenter" || lo == "contentpresenter")
                     ck = "content";
                 // Popup: single child via .Child(), not .Children()
                 else if (lo == "popup")
@@ -6288,8 +7726,8 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
             // Platform panels always use .Children().Append(), override catalog composition_kind
             if (n.control == "StackPanel" || n.control == "Grid" || n.control == "Canvas" || n.control == "RelativePanel" || n.control == "WrapPanel" || n.control == "Column" || n.control == "Row")
                 ck = "panel";
-            // ComboBox/ListView/Pivot always use .Items().Append()
-            if ((n.control == "Pivot" || n.control == "ComboBox" || n.control == "ListView" || n.control == "GridView" || n.control == "FlipView") && ck != "items")
+            // ComboBox/ListView/Pivot/CommandBar always use .Items() or .PrimaryCommands()
+            if ((n.control == "Pivot" || n.control == "ComboBox" || n.control == "ListView" || n.control == "GridView" || n.control == "FlipView" || n.control == "CommandBar" || n.control == "CommandBarFlyout") && ck != "items")
                 ck = "items";
             // Detect icon children for .Icon() routing
             bool has_icon_child = false;
@@ -6457,6 +7895,16 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                     }
                     else if (child_vars.size() == 1)
                         out << indent << var_name << "." << scp << "(" << catalog.cast_child(child_vars[0], n.control) << ");\n";
+                    else if (n.control == "SettingsExpander")
+                    {
+                        for (size_t i = 0; i < child_vars.size(); ++i)
+                        {
+                            if (i == 0 && (n.children[i].control == "ToggleSwitch" || n.children[i].control == "Button" || n.children[i].control == "ComboBox"))
+                                out << indent << var_name << ".Content(" << catalog.cast_child(child_vars[i], n.control) << ");\n";
+                            else
+                                out << indent << var_name << ".Items(" << catalog.cast_child(child_vars[i], n.control) << ");\n";
+                        }
+                    }
                     else
                     {
                         {
@@ -6486,6 +7934,36 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                     out << indent << "}\n";
                 }
             }
+            else if (ck == "columns")
+            {
+                // TableView: IVector<TableViewColumn> columns collection
+                for (auto const& cv : child_vars)
+                    out << indent << "inspectable_append(" << var_name << ".Columns(), " << cv << ");\n";
+            }
+            else if (ck == "charts")
+            {
+                // Chart children (the .winui intermediate flattens the
+                // Chart.Data / Chart.Axes property elements): route by the
+                // child's own type — Samples -> Data(), Axis -> Axes(),
+                // CartesianSeries -> Series().
+                for (size_t i = 0; i < child_vars.size(); ++i)
+                {
+                    std::string lc;
+                    if (child_ctrls.size() == child_vars.size()) lc = child_ctrls[i];
+                    else if (i < n.children.size()) lc = n.children[i].control;
+                    for (auto& c : lc) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    auto scq = lc.rfind("::");
+                    if (scq != std::string::npos) lc = lc.substr(scq + 2);
+                    if (lc.size() >= 7 && lc.compare(lc.size() - 7, 7, "samples") == 0)
+                        out << indent << "inspectable_append(" << var_name << ".Data(), " << child_vars[i] << ");\n";
+                    else if (lc.size() >= 4 && lc.compare(lc.size() - 4, 4, "axis") == 0)
+                        out << indent << "inspectable_append(" << var_name << ".Axes(), " << child_vars[i] << ");\n";
+                    else if (lc.size() >= 6 && lc.compare(lc.size() - 6, 6, "series") == 0)
+                        out << indent << "inspectable_append(" << var_name << ".Series(), " << child_vars[i] << ");\n";
+                    else
+                        out << indent << "// " << var_name << " child skipped: unknown Charts collection (" << lc << ")\n";
+                }
+            }
             else if (ck == "panel")
             {
                 // Panel controls always use .Children().Append() — even if they are component types
@@ -6512,19 +7990,85 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                                 out << indent << parent_chain.back() << ".Children().Append(" << cv << ");\n";
                         }
                     }
+                    else if (n.control == "ControlExample")
+                    {
+                        std::vector<std::string> ex_vars, out_vars, opt_vars;
+                        for (size_t i = 0; i < child_vars.size(); ++i)
+                        {
+                            std::string sl = (i < child_slots.size()) ? child_slots[i] : "";
+                            if (sl == "Output") out_vars.push_back(child_vars[i]);
+                            else if (sl == "Options") opt_vars.push_back(child_vars[i]);
+                            else ex_vars.push_back(child_vars[i]);
+                        }
+                        auto emit_slot = [&](std::string const& slot_prop, std::vector<std::string> const& svars)
+                        {
+                            if (svars.size() == 1)
+                            {
+                                out << indent << var_name << "." << slot_prop << "(" << svars[0] << ");\n";
+                            }
+                            else if (svars.size() > 1)
+                            {
+                                out << indent << "{\n";
+                                out << indent << "    auto _wrap_sp = winrt::Microsoft::UI::Xaml::Controls::StackPanel();\n";
+                                for (auto const& cv : svars)
+                                    out << indent << "    _wrap_sp.Children().Append(" << cv << ");\n";
+                                out << indent << "    " << var_name << "." << slot_prop << "(_wrap_sp);\n";
+                                out << indent << "}\n";
+                            }
+                        };
+                        emit_slot("Example", ex_vars);
+                        emit_slot("Output", out_vars);
+                        emit_slot("Options", opt_vars);
+                    }
                     else
                     {
-                        out << indent << "{\n";
-                        out << indent << "    auto _wrap_sp = winrt::Microsoft::UI::Xaml::Controls::StackPanel();\n";
-                        for (auto const& cv : child_vars)
-                            out << indent << "    _wrap_sp.Children().Append(" << cv << ");\n";
-                        out << indent << "    " << var_name << "." << scp << "(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(_wrap_sp.m_unknown.get()));\n";
-                        out << indent << "}\n";
+                        std::vector<std::string> items_vars;
+                        std::vector<std::string> content_vars;
+                        for (size_t i = 0; i < n.children.size() && i < child_vars.size(); ++i)
+                        {
+                            std::string sl = (i < child_slots.size()) ? child_slots[i] : "";
+                            if (sl == "Items") items_vars.push_back(child_vars[i]);
+                            else content_vars.push_back(child_vars[i]);
+                        }
+                        if (!items_vars.empty())
+                        {
+                            for (auto const& iv : items_vars)
+                                out << indent << "inspectable_append(" << var_name << ".Items(), " << iv << ");\n";
+                            if (content_vars.size() == 1)
+                            {
+                                out << indent << var_name << "." << scp << "(" << content_vars[0] << ");\n";
+                            }
+                            else if (content_vars.size() > 1)
+                            {
+                                out << indent << "{\n";
+                                out << indent << "    auto _wrap_sp = winrt::Microsoft::UI::Xaml::Controls::StackPanel();\n";
+                                for (auto const& cv : content_vars)
+                                    out << indent << "    _wrap_sp.Children().Append(" << cv << ");\n";
+                                out << indent << "    " << var_name << "." << scp << "(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(_wrap_sp.m_unknown.get()));\n";
+                                out << indent << "}\n";
+                            }
+                        }
+                        else
+                        {
+                            if (child_vars.size() == 1)
+                            {
+                                out << indent << var_name << "." << scp << "(" << child_vars[0] << ");\n";
+                            }
+                            else
+                            {
+                                out << indent << "{\n";
+                                out << indent << "    auto _wrap_sp = winrt::Microsoft::UI::Xaml::Controls::StackPanel();\n";
+                                for (auto const& cv : child_vars)
+                                    out << indent << "    _wrap_sp.Children().Append(" << cv << ");\n";
+                                out << indent << "    " << var_name << "." << scp << "(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(_wrap_sp.m_unknown.get()));\n";
+                                out << indent << "}\n";
+                            }
+                        }
                     }
                 }
                 else
                     for (auto const& cv : child_vars)
-                        out << indent << var_name << ".Children().Append(" << cv << ");\n";
+                        out << indent << "inspectable_append(" << var_name << ".Children(), " << cv << ");\n";
             }
             else
             {
@@ -6561,6 +8105,16 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                     }
                     else if (child_vars.size() == 1)
                         out << indent << var_name << "." << scp << "(" << catalog.cast_child(child_vars[0], n.control) << ");\n";
+                    else if (n.control == "SettingsExpander")
+                    {
+                        for (size_t i = 0; i < child_vars.size(); ++i)
+                        {
+                            if (i == 0 && n.children[i].control == "ToggleSwitch")
+                                out << indent << var_name << ".Content(" << catalog.cast_child(child_vars[i], n.control) << ");\n";
+                            else
+                                out << indent << var_name << ".Items(" << catalog.cast_child(child_vars[i], n.control) << ");\n";
+                        }
+                    }
                     else
                     {
                         // Always wrap multiple children in StackPanel for content controls
@@ -6580,7 +8134,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         return var_name;
     };
 
-    // Emit root nodes — MicaBackdrop becomes SystemBackdrop()
+    // Emit root nodes — MicaBackdrop becomes SystemBackdrop(); Flyouts register into Resources
     std::vector<std::string> root_vars;
     for (auto const& rn : view.root)
     {
@@ -6589,15 +8143,37 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
             continue;
         }
         std::string rv = emit_node(emit_node, rn, 0, {});
-        if (!rv.empty()) root_vars.push_back(std::move(rv));
+        if (rv.empty()) continue;
+        if (rn.control.ends_with("Flyout") || rn.control == "Flyout")
+        {
+            std::string res_key = rn.control;
+            for (auto const& [k, v] : rn.props) {
+                if (k == "name" || k == "Name" || k == "x:Name") { res_key = v; break; }
+            }
+            for (auto const& [k, v] : rn.raw_attrs) {
+                if (k == "name" || k == "Name" || k == "x:Name") { res_key = v; break; }
+            }
+            out << "        insert_resource(Resources(), L\"" << res_key << "\", " << rv << ");\n";
+        }
+        else
+        {
+            root_vars.push_back(std::move(rv));
+        }
     }
 
     // Set the single root child as Content() (Window: the window content;
     // Page/UserControl: the page's visual root - both must attach or the
-    // view renders empty).
+    // view renders empty). Templated ContentControls (OpacityMaskView, Button)
+    // use Content for user payload, NOT visual root; setting root as Content
+    // creates a cycle with PART_ContentPresenter.
+    bool is_content_control_base = (view.base_type == "ContentControl" || view.base_type == "Button" || view.base_type == "Control" || view.base_type == "ToggleButton")
+        && view.base_type != "UserControl" && view.base_type != "Page" && !view.base_type.ends_with("Page");
     if (root_vars.size() == 1)
     {
-        out << "        Content(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(" << root_vars[0] << ".m_unknown.get()));\n";
+        if (!is_content_control_base)
+        {
+            out << "        Content(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(" << root_vars[0] << ".m_unknown.get()));\n";
+        }
         if (is_window_class)
         {
             out << "        g_theme_state.window_id = AppWindow().Id().Value;\n";
@@ -6625,7 +8201,10 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         out << "        auto _root = Grid();\n";
         for (auto const& rv : root_vars)
             out << "        _root.Children().Append(" << rv << ");\n";
-        out << "        Content(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(_root.m_unknown.get()));\n";
+        if (!is_content_control_base)
+        {
+            out << "        Content(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(_root.m_unknown.get()));\n";
+        }
         if (is_window_class)
         {
             out << "        g_theme_state.window_id = AppWindow().Id().Value;\n";
@@ -6657,10 +8236,20 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         }
     }
 
+    out << "        for (auto const& [__elem, __get_target] : _deferred_labeled_by) {\n";
+    out << "            auto __target_elem = __get_target();\n";
+    out << "            if (__elem.m_unknown.get() && __target_elem.m_unknown.get())\n";
+    out << "                AutomationProperties::SetLabeledBy(__elem, __target_elem);\n";
+    out << "        }\n";
+    out << "        for (auto const& __rp_fn : _deferred_relative_panel) __rp_fn();\n";
+    if (view.name == "SettingsPage")
+    {
+        if (has_elem("themeMode"))
+            out << "        if (themeMode.m_unknown.get()) themeMode.SelectedIndex(g_theme_state.theme_idx == 1 ? 0 : (g_theme_state.theme_idx == 2 ? 1 : 2));\n";
+        if (has_elem("navigationLocation"))
+            out << "        if (navigationLocation.m_unknown.get()) navigationLocation.SelectedIndex(0);\n";
+    }
     out << "    }\n";
-
-    // (Settings behavior wire-up now emitted from the page constructor,
-    // right after BuildUI() - see the ctor emission above.)
 
     // Emit template factory functions (no load_xaml)
     for (auto const& tfr : pending_factory_funcs)
@@ -6669,11 +8258,6 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     }
     } // end if (!is_app_class) — BuildUI() only for Window/UserControl
 
-    // Navigation synthesis: when the driver supplied a tag->page map for
-    // this window view, emit a Frame::Navigate dispatcher used by the
-    // SelectionChanged/Loaded callbacks. Resolution is data-driven from the
-    // project's own views (Tag attrs, page runtime class names) - no
-    // hardcoded page names in the compiler.
     std::string nav_view_name = has_elem("NavView") ? "NavView" : (has_elem("NavigationViewControl") ? "NavigationViewControl" : "");
     std::string frame_name = has_elem("ContentFrame") ? "ContentFrame" : (has_elem("rootFrame") ? "rootFrame" : "");
     bool is_nav_window = is_window_class && !view.nav_pages.empty() && !nav_view_name.empty() && !frame_name.empty();
@@ -6690,16 +8274,29 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
             for (auto const& cbn : callbacks)
                 if (cbn.find("Loaded") != std::string::npos) { loaded_cb_name = cbn; break; }
         }
-        // Direct construction dispatch: build the page view and set it as
-        // the Frame's content. Zero-XAML apps have no IXamlMetadataProvider,
-        // so Frame::Navigate(TypeName) cannot resolve pages; constructing
-        // the page directly (via the page module's exported factory) is the
-        // metadata-free equivalent with identical Frame semantics.
-        out << "\n    void _navigate_to_tag(std::wstring_view tag)\n    {\n";
+        out << "\n    std::vector<std::wstring> m_nav_history;\n";
+        out << "    std::wstring m_current_nav_tag;\n";
+        out << "\n    void _navigate_to_tag(std::wstring_view tag, bool record_history = true)\n    {\n";
+        out << "        static void* s_nav_ctrl = nullptr;\n";
+        out << "        static void* s_titlebar_ctrl = nullptr;\n";
+        out << "        s_nav_ctrl = " << nav_view_name << ".m_unknown.get();\n";
+        if (has_elem("titleBar"))
+        {
+            out << "        s_titlebar_ctrl = titleBar.m_unknown.get();\n";
+        }
+        out << "        g_theme_state.set_nav_mode = [](int mode) {\n";
+        out << "            if (s_nav_ctrl) {\n";
+        out << "                auto nv = winrt::Microsoft::UI::Xaml::Controls::NavigationView::wrap_borrowed(s_nav_ctrl);\n";
+        out << "                nv.PaneDisplayMode(mode == 1 ? winrt::Microsoft::UI::Xaml::Controls::NavigationViewPaneDisplayMode::Top : winrt::Microsoft::UI::Xaml::Controls::NavigationViewPaneDisplayMode::Auto);\n";
+        out << "            }\n";
+        out << "            if (s_titlebar_ctrl) {\n";
+        out << "                auto tb = winrt::Microsoft::UI::Xaml::Controls::TitleBar::wrap_borrowed(s_titlebar_ctrl);\n";
+        out << "                tb.IsPaneToggleButtonVisible(mode != 1);\n";
+        out << "            }\n";
+        out << "        };\n";
         out << "        winrt::IInspectable (*factory)() = nullptr;\n";
         for (auto const& [tag, page_name] : view.nav_pages)
         {
-            // "Ns.Page" -> factory create_<Page>() imported from module Ns
             std::string fn = "create_";
             std::string ns_part = page_name;
             auto d = page_name.rfind('.');
@@ -6708,17 +8305,45 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
             out << "        if (tag == L\"" << tag << "\") factory = " << fn << ";\n";
         }
         out << "        if (!factory) return;\n";
-        out << "        winrt::IInspectable page = factory();\n";
-        out << "        if (page)\n";
+        out << "        try\n";
         out << "        {\n";
-        out << "            void* fe_raw = nullptr;\n";
-        out << "            if (page.get_abi() && winrt::IUnknown::qi_raw(page.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::IFrameworkElement>, &fe_raw) >= 0 && fe_raw)\n";
+        out << "            winrt::IInspectable page = factory();\n";
+        out << "            if (page)\n";
         out << "            {\n";
-        out << "                winrt::Microsoft::UI::Xaml::IFrameworkElement fe{fe_raw};\n";
-        out << "                fe.put_RequestedTheme(get_global_theme());\n";
+        out << "                if (record_history && !m_current_nav_tag.empty() && m_current_nav_tag != tag)\n";
+        out << "                    m_nav_history.push_back(m_current_nav_tag);\n";
+        out << "                m_current_nav_tag = std::wstring(tag);\n";
+        if (has_elem("titleBar"))
+        {
+            out << "                if (titleBar.m_unknown.get()) {\n";
+            out << "                    titleBar.IsBackButtonVisible(!m_nav_history.empty());\n";
+            out << "                    titleBar.IsBackButtonEnabled(!m_nav_history.empty());\n";
+            out << "                }\n";
+        }
+        out << "                void* fe_raw = nullptr;\n";
+        out << "                if (page.get_abi() && winrt::IUnknown::qi_raw(page.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::IFrameworkElement>, &fe_raw) >= 0 && fe_raw)\n";
+        out << "                {\n";
+        out << "                    winrt::Microsoft::UI::Xaml::IFrameworkElement fe{fe_raw};\n";
+        out << "                    fe.put_RequestedTheme(get_global_theme());\n";
+        out << "                    fe.put_HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);\n";
+        out << "                }\n";
+        out << "                if (tag != L\"Home\" && tag != L\"HomePage\")\n";
+        out << "                {\n";
+        out << "                    winrt::Microsoft::UI::Xaml::Controls::ScrollViewer sv{};\n";
+        out << "                    sv.VerticalScrollBarVisibility(winrt::Microsoft::UI::Xaml::Controls::ScrollBarVisibility::Auto);\n";
+        out << "                    sv.VerticalScrollMode(winrt::Microsoft::UI::Xaml::Controls::ScrollMode::Enabled);\n";
+        out << "                    sv.HorizontalScrollBarVisibility(winrt::Microsoft::UI::Xaml::Controls::ScrollBarVisibility::Disabled);\n";
+        out << "                    sv.HorizontalScrollMode(winrt::Microsoft::UI::Xaml::Controls::ScrollMode::Disabled);\n";
+        out << "                    sv.Content(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(page.get_abi()));\n";
+        out << "                    " << frame_name << ".Content(sv);\n";
+        out << "                }\n";
+        out << "                else\n";
+        out << "                {\n";
+        out << "                    " << frame_name << ".Content(page);\n";
+        out << "                }\n";
         out << "            }\n";
-        out << "            " << frame_name << ".Content(page);\n";
         out << "        }\n";
+        out << "        catch (...) { boot_log(\"navigate:catch\"); }\n";
         out << "    }\n";
     }
 
@@ -6863,17 +8488,178 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                 out << "        }\n";
             }
         }
-        if (!nav_view_name.empty() && (cb.find("PaneToggle") != std::string::npos || cb.find("panetoggle") != std::string::npos))
+        auto cb_it = view.callbacks.find(cb);
+        if (!nav_view_name.empty() && (cb.find("PaneToggle") != std::string::npos || cb.find("panetoggle") != std::string::npos) && (cb_it == view.callbacks.end() || cb_it->second.empty()))
         {
             out << "        // synthesized: toggle navigation pane\n";
             out << "        " << nav_view_name << ".IsPaneOpen(!" << nav_view_name << ".IsPaneOpen());\n";
         }
-        // Real code-behind logic carried from the winmd callback bodies
-        // (language-neutral statements produced by xaml2winuic). Translate
-        // the supported forms into C++; anything referencing identifiers the
-        // projection does not know stays as a comment so the generated
-        // module always compiles.
-        auto cb_it = view.callbacks.find(cb);
+        if (is_nav_window && (cb.find("BackRequested") != std::string::npos || cb.find("GoBack") != std::string::npos))
+        {
+            out << "        if (!m_nav_history.empty()) {\n";
+            out << "            auto prev = m_nav_history.back();\n";
+            out << "            m_nav_history.pop_back();\n";
+            out << "            _navigate_to_tag(prev, false);\n";
+            out << "        }\n";
+        }
+        if (is_nav_window && has_elem("controlsSearchBox") && (cb == "OnControlsSearchBoxTextChanged" || cb == "OnControlsSearchBoxQuerySubmitted"))
+        {
+            out << "        struct _nav_entry { wchar_t const* title; wchar_t const* tag; };\n";
+            out << "        static constexpr _nav_entry s_entries[] = {\n";
+            for (auto const& [tag, page_name] : view.nav_pages)
+            {
+                if (tag == "__settings__") continue;
+                std::string title = tag;
+                if (title.size() > 4 && title.ends_with("Page")) title = title.substr(0, title.size() - 4);
+                out << "            { L\"" << escape_wstr(title) << "\", L\"" << escape_wstr(tag) << "\" },\n";
+            }
+            out << "            { L\"Settings\", L\"__settings__\" }\n";
+            out << "        };\n";
+            out << "        auto to_lo = [](std::wstring_view sv) { std::wstring r(sv); for (auto& ch : r) if (ch >= L'A' && ch <= L'Z') ch += (L'a' - L'A'); return r; };\n";
+            if (cb == "OnControlsSearchBoxTextChanged")
+            {
+                out << "        if (args) {\n";
+                out << "            void* tc_out = nullptr;\n";
+                out << "            if (winrt::impl::query_interface(args.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::AutoSuggestBoxTextChangedEventArgs>, &tc_out) >= 0 && tc_out) {\n";
+                out << "                auto tc = winrt::Microsoft::UI::Xaml::Controls::AutoSuggestBoxTextChangedEventArgs::from_abi(tc_out);\n";
+                out << "                if (tc.Reason() != winrt::Microsoft::UI::Xaml::Controls::AutoSuggestionBoxTextChangeReason::UserInput) return;\n";
+                out << "            }\n";
+                out << "        }\n";
+                out << "        auto q = to_lo(controlsSearchBox.Text().to_view());\n";
+                out << "        if (q.empty()) { controlsSearchBox.ItemsSource(winrt::IInspectable{nullptr}); return; }\n";
+                out << "        auto vec = winrt::single_threaded_vector<winrt::hstring>();\n";
+                out << "        int matches = 0;\n";
+                out << "        for (auto const& e : s_entries) {\n";
+                out << "            if (to_lo(e.title).find(q) != std::wstring::npos || to_lo(e.tag).find(q) != std::wstring::npos) {\n";
+                out << "                inspectable_append(vec, winrt::hstring(e.title));\n";
+                out << "                if (++matches >= 12) break;\n";
+                out << "            }\n";
+                out << "        }\n";
+                out << "        controlsSearchBox.ItemsSource(vec);\n";
+            }
+            else
+            {
+                out << "        std::wstring q = std::wstring(controlsSearchBox.Text().to_view());\n";
+                out << "        if (args) {\n";
+                out << "            void* qs_out = nullptr;\n";
+                out << "            if (winrt::impl::query_interface(args.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::AutoSuggestBoxQuerySubmittedEventArgs>, &qs_out) >= 0 && qs_out) {\n";
+                out << "                auto qs = winrt::Microsoft::UI::Xaml::Controls::AutoSuggestBoxQuerySubmittedEventArgs::from_abi(qs_out);\n";
+                out << "                auto chosen = winrt::unbox_value_or<winrt::hstring>(qs.ChosenSuggestion(), L\"\");\n";
+                out << "                if (!chosen.empty()) q = std::wstring(chosen.to_view());\n";
+                out << "                else if (!qs.QueryText().empty()) q = std::wstring(qs.QueryText().to_view());\n";
+                out << "            }\n";
+                out << "        }\n";
+                out << "        auto ql = to_lo(q);\n";
+                out << "        if (ql.empty()) return;\n";
+                out << "        for (auto const& e : s_entries) {\n";
+                out << "            if (to_lo(e.title) == ql || to_lo(e.tag) == ql) { _navigate_to_tag(e.tag); return; }\n";
+                out << "        }\n";
+                out << "        for (auto const& e : s_entries) {\n";
+                out << "            if (to_lo(e.title).find(ql) != std::wstring::npos || to_lo(e.tag).find(ql) != std::wstring::npos) { _navigate_to_tag(e.tag); return; }\n";
+                out << "        }\n";
+            }
+        }
+        if (view.name == "SettingsPage" && (cb == "ThemeModeSelectionChanged" || cb == "themeMode_SelectionChanged") && has_elem("themeMode"))
+        {
+            out << "        int idx = themeMode.SelectedIndex();\n";
+            out << "        if (idx == 0) apply_app_theme(false);\n";
+            out << "        else if (idx == 1) apply_app_theme(true);\n";
+            out << "        else if (idx == 2) { bool sys_dark = !is_system_light_mode(); apply_app_theme(sys_dark); g_theme_state.theme_idx = 0; }\n";
+            out << "        RequestedTheme(get_global_theme());\n";
+        }
+        if (view.name == "SettingsPage" && (cb == "NavigationLocationSelectionChanged" || cb == "navigationLocation_SelectionChanged") && has_elem("navigationLocation"))
+        {
+            out << "        int idx = navigationLocation.SelectedIndex();\n";
+            out << "        if (g_theme_state.set_nav_mode && idx >= 0) g_theme_state.set_nav_mode(idx);\n";
+        }
+        if (view.name == "SettingsPage" && (cb == "SoundToggleToggled" || cb == "soundToggle_Toggled") && has_elem("soundToggle") && has_elem("SpatialAudioCard"))
+        {
+            out << "        bool on = soundToggle.IsOn();\n";
+            out << "        SpatialAudioCard.IsEnabled(on);\n";
+        }
+        if (view.name == "ControlExample" && cb == "SelectorBarItemLoaded")
+        {
+            out << "        auto item = winrt::Microsoft::UI::Xaml::Controls::SelectorBarItem::wrap_borrowed(sender.get_abi());\n";
+            out << "        if (item.get_abi())\n";
+            out << "        {\n";
+            out << "            auto tag = winrt::unbox_value_or<winrt::hstring>(item.Tag(), L\"\");\n";
+            out << "            bool has_code = false;\n";
+            out << "            if (tag == L\"Xaml\") has_code = (xaml.size() > 0) || (xamlSource.size() > 0);\n";
+            out << "            else if (tag == L\"CSharp\") has_code = (cSharp.size() > 0) || (cSharpSource.size() > 0);\n";
+            out << "            item.Visibility(has_code ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed);\n";
+            out << "            if (has_code && SelectorBarControl.SelectedItem().get_abi() == nullptr) SelectorBarControl.SelectedItem(item);\n";
+            out << "        }\n";
+        }
+        if (view.name == "ControlExample" && cb == "SelectorBarControlSelectionChanged")
+        {
+            out << "        auto sel = SelectorBarControl.SelectedItem();\n";
+            out << "        if (sel.get_abi())\n";
+            out << "        {\n";
+            out << "            auto tag = winrt::unbox_value_or<winrt::hstring>(sel.Tag(), L\"\");\n";
+            out << "            auto x_vis = (tag == L\"Xaml\") ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed;\n";
+            out << "            auto c_vis = (tag == L\"CSharp\") ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed;\n";
+            out << "            XamlPresenter.Visibility(x_vis);\n";
+            out << "            CSharpPresenter.Visibility(c_vis);\n";
+            out << "            XamlContentPresenter.Visibility(x_vis);\n";
+            out << "            CSharpContentPresenter.Visibility(c_vis);\n";
+            out << "        }\n";
+        }
+        if (view.name == "SampleCodePresenter" && (cb == "CodePresenterLoaded" || cb == "SampleCodePresenterLoaded"))
+        {
+            out << "        if (code.size() > 0 && CodeScrollViewer.get_abi())\n";
+            out << "        {\n";
+            out << "            auto tb = winrt::Microsoft::UI::Xaml::Controls::TextBlock();\n";
+            out << "            tb.Text(winrt::hstring(code.c_str()));\n";
+            out << "            tb.IsTextSelectionEnabled(true);\n";
+            out << "            tb.FontFamily(winrt::Microsoft::UI::Xaml::Media::FontFamily(L\"Consolas\"));\n";
+            out << "            CodeScrollViewer.Content(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(tb.m_unknown.get()));\n";
+            out << "        }\n";
+        }
+        if (view.name == "HorizontalScrollContainer")
+        {
+            if (cb == "ScrollBackBtn_Click" || cb == "ScrollBackBtnClick")
+            {
+                out << "        if (scroller.m_unknown.get()) {\n";
+                out << "            double target = scroller.HorizontalOffset() - scroller.ViewportWidth();\n";
+                out << "            if (target < 0.0) target = 0.0;\n";
+                out << "            scroller.ChangeView(winrt::Windows::Foundation::IReference<double>(target), nullptr, nullptr);\n";
+                out << "        }\n";
+            }
+            else if (cb == "ScrollForwardBtn_Click" || cb == "ScrollForwardBtnClick")
+            {
+                out << "        if (scroller.m_unknown.get()) {\n";
+                out << "            double target = scroller.HorizontalOffset() + scroller.ViewportWidth();\n";
+                out << "            scroller.ChangeView(winrt::Windows::Foundation::IReference<double>(target), nullptr, nullptr);\n";
+                out << "        }\n";
+            }
+            else if (cb == "Scroller_SizeChanged" || cb == "ScrollerSizeChanged")
+            {
+                out << "        auto dq = winrt::Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();\n";
+                out << "        if (dq.get_abi()) {\n";
+                out << "            dq.TryEnqueue([this]() {\n";
+                out << "                if (scroller.m_unknown.get() && ScrollForwardBtn.m_unknown.get()) {\n";
+                out << "                    auto f_vis = (scroller.ScrollableWidth() > 0) ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed;\n";
+                out << "                    if (ScrollForwardBtn.Visibility() != f_vis) ScrollForwardBtn.Visibility(f_vis);\n";
+                out << "                }\n";
+                out << "            });\n";
+                out << "        }\n";
+            }
+            else if (cb == "Scroller_ViewChanging" || cb == "ScrollerViewChanging" || cb == "Scroller_ViewChanged" || cb == "ScrollerViewChanged")
+            {
+                out << "        if (scroller.m_unknown.get()) {\n";
+                out << "            double off = scroller.HorizontalOffset();\n";
+                out << "            double sw = scroller.ScrollableWidth();\n";
+                out << "            if (ScrollBackBtn.m_unknown.get()) {\n";
+                out << "                auto b_vis = (off > 1.0) ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed;\n";
+                out << "                if (ScrollBackBtn.Visibility() != b_vis) ScrollBackBtn.Visibility(b_vis);\n";
+                out << "            }\n";
+                out << "            if (ScrollForwardBtn.m_unknown.get()) {\n";
+                out << "                auto f_vis = (sw > 1.0 && off < sw - 1.0) ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed;\n";
+                out << "                if (ScrollForwardBtn.Visibility() != f_vis) ScrollForwardBtn.Visibility(f_vis);\n";
+                out << "            }\n";
+                out << "        }\n";
+            }
+        }
         if (cb_it != view.callbacks.end())
         {
             for (auto const& raw_stmt : cb_it->second)
@@ -6977,7 +8763,12 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                                 {
                                     bool known_state = false;
                                     for (auto const& sv : view.state_vars)
-                                        if (sv.name == val_cpp) { known_state = true; break; }
+                                    {
+                                        std::string sv_lo = sv.name, vc_lo = val_cpp;
+                                        for (auto& c : sv_lo) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                                        for (auto& c : vc_lo) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                                        if (sv_lo == vc_lo) { val_cpp = sv.name; known_state = true; break; }
+                                    }
                                     if (!known_state) extra_members.insert(val_cpp);
                                 }
                             }
@@ -6996,13 +8787,16 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         // component's own logic.
         for (auto const& ev : view.exposed_component_events)
         {
-            std::string ev_lo = ev;
+            std::string ev_clean = ev;
+            if (ev_clean.size() > 2 && ev_clean[0] == 'o' && ev_clean[1] == 'n' && std::isupper(static_cast<unsigned char>(ev_clean[2])))
+                ev_clean = ev_clean.substr(2);
+            std::string ev_lo = ev_clean;
             for (auto& c : ev_lo) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            if (cb.size() >= ev.size()
-                && std::tolower(static_cast<unsigned char>(cb[cb.size() - ev.size()])) == std::tolower(static_cast<unsigned char>(ev[0])))
+            if (cb.size() >= ev_clean.size()
+                && std::tolower(static_cast<unsigned char>(cb[cb.size() - ev_clean.size()])) == std::tolower(static_cast<unsigned char>(ev_clean[0])))
             {
-                std::string cb_tail = cb.substr(cb.size() - ev.size());
-                std::string ev_pascal = ev;
+                std::string cb_tail = cb.substr(cb.size() - ev_clean.size());
+                std::string ev_pascal = ev_clean;
                 for (auto& c : cb_tail) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
                 for (auto& c : ev_pascal) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
                 if (cb_tail == ev_pascal)
@@ -7027,11 +8821,16 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         out << "\n    // external event forwarding (pages attach .on<E> to this view)\n";
         for (auto const& ev : view.exposed_component_events)
         {
-            std::string ev_lo = ev;
+            std::string ev_clean = ev;
+            if (ev_clean.size() > 2 && ev_clean[0] == 'o' && ev_clean[1] == 'n' && std::isupper(static_cast<unsigned char>(ev_clean[2])))
+                ev_clean = ev_clean.substr(2);
+            std::string ev_lo = ev_clean;
             for (auto& c : ev_lo) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             out << "    std::vector<std::function<void(IInspectable const&, IInspectable const&)>> m_" << ev_lo << "_handlers;\n";
             out << "public:\n";
-            out << "    void add_" << ev << "(std::function<void(IInspectable const&, IInspectable const&)> h) { m_" << ev_lo << "_handlers.push_back(h); }\n";
+            out << "    void add_" << ev_clean << "(std::function<void(IInspectable const&, IInspectable const&)> h) { m_" << ev_lo << "_handlers.push_back(h); }\n";
+            if (ev != ev_clean)
+                out << "    void add_" << ev << "(std::function<void(IInspectable const&, IInspectable const&)> h) { m_" << ev_lo << "_handlers.push_back(h); }\n";
             out << "private:\n";
             out << "    void _fire_" << ev_lo << "(IInspectable const& s, IInspectable const& e)\n";
             out << "    {\n";
@@ -7097,7 +8896,8 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         out << "\nexport winrt::IInspectable create_" << class_name << "()\n";
         out << "{\n";
         out << "    winrt::boot_log(\"create:" << class_name << "\");\n";
-        out << "    return winrt::IInspectable(get_" << class_name << "());\n";
+        out << "    auto* p = new " << cpp_class << "();\n";
+        out << "    return winrt::IInspectable(*p);\n";
         out << "}\n";
         // Registration hook for the local activation registry (winrt_base):
         // main.ixx imports each view module and calls this once at startup so
@@ -7107,7 +8907,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         out << "\n// Register the local C++ factory under the runtime class name\n";
         out << "export void register_local_factory_" << class_name << "()\n";
         out << "{\n";
-        out << "    winrt::impl::register_local_factory(L\"" << ns << "." << class_name << "\", &create_" << class_name << ");\n";
+        out << "    winrt::impl::register_local_factory(L\"" << ns_meta << "." << class_name << "\", &create_" << class_name << ");\n";
         out << "}\n";
     }
 
@@ -7116,9 +8916,8 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     // and comments x:Bind leftovers that reference elements this codegen can't
     // materialize. Shape-based only - never touches the prelude/helpers.
     std::string code = out.str();
-    code = fixup_view_code(std::move(code));
+    code = fixup_view_code(std::move(code), &g_type_events, &g_type_prop_kinds, &g_type_ns, &g_enum_info);
     return code;
 }
 
 } // namespace winuic
-

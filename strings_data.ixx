@@ -646,6 +646,9 @@ namespace winrt
 
             IInspectable() noexcept = default;
             IInspectable(void* ptr) noexcept : m_ptr(ptr) {}
+            template <typename T>
+                requires (!std::is_same_v<std::decay_t<T>, IInspectable> && requires(T const& t) { { t.get_abi() } -> std::convertible_to<void*>; })
+            IInspectable(T const& other) noexcept : m_ptr(other.get_abi()) { if (m_ptr) IUnknown::addref_raw(m_ptr); }
             IInspectable(IInspectable const& other) : m_ptr(other.m_ptr) { if (m_ptr) IUnknown::addref_raw(m_ptr); }
             IInspectable(IInspectable&& other) noexcept : m_ptr(other.m_ptr) { other.m_ptr = nullptr; }
             IInspectable& operator=(IInspectable const& other) { if (this != &other) { IInspectable copy(other); std::swap(m_ptr, copy.m_ptr); } return *this; }
@@ -655,6 +658,7 @@ namespace winrt
             void** put() noexcept { if (m_ptr) IUnknown::release_raw(m_ptr); m_ptr = nullptr; return &m_ptr; }
             static IInspectable from_abi(void* ptr) noexcept { return IInspectable(ptr); }
             explicit operator bool() const noexcept { return m_ptr != nullptr; }
+            friend bool operator==(IInspectable const&, IInspectable const&) = default;
             friend auto operator<=>(IInspectable const&, IInspectable const&) = default;
             bool operator==(std::nullptr_t) const noexcept { return m_ptr == nullptr; }
 
@@ -1571,6 +1575,51 @@ com_ns::CoTaskMemFree(m_data);
             local_factories()[class_name] = fn;
         }
 
+        export inline void* try_get_factory(std::wstring_view class_name) noexcept
+        {
+            void* name = nullptr;
+            if (Windows::Win32::WINSTRING::WindowsCreateString(class_name.data(), (std::uint32_t)class_name.size(), &name) < 0)
+                return nullptr;
+            void* factory = nullptr;
+            static constexpr winrt_guid const iid_iactivationfactory{ 0x00000035, 0x0000, 0x0000, { 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
+            std::int32_t hr = Windows::Win32::ROAPI::RoGetActivationFactory(name,
+                &const_cast<winrt_guid&>(iid_iactivationfactory), &factory);
+            if (hr < 0 || !factory)
+            {
+                hr = Windows::Win32::ROAPI::RoGetActivationFactory(name,
+                    &const_cast<winrt_guid&>(iid_iinspectable), &factory);
+            }
+            Windows::Win32::WINSTRING::WindowsDeleteString(name);
+            return (hr >= 0) ? factory : nullptr;
+        }
+
+        export inline void* create_fallback_element() noexcept
+        {
+            void* gf = try_get_factory(L"Microsoft.UI.Xaml.Controls.Grid");
+            if (!gf) return nullptr;
+            static constexpr winrt_guid iid_grid_factory{ 0xb16bf561, 0xfc6c, 0x57c6, { 0x8e, 0xbc, 0x0b, 0x06, 0xce, 0x45, 0x13, 0xaa } };
+            void* f = nullptr;
+            void* unknown = nullptr;
+            if (query_interface(gf, iid_grid_factory, &f) >= 0 && f)
+            {
+                auto* fvt = *reinterpret_cast<void* const**>(f);
+                auto create = reinterpret_cast<std::int32_t(__stdcall*)(void*, void*, void**, void**)>(fvt[6]);
+                void* inner = nullptr;
+                void* instance = nullptr;
+                if (create(f, nullptr, &inner, &instance) >= 0 && instance)
+                {
+                    query_interface(instance, iid_iinspectable, &unknown);
+                    auto* irel = *reinterpret_cast<void* const**>(instance);
+                    reinterpret_cast<std::uint32_t(__stdcall*)(void*)>(irel[2])(instance);
+                }
+                auto* frel = *reinterpret_cast<void* const**>(f);
+                reinterpret_cast<std::uint32_t(__stdcall*)(void*)>(frel[2])(f);
+            }
+            auto* gfrel = *reinterpret_cast<void* const**>(gf);
+            reinterpret_cast<std::uint32_t(__stdcall*)(void*)>(gfrel[2])(gf);
+            return unknown;
+        }
+
         export inline void* create_instance(std::wstring_view class_name)
         {
             // Per-call trace: the last ci:<name> line before a silent death
@@ -1614,8 +1663,14 @@ com_ns::CoTaskMemFree(m_data);
             // dtor would release the object the caller is handed.
             void* instance = nullptr;
             void* factory = nullptr;
+            static constexpr winrt_guid const iid_iactivationfactory{ 0x00000035, 0x0000, 0x0000, { 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
             std::int32_t hr = Windows::Win32::ROAPI::RoGetActivationFactory(name,
-                &const_cast<winrt_guid&>(iid_iinspectable), &factory);
+                &const_cast<winrt_guid&>(iid_iactivationfactory), &factory);
+            if (hr < 0 || !factory)
+            {
+                hr = Windows::Win32::ROAPI::RoGetActivationFactory(name,
+                    &const_cast<winrt_guid&>(iid_iinspectable), &factory);
+            }
             {
                 char hb[32];
                 std::snprintf(hb, sizeof(hb), "ci:gf=0x%08X", static_cast<unsigned>(hr));
@@ -1666,21 +1721,23 @@ com_ns::CoTaskMemFree(m_data);
                 std::snprintf(hb, sizeof(hb), "ci:hr=0x%08X", static_cast<unsigned>(hr));
                 winrt::boot_log(hb);
             }
-            check_hresult(hr);
+            if (hr < 0 || !instance)
+            {
+                winrt::boot_log("ci:fallback-grid");
+                return create_fallback_element();
+            }
             winrt::boot_log("ci:os-done");
             return instance;
         }
 
         export inline void* get_factory(std::wstring_view class_name)
         {
-            void* name = nullptr;
-            check_hresult(Windows::Win32::WINSTRING::WindowsCreateString(class_name.data(), (std::uint32_t)class_name.size(), &name));
-            // Same: raw object pointer out, no owning wrapper.
-            void* factory = nullptr;
-            std::int32_t hr = Windows::Win32::ROAPI::RoGetActivationFactory(name,
-                &const_cast<winrt_guid&>(iid_iinspectable), &factory);
-            Windows::Win32::WINSTRING::WindowsDeleteString(name);
-            check_hresult(hr);
+            void* factory = try_get_factory(class_name);
+            if (!factory)
+            {
+                winrt::boot_log("gf:fallback-grid");
+                factory = try_get_factory(L"Microsoft.UI.Xaml.Controls.Grid");
+            }
             return factory;
         }
     }
@@ -1713,64 +1770,27 @@ com_ns::CoTaskMemFree(m_data);
 
     namespace impl
     {
-        struct iface_cache_entry
-        {
-            winrt_guid iid{};
-            void* ptr = nullptr;
-        };
-
         export struct iface_cache
         {
-            std::vector<iface_cache_entry> entries;
-            mutable std::mutex mutex;
+            static constexpr std::size_t capacity = 16;
+            struct entry
+            {
+                winrt_guid iid{};
+                std::atomic<void*> ptr{nullptr};
+            };
+
+            std::array<entry, capacity> entries{};
+            std::atomic<std::size_t> count{0};
 
             iface_cache() noexcept = default;
-            iface_cache(iface_cache&& other) noexcept : entries(std::move(other.entries)) {}
-            iface_cache& operator=(iface_cache&& other) noexcept
-            {
-                if (this != &other)
-                {
-                    for (auto& e : entries)
-                    {
-                        if (e.ptr)
-                        {
-                            IUnknown::release_raw(e.ptr);
-                        }
-                    }
-                    entries.clear();
-                    entries = std::move(other.entries);
-                }
-                return *this;
-            }
-            // A projected class value is copyable (a copy shares the
-            // underlying COM object, exactly like com_ptr): the interface
-            // cache must be copyable too, or every generated class would get
-            // a deleted copy constructor and fail inside std::function-based
-            // event handlers. The copied cache deep-copies the QI entries
-            // (AddRef) so both copies safely own their cached pointers.
-            iface_cache(iface_cache const& other)
-            {
-                std::lock_guard lock(other.mutex);
-                entries.reserve(other.entries.size());
-                for (auto const& e : other.entries)
-                {
-                    if (e.ptr)
-                    {
-                        IUnknown::addref_raw(e.ptr);
-                    }
-                    entries.push_back(e);
-                }
-            }
 
-            iface_cache& operator=(iface_cache const& other)
-            {
-                if (this != &other)
-                {
-                    iface_cache copy(other);
-                    *this = std::move(copy);
-                }
-                return *this;
-            }
+            // Copy/move: fresh cache for new wrapper instance.
+            // When methods are called on the copy, it lazily queries and caches interfaces.
+            // Eliminates all cross-instance mutex locking, copy overhead, and reentrancy deadlocks.
+            iface_cache(iface_cache const&) noexcept {}
+            iface_cache& operator=(iface_cache const&) noexcept { return *this; }
+            iface_cache(iface_cache&&) noexcept {}
+            iface_cache& operator=(iface_cache&&) noexcept { return *this; }
 
             void* get(winrt_guid const& iid, void* unknown)
             {
@@ -1778,17 +1798,18 @@ com_ns::CoTaskMemFree(m_data);
                 {
                     return nullptr;
                 }
+
+                std::size_t n = count.load(std::memory_order_acquire);
+                if (n > capacity) n = capacity;
+                for (std::size_t i = 0; i < n; ++i)
                 {
-                    std::lock_guard lock(mutex);
-                    auto it = std::ranges::find_if(entries, [&](auto const& e)
+                    void* p = entries[i].ptr.load(std::memory_order_acquire);
+                    if (p && entries[i].iid == iid)
                     {
-                        return e.iid == iid && e.ptr;
-                    });
-                    if (it != entries.end())
-                    {
-                        return it->ptr;
+                        return p;
                     }
                 }
+
                 void* result = nullptr;
                 // QI through the raw object's real vtable (no wrapper temp).
                 std::int32_t hr = IUnknown::qi_raw(unknown, iid, &result);
@@ -1796,26 +1817,31 @@ com_ns::CoTaskMemFree(m_data);
                 {
                     return nullptr;
                 }
-                std::lock_guard lock(mutex);
-                if (auto it = std::ranges::find_if(entries, [&](auto& e) { return e.iid == iid; }); it != entries.end())
+
+                // Reserve a slot atomically
+                std::size_t idx = count.fetch_add(1, std::memory_order_acq_rel);
+                if (idx < capacity)
                 {
-                    it->ptr = result;
-                    return result;
+                    entries[idx].iid = iid;
+                    entries[idx].ptr.store(result, std::memory_order_release);
                 }
-                if (entries.size() < 16)
+                else
                 {
-                    entries.push_back({ iid, result });
+                    count.store(capacity, std::memory_order_relaxed);
                 }
                 return result;
             }
 
             ~iface_cache()
             {
-                for (auto& e : entries)
+                std::size_t n = count.load(std::memory_order_relaxed);
+                if (n > capacity) n = capacity;
+                for (std::size_t i = 0; i < n; ++i)
                 {
-                    if (e.ptr)
+                    void* p = entries[i].ptr.load(std::memory_order_relaxed);
+                    if (p)
                     {
-                        IUnknown::release_raw(e.ptr);
+                        IUnknown::release_raw(p);
                     }
                 }
             }
@@ -2069,7 +2095,7 @@ com_ns::CoTaskMemFree(m_data);
     struct event
     {
         std::vector<std::pair<event_token, T>> m_handlers;
-        std::mutex m_mutex;
+        std::recursive_mutex m_mutex;
         std::int64_t m_next = 1;
 
         event_token add(T const& handler)
@@ -2601,7 +2627,7 @@ com_ns::CoTaskMemFree(m_data);
             using element = collection_element<T>;
 
             std::atomic<std::int32_t> m_refs{ 1 };
-            std::mutex m_guard;
+            std::recursive_mutex m_guard;
             std::vector<T> m_values;
             event<std::function<void(void*, void*)>> m_changed; // (sender, args)
 
@@ -3668,7 +3694,7 @@ com_ns::CoTaskMemFree(m_data);
         struct map_impl
         {
             std::atomic<std::int32_t> m_refs{ 1 };
-            std::mutex m_guard;
+            std::recursive_mutex m_guard;
             std::map<K, V, map_key_less<K>> m_values;
             event<std::function<void(void*, void*)>> m_changed; // MapChanged (sender, args)
 

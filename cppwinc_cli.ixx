@@ -27,9 +27,9 @@ constexpr option options[] =
     { "exclude", "<list>", "Namespace prefixes to exclude, as ONE comma-separated list or repeated switches (e.g. -exclude Windows.Win32.DirectWrite,Windows.Win32.Com) - takes precedence over -include", 0 },
     { "base", {}, "Generate base module unconditionally", 0 },
     { "std", "[<path>]", "Build the std named module into <path> (default: output folder)", 1 },
-    { "winui", "[<path>]", "Auto-discover WASDK metadata + DLLs; build Microsoft.UI.Xaml projection if runtime DLLs not found. Optional <path> = folder receiving ONLY the final linked binaries (modules stay in -output)", 1 },
-    { "winui_no_compile", "[<path>]", "Like -winui but skip compilation (generate only); same optional <path> outpath support", 1 },
-    { "compile", "[<path>]", "Compile modules (release: /MD /O2, parallel across all cores) + link exe / sys / release dll. With -input: compiles the generated projection; optional <path> = folder receiving ONLY the final linked binaries. Alone: quick-test - compiles <path>'s .ixx modules + .cpp sources and links <name>.exe/.sys/.dll (intermediates stay in <path>/build)", 1 },
+    { "winui", "[exp] [debug] [<path>]", "Auto-discover WASDK metadata + DLLs; build Microsoft.UI.Xaml projection if runtime DLLs not found. 'exp' = latest experimental winmds only (default: latest stable); 'debug' = debug build (/MDd /Od /Zi /D_DEBUG); optional <path> = folder receiving ONLY the final linked binaries (modules stay in -output)", 3 },
+    { "winui_no_compile", "[exp] [<path>]", "Like -winui but skip compilation (generate only); same optional 'exp' channel and <path> outpath support (+ resources.pri, Assets, LICENSE, bootstrap DLL beside the output)", 2 },
+    { "compile", "[debug] [<path>]", "Compile modules (release: /MD /O2, or debug: /MDd /Od /Zi /D_DEBUG with 'debug') + link exe / sys / release dll. With -input: compiles the generated projection; optional <path> = folder receiving ONLY the final linked binaries. Alone: quick-test - compiles <path>'s .ixx modules + .cpp sources and links <name>.exe/.sys/.dll (intermediates stay in <path>/build)", 2 },
     { "target", "<list>", "Link targets for -compile (requires -compile): comma-separated exe, sys, dll (default: auto-detect from sources; every matching target links in one pass). Output location: -compile path, else -output, else the project folder", 0 },
     { "help", {}, "Show detailed help with examples", 0 },
     { "?", {}, {}, 0 },
@@ -238,6 +238,30 @@ struct arg_parser
                 values.push_back(raw[i]);
                 ++i;
             }
+            if (name == "winui" || name == "winui_no_compile" || name == "compile")
+            {
+                for (auto vit = values.begin(); vit != values.end(); )
+                {
+                    if (*vit == "exp" && (name == "winui" || name == "winui_no_compile"))
+                    {
+                        if (args.contains("wasdk_exp"))
+                            throw std::runtime_error("duplicate exp argument: the experimental channel may be given once (-winui exp / -winui_no_compile exp)");
+                        args["wasdk_exp"] = {};
+                        vit = values.erase(vit);
+                    }
+                    else if (*vit == "debug" && (name == "winui" || name == "compile"))
+                    {
+                        if (args.contains("debug"))
+                            throw std::runtime_error("duplicate debug argument: debug may be given once");
+                        args["debug"] = {};
+                        vit = values.erase(vit);
+                    }
+                    else
+                    {
+                        ++vit;
+                    }
+                }
+            }
             if (opt->max != 0 && values.size() > opt->max)
             {
                 throw std::runtime_error("too many values for option: " + name
@@ -421,7 +445,13 @@ std::vector<std::filesystem::path> resolve_sdk()
 // Discover WASDK winmds from NuGet package cache.
 // Searches ~/.nuget/packages/microsoft.windowsappsdk.winui/<latest>/metadata/
 // and  ~/.nuget/packages/microsoft.windowsappsdk.foundation/<latest>/metadata/
-std::vector<std::filesystem::path> resolve_wasdk()
+static bool wasdk_channel_ok(std::string_view dir_name, bool exp)
+{
+    bool const is_exp = dir_name.find("-experimental") != std::string_view::npos;
+    return exp ? is_exp : !is_exp;
+}
+
+std::vector<std::filesystem::path> resolve_wasdk(bool exp = false)
 {
     std::vector<std::filesystem::path> result;
     // NuGet global packages folder (shared resolver: NUGET_PACKAGES first,
@@ -439,7 +469,7 @@ std::vector<std::filesystem::path> resolve_wasdk()
             if (entry.is_directory())
             {
                 auto const& p = entry.path().filename().string();
-                if (!p.empty() && std::isdigit(static_cast<unsigned char>(p.front())))
+                if (!p.empty() && std::isdigit(static_cast<unsigned char>(p.front())) && wasdk_channel_ok(p, exp))
                 {
                     if (latest_ver.empty() || p > latest_ver.filename().string())
                     {
@@ -471,7 +501,7 @@ std::vector<std::filesystem::path> resolve_wasdk()
             if (entry.is_directory())
             {
                 auto const& p = entry.path().filename().string();
-                if (!p.empty() && std::isdigit(static_cast<unsigned char>(p.front())))
+                if (!p.empty() && std::isdigit(static_cast<unsigned char>(p.front())) && wasdk_channel_ok(p, exp))
                 {
                     if (latest_ver.empty() || p > latest_ver.filename().string())
                     {
