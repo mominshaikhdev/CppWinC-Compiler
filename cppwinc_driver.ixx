@@ -14,6 +14,15 @@ void replace_all(std::string& value, std::string_view from, std::string_view to)
     }
 }
 
+inline bool is_path_under_externals(std::filesystem::path const& p)
+{
+    for (auto const& part : p)
+    {
+        if (part == "externals") return true;
+    }
+    return false;
+}
+
 // locate the MSVC toolchain directory (modules\std.ixx lives under it):
 // use the dev-prompt env var when present, otherwise vswhere
 std::filesystem::path locate_msvc_toolchain()
@@ -748,6 +757,8 @@ void process_args(arg_parser const& args)
     std::filesystem::create_directories(output);
     settings.output_folder = std::filesystem::canonical(output).string();
     settings.output_folder += std::filesystem::path::preferred_separator;
+    std::error_code ext_ec;
+    std::filesystem::create_directories(std::filesystem::path(settings.output_folder) / "externals" / "include", ext_ec);
 
     if (settings.component)
     {
@@ -2183,6 +2194,7 @@ export int run(int const, char**)
         std::map<std::string, std::string, std::less<>> ns_owner;
         auto write_output_file = [&](std::filesystem::path const& path, std::string const& content)
         {
+            if (is_path_under_externals(path)) return;
             {
                 std::lock_guard<std::mutex> lock(write_mutex);
                 emitted_this_run.insert(path.stem().string());
@@ -3113,6 +3125,7 @@ export int run(int const, char**)
                 // Events other views attached to THIS view's instances
                 // (driver-aggregated; emitted as forwarding accessors).
                 std::vector<std::string> exposed_component_events;
+                std::vector<std::string> extra_app_resources;
             };
             std::vector<view_job> view_jobs;
             // Names of every type the loaded metadata actually exports. The view
@@ -3321,6 +3334,32 @@ export int run(int const, char**)
                         vj.exposed_component_events.assign(it->second.begin(), it->second.end());
                 }
             }
+            // Collect extra resources from resource dictionary views (e.g. *Resources, ItemTemplates)
+            // so the Application view merges them into app.Resources()
+            std::vector<std::string> app_extra_resources;
+            for (auto const& vj : view_jobs)
+            {
+                if (vj.view_name != "App" && (vj.view_name.ends_with("Resources") || vj.view_name == "ItemTemplates"))
+                {
+                    winuic::layout_view rlv = winuic::parse_layout_json(vj.json, vj.view_name);
+                    auto collect = [&](auto const& self, winuic::layout_node const& node) -> void {
+                        for (auto const& [k, v] : node.raw_attrs) {
+                            if (k == "Resource" || k == "Resources") {
+                                if (!v.empty()) app_extra_resources.push_back(v);
+                            }
+                        }
+                        for (auto const& ch : node.children) self(self, ch);
+                    };
+                    for (auto const& rn : rlv.root) collect(collect, rn);
+                }
+            }
+            for (auto& vj : view_jobs)
+            {
+                if (vj.view_name == "App" || vj.base_type == "Application")
+                {
+                    vj.extra_app_resources = app_extra_resources;
+                }
+            }
             if (!view_jobs.empty()) phase("view emission start");
             // Emit view modules in parallel on all cores
             if (view_jobs.size() > 1)
@@ -3360,6 +3399,7 @@ export int run(int const, char**)
                             lv.shell_window = vj.shell_window;
                             lv.component_view_imports = vj.component_view_imports;
                             lv.exposed_component_events = vj.exposed_component_events;
+                            lv.extra_app_resources = vj.extra_app_resources;
                             // Only the window view hosts the nav map: pages
                             // must not import the component module (their own
                             // class name would collide with the component
@@ -3400,6 +3440,7 @@ export int run(int const, char**)
                 lv.shell_window = vj.shell_window;
                 lv.component_view_imports = vj.component_view_imports;
                 lv.exposed_component_events = vj.exposed_component_events;
+                lv.extra_app_resources = vj.extra_app_resources;
                 // Window view only - see the parallel-path comment above.
                 if (vj.view_name == main_window_class)
                     lv.nav_pages = nav_pages;
@@ -5073,6 +5114,7 @@ export int run(int const, char**)
             std::vector<std::filesystem::path> stale;
             for (auto const& entry : std::filesystem::directory_iterator(output_folder))
             {
+                if (is_path_under_externals(entry.path())) continue;
                 if (!entry.is_regular_file() || entry.path().extension() != ".ixx") continue;
                 std::string stem = entry.path().stem().string();
                 if (emitted_this_run.contains(stem)) continue;
@@ -5537,6 +5579,7 @@ export int run(int const, char**)
             std::vector<std::filesystem::path> stale;
             for (auto const& entry : std::filesystem::directory_iterator(output_folder))
             {
+                if (is_path_under_externals(entry.path())) continue;
                 if (!entry.is_regular_file() || entry.path().extension() != ".ixx") continue;
                 std::string stem = entry.path().stem().string();
                 if (emitted_this_run.contains(stem)) continue;
@@ -5594,6 +5637,7 @@ export int run(int const, char**)
                 std::map<std::string, std::filesystem::path, std::less<>> stem_path;
                 for (auto const& entry : std::filesystem::directory_iterator(output_folder))
                 {
+                    if (is_path_under_externals(entry.path())) continue;
                     if (!entry.is_regular_file() || entry.path().extension() != ".ixx") continue;
                     stem_path[entry.path().stem().string()] = entry.path();
                 }
@@ -5621,6 +5665,7 @@ export int run(int const, char**)
                 std::vector<std::filesystem::path> extra;
                 for (auto const& entry : std::filesystem::directory_iterator(output_folder))
                 {
+                    if (is_path_under_externals(entry.path())) continue;
                     if (!entry.is_regular_file() || entry.path().extension() != ".ixx") continue;
                     std::string stem = entry.path().stem().string();
                     bool generator_winrt = stem == "winrt_base" || stem.starts_with("winrt.");
@@ -6077,6 +6122,7 @@ externals_bundle scan_externals(std::filesystem::path const& proj_folder)
     externals_bundle out;
     std::error_code ec;
     std::filesystem::path root = proj_folder / "externals";
+    std::filesystem::create_directories(root / "include", ec);
     if (!std::filesystem::is_directory(root, ec)) return out;
 
     std::set<std::string, std::less<>> inc, libs, dlls;
@@ -7178,10 +7224,12 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
         }
 
         // externals/**.dll ride next to the binaries they were built for.
+        if (!is_path_under_externals(final_dir))
         {
             std::error_code dec;
             for (auto const& dll : ext.dlls)
             {
+                if (is_path_under_externals(final_dir / dll.filename())) continue;
                 std::filesystem::copy_file(dll, final_dir / dll.filename(),
                     std::filesystem::copy_options::overwrite_existing, dec);
                 if (dec)

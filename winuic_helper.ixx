@@ -49,14 +49,54 @@ inline std::string escape_wstr(std::string const& s)
 {
     std::string r;
     r.reserve(s.size() + 8);
-    for (char c : s) {
-        switch (c) {
-        case '\\': r += "\\\\"; break;
-        case '"':  r += "\\\""; break;
-        case '\n': r += "\\n"; break;
-        case '\r': r += "\\r"; break;
-        case '\t': r += "\\t"; break;
-        default:   r += c; break;
+    size_t i = 0;
+    while (i < s.size()) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c < 128) {
+            switch (c) {
+            case '\\': r += "\\\\"; break;
+            case '"':  r += "\\\""; break;
+            case '\n': r += "\\n"; break;
+            case '\r': r += "\\r"; break;
+            case '\t': r += "\\t"; break;
+            default:   r += static_cast<char>(c); break;
+            }
+            ++i;
+        } else {
+            uint32_t cp = 0;
+            int len = 0;
+            if ((c & 0xE0) == 0xC0) {
+                cp = c & 0x1F; len = 2;
+            } else if ((c & 0xF0) == 0xE0) {
+                cp = c & 0x0F; len = 3;
+            } else if ((c & 0xF8) == 0xF0) {
+                cp = c & 0x07; len = 4;
+            } else {
+                ++i;
+                continue;
+            }
+            bool valid = true;
+            for (int k = 1; k < len; ++k) {
+                if (i + k >= s.size() || (static_cast<unsigned char>(s[i + k]) & 0xC0) != 0x80) {
+                    valid = false;
+                    break;
+                }
+                cp = (cp << 6) | (static_cast<unsigned char>(s[i + k]) & 0x3F);
+            }
+            if (valid) {
+                i += len;
+                if (cp <= 0xFFFF) {
+                    char buf[16];
+                    snprintf(buf, sizeof(buf), "\\u%04X", cp);
+                    r += buf;
+                } else {
+                    char buf[16];
+                    snprintf(buf, sizeof(buf), "\\U%08X", cp);
+                    r += buf;
+                }
+            } else {
+                ++i;
+            }
         }
     }
     return r;
@@ -1734,9 +1774,9 @@ inline std::string box_if_inspectable(std::string_view pk, std::string const& va
     // Already an L"..." or "..." string literal — wrap in box_value BEFORE checking parens
     // so strings like L"System Backdrops (Mica/Acrylic)" are boxed properly.
     bool already_wstr = (val.size() > 2 && val[0] == 'L' && val[1] == '"' && val.back() == '"');
-    if (already_wstr) return "winrt::box_value(" + val + ")";
+    if (already_wstr) return "winrt::box_value(winrt::hstring(" + val + "))";
     bool already_str = (val.size() >= 2 && val.front() == '"' && val.back() == '"');
-    if (already_str) return "winrt::box_value(" + val + ")";
+    if (already_str) return "winrt::box_value(winrt::hstring(L" + val + "))";
     if (val.find("(") != std::string::npos && val.find(")") != std::string::npos) return val;
     if (val.find("box_value") != std::string::npos) return val;
     if (val.find("make_solid_brush") != std::string::npos) return val;
@@ -1744,7 +1784,7 @@ inline std::string box_if_inspectable(std::string_view pk, std::string const& va
     if (val.find("from_abi") != std::string::npos) return val;
     bool is_num = !val.empty() && (std::isdigit(static_cast<unsigned char>(val.front())) || val.front() == '-');
     if (is_num) return "winrt::box_value(" + val + ")";
-    return "winrt::box_value(L\"" + val + "\")";
+    return "winrt::box_value(winrt::hstring(L\"" + val + "\"))";
 }
 
 // Control-aware overload: checks if the property actually needs boxing for this control
@@ -1813,9 +1853,9 @@ inline std::string box_if_inspectable(std::string const& control, std::string_vi
     // Already an L"..." or "..." string literal — wrap in box_value BEFORE checking parens
     // so strings like L"System Backdrops (Mica/Acrylic)" are boxed properly.
     bool already_wstr = (val.size() > 2 && val[0] == 'L' && val[1] == '"' && val.back() == '"');
-    if (already_wstr) return "winrt::box_value(" + val + ")";
+    if (already_wstr) return "winrt::box_value(winrt::hstring(" + val + "))";
     bool already_str = (val.size() >= 2 && val.front() == '"' && val.back() == '"');
-    if (already_str) return "winrt::box_value(" + val + ")";
+    if (already_str) return "winrt::box_value(winrt::hstring(L" + val + "))";
     if (val.find("(") != std::string::npos && val.find(")") != std::string::npos) return val;
     if (val.find("box_value") != std::string::npos) return val;
     if (val.find("make_solid_brush") != std::string::npos) return val;
@@ -1823,7 +1863,7 @@ inline std::string box_if_inspectable(std::string const& control, std::string_vi
     if (val.find("from_abi") != std::string::npos) return val;
     bool is_num = !val.empty() && (std::isdigit(static_cast<unsigned char>(val.front())) || val.front() == '-');
     if (is_num) return "winrt::box_value(" + val + ")";
-    return "winrt::box_value(L\"" + val + "\")";
+    return "winrt::box_value(winrt::hstring(L\"" + val + "\"))";
 }
 
 // Named colors that map to Windows::UI::Color via Colors:: helper
@@ -2623,6 +2663,18 @@ inline std::string resolve_prop_value(std::string_view pk, std::string const& va
         // strip trailing () artifact (e.g. "Consolas...()" from chained transforms)
         while (clean.size() >= 2 && clean.back() == ')' && clean[clean.size()-2] == '(')
             clean.pop_back(), clean.pop_back();
+        if (clean.find("SymbolThemeFontFamily") != std::string::npos)
+            clean = "Segoe Fluent Icons, Segoe MDL2 Assets";
+        else if (clean.find("ContentControlThemeFontFamily") != std::string::npos)
+            clean = "Segoe UI";
+        else if (clean.find("Resource ") != std::string::npos)
+        {
+            auto ks = clean.find("Resource ") + 9;
+            auto ke = clean.find('}', ks);
+            if (ke != std::string::npos) clean = clean.substr(ks, ke - ks);
+            if (clean.find("Symbol") != std::string::npos) clean = "Segoe Fluent Icons, Segoe MDL2 Assets";
+            else clean = "Segoe UI";
+        }
         if (!clean.empty())
             return "winrt::Microsoft::UI::Xaml::Media::FontFamily(" + wstr_literal(clean) + ")";
         return ""; // nothing usable - skip the setter rather than crash
@@ -2919,7 +2971,7 @@ inline std::string resolve_prop_value(std::string_view pk, std::string const& va
         {
             bool is_num = std::isdigit(static_cast<unsigned char>(val.front())) || val.front() == '-';
             if (is_num) return "winrt::box_value(" + val + ")";
-            return "winrt::box_value(L\"" + val + "\")";
+            return "winrt::box_value(winrt::hstring(L\"" + val + "\"))";
         }
     }
     // Tag/SelectedItem: IInspectable box_value wrapper
@@ -2929,7 +2981,7 @@ inline std::string resolve_prop_value(std::string_view pk, std::string const& va
         {
             bool is_num = std::isdigit(static_cast<unsigned char>(val.front())) || val.front() == '-';
             if (is_num) return "winrt::box_value(" + val + ")";
-            return "winrt::box_value(L\"" + val + "\")";
+            return "winrt::box_value(winrt::hstring(L\"" + val + "\"))";
         }
     }
     // IconSource: construct proper IconSource type from string value

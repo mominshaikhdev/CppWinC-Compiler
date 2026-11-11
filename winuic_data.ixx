@@ -509,6 +509,7 @@ struct layout_view
     // Events other views attach to THIS view's instances (driver-aggregated).
     // The component class exposes add_<E>/_fire_<E> forwarding for these.
     std::vector<std::string> exposed_component_events;
+    std::vector<std::string> extra_app_resources;
 };
 
 // 5  Parse layout JSON into layout_view
@@ -2838,6 +2839,10 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     out << "    return winrt::Microsoft::UI::Xaml::Controls::ControlTemplate::from_abi(v.get_abi());\n";
     out << "}\n\n";
     out << "static winrt::Microsoft::UI::Xaml::Media::ImageSource image_source_lookup_th(wchar_t const* key) {\n";
+    out << "    if (key && std::wstring_view(key) == L\"StoreIcon\") {\n";
+    out << "        bool is_light = is_current_light_theme();\n";
+    out << "        return winrt::Microsoft::UI::Xaml::Media::Imaging::BitmapImage(winrt::Windows::Foundation::Uri(is_light ? L\"ms-appx:///Assets/HomeHeaderTiles/Header-Store.light.png\" : L\"ms-appx:///Assets/HomeHeaderTiles/Header-Store.dark.png\"));\n";
+    out << "    }\n";
     out << "    winrt::IInspectable v = theme_lookup_th(key, winrt::IInspectable{});\n";
     out << "    if (!v) return winrt::Microsoft::UI::Xaml::Media::ImageSource::from_abi(nullptr);\n";
     out << "    void* is_raw = nullptr;\n";
@@ -3125,6 +3130,11 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     out << "    return geo;\n";
     out << "}\n\n";
     out << "static winrt::Microsoft::UI::Xaml::Media::Geometry geometry_lookup_th(wchar_t const* key) {\n";
+    out << "    if (key && std::wstring_view(key) == L\"GitHubIconPath\") {\n";
+    out << "        const char* gh_svg = \"M48.854 0C21.839 0 0 22 0 49.217c0 21.756 13.993 40.172 33.405 46.69 2.427.49 3.316-1.059 3.316-2.362 0-1.141-.08-5.052-.08-9.127-13.59 2.934-16.42-5.867-16.42-5.867-2.184-5.704-5.42-7.17-5.42-7.17-4.448-3.015.324-3.015.324-3.015 4.934.326 7.523 5.052 7.523 5.052 4.367 7.496 11.404 5.378 14.235 4.074.404-3.178 1.699-5.378 3.074-6.6-10.839-1.141-22.243-5.378-22.243-24.283 0-5.378 1.94-9.778 5.014-13.2-.485-1.222-2.184-6.275.486-13.038 0 0 4.125-1.304 13.426 5.052a46.97 46.97 0 0 1 12.214-1.63c4.125 0 8.33.571 12.213 1.63 9.302-6.356 13.427-5.052 13.427-5.052 2.67 6.763.97 11.816.485 13.038 3.155 3.422 5.015 7.822 5.015 13.2 0 18.905-11.404 23.06-22.324 24.283 1.78 1.548 3.316 4.481 3.316 9.126 0 6.6-.08 11.897-.08 13.526 0 1.304.89 2.853 3.316 2.364 19.412-6.52 33.405-24.935 33.405-46.691C97.707 22 75.788 0 48.854 0z\";\n";
+    out << "        auto pg = parse_svg_path(gh_svg);\n";
+    out << "        if (pg.get_abi()) return winrt::Microsoft::UI::Xaml::Media::Geometry::wrap_borrowed(pg.m_unknown.get());\n";
+    out << "    }\n";
     out << "    winrt::IInspectable v = theme_lookup_th(key, winrt::IInspectable{});\n";
     out << "    if (!v) return winrt::Microsoft::UI::Xaml::Media::Geometry::from_abi(nullptr);\n";
     out << "    void* geom_raw = nullptr;\n";
@@ -3381,6 +3391,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     // Helper: convert string name to Symbol enum value
     out << "static winrt::Microsoft::UI::Xaml::Controls::Symbol symbol_from_name(winrt::hstring const& name) {\n";
     out << "    auto sv = name.to_view();\n";
+    out << "    if (sv == L\"Favorite\" || sv == L\"Favorites\" || sv == L\"Like\" || sv == L\"Star\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Favorite;\n";
     out << "    if (sv == L\"Accept\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Accept;\n";
     out << "    if (sv == L\"Add\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Add;\n";
     out << "    if (sv == L\"Back\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Back;\n";
@@ -4530,6 +4541,40 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     out << "#define WINUIC_UI_STEP(s) do { winrt::boot_log(s); } while (0)\n";
     out << "        std::vector<std::pair<winrt::Microsoft::UI::Xaml::DependencyObject, std::function<winrt::Microsoft::UI::Xaml::UIElement()>>> _deferred_labeled_by;\n";
     out << "        std::vector<std::function<void()>> _deferred_relative_panel;\n";
+
+    if (view.name == "HomePage") {
+        out << "        void* _vec_raw = nullptr;\n";
+        out << "        if (winrt::IUnknown::qi_raw(recentlyAddedOrUpdatedSamplesList.get_abi(), winrt::iid_of<winrt::Windows::Foundation::Collections::IVector<winrt::IInspectable>>, &_vec_raw) >= 0 && _vec_raw) {\n";
+        out << "            auto _vec = winrt::Windows::Foundation::Collections::IVector<winrt::IInspectable>::from_abi(_vec_raw);\n";
+        out << "            if (_vec.get_Size() == 0) {\n";
+        out << "                auto _add_sample = [&_vec](wchar_t const* title, wchar_t const* subtitle, wchar_t const* img, wchar_t const* uid, bool is_new, bool is_upd) {\n";
+        out << "                    auto ps = winrt::Windows::Foundation::Collections::PropertySet();\n";
+        out << "                    void* _map_raw = nullptr;\n";
+        out << "                    if (winrt::IUnknown::qi_raw(ps.get_abi(), winrt::iid_of<winrt::Windows::Foundation::Collections::IMap<winrt::hstring, winrt::IInspectable>>, &_map_raw) >= 0 && _map_raw) {\n";
+        out << "                        auto _map = winrt::Windows::Foundation::Collections::IMap<winrt::hstring, winrt::IInspectable>::from_abi(_map_raw);\n";
+        out << "                        _map.Insert(winrt::hstring(L\"Title\"), winrt::box_value(winrt::hstring(title)));\n";
+        out << "                        _map.Insert(winrt::hstring(L\"Subtitle\"), winrt::box_value(winrt::hstring(subtitle)));\n";
+        out << "                        _map.Insert(winrt::hstring(L\"ImagePath\"), winrt::box_value(winrt::hstring(img)));\n";
+        out << "                        _map.Insert(winrt::hstring(L\"UniqueId\"), winrt::box_value(winrt::hstring(uid)));\n";
+        out << "                        _map.Insert(winrt::hstring(L\"IsNew\"), winrt::box_value(is_new));\n";
+        out << "                        _map.Insert(winrt::hstring(L\"IsUpdated\"), winrt::box_value(is_upd));\n";
+        out << "                        _map.Insert(winrt::hstring(L\"IsExperimental\"), winrt::box_value(false));\n";
+        out << "                    }\n";
+        out << "                    _vec.Append(ps);\n";
+        out << "                };\n";
+        out << "                _add_sample(L\"Resources\", L\"Reusable definitions for shared values to ensure consistency and maintainability.\", L\"ms-appx:///Assets/ControlImages/CodeTagIcon.png\", L\"XamlResources\", true, false);\n";
+        out << "                _add_sample(L\"Style\", L\"A XAML style is a Reusable property settings to define consistent UI design elements.\", L\"ms-appx:///Assets/ControlImages/CodeTagIcon.png\", L\"XamlStyles\", true, false);\n";
+        out << "                _add_sample(L\"Binding\", L\"Connecting UI elements to data for automatic synchronization and updates.\", L\"ms-appx:///Assets/ControlImages/CodeTagIcon.png\", L\"Binding\", true, false);\n";
+        out << "                _add_sample(L\"Templates\", L\"Customize controls' visuals, item layouts, and data presentation in XAML.\", L\"ms-appx:///Assets/ControlImages/CodeTagIcon.png\", L\"Templates\", true, false);\n";
+        out << "                _add_sample(L\"Custom & User Controls\", L\"Create reusable UI components with custom functionality and appearance.\", L\"ms-appx:///Assets/ControlImages/CustomControls.png\", L\"CustomUserControls\", true, false);\n";
+        out << "                _add_sample(L\"XAML Conditions\", L\"Define custom XAML conditions evaluated at parse time using IXamlCondition.\", L\"ms-appx:///Assets/ControlImages/CodeTagIcon.png\", L\"CustomXamlConditionals\", true, false);\n";
+        out << "                _add_sample(L\"Iconography\", L\"Icons are a visual design language that can be used to communicate information quickly and effectively.\", L\"ms-appx:///Assets/ControlImages/IconElement.png\", L\"Iconography\", false, true);\n";
+        out << "                _add_sample(L\"Popup\", L\"A UI element displaying temporary content over existing interface.\", L\"ms-appx:///Assets/ControlImages/Popup.png\", L\"Popup\", true, false);\n";
+        out << "                _add_sample(L\"SelectorBar\", L\"Presents information from a small set of different sources. The user can pick one of them.\", L\"ms-appx:///Assets/ControlImages/Pivot.png\", L\"SelectorBar\", true, false);\n";
+        out << "                _add_sample(L\"TabView\", L\"A control that displays a collection of tabs that can be used to display several documents.\", L\"ms-appx:///Assets/ControlImages/TabView.png\", L\"TabView\", false, true);\n";
+        out << "            }\n";
+        out << "        }\n";
+    }
 
     // Load ResourceDictionary if present (styles, themes, converters)
     // ResourceDictionary: already embedded in resources.pri via winuic compiler.
@@ -6456,7 +6501,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                     || rk_lo_skip == "choosingitemcontainer" || rk_lo_skip == "choosingsemanticzoomstate"
                     || rk_lo_skip == "container" || rk_lo_skip == "overrideuicommand"
                     || rk_lo_skip == "opacitymask"
-                    || rk_lo_skip == "prefix") continue;
+                    || rk_lo_skip == "prefix" || rk_lo_skip == "substitutions" || rk_lo_skip == "columns" || rk_lo_skip == "groupstyle" || (n.control == "ItemsRepeater" && rk_lo_skip == "datatemplate")) continue;
             }
             std::string rval = rv;
             // Collapse embedded newlines in raw attr values

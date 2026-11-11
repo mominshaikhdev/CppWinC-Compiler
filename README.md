@@ -8,6 +8,67 @@
 > (interface projections, activation factories) is inherent to the WinRT
 > ABI itself. Licensed under MIT, Copyright (c) 2026 Momin Shaikh.
 
+---
+
+## Table of Contents
+
+1. [Headline Features](#headline-features)
+2. [WinUI 3 Projection](#winui-3-projection)
+   - [Manual Editing, Business Logic & Third-Party Control Integration](#manual-editing-business-logic--third-party-control-integration)
+   - [Metadata-First WinUI 3 Architecture & Rebuild-Free Evolution](#metadata-first-winui-3-architecture--rebuild-free-evolution)
+   - [Brush and Color Handling](#brush-and-color-handling)
+   - [Geometry and SVG Path Handling](#geometry-and-svg-path-handling)
+   - [Font and Icon Handling](#font-and-icon-handling)
+   - [Dynamic Resource Dictionary & Theme Lookup](#dynamic-resource-dictionary--theme-lookup)
+   - [Untyped Item Property Access & DataTemplate Handling](#untyped-item-property-access--datatemplate-handling)
+3. [WinRT Projection](#winrt-projection)
+   - [Runtime Helpers (`winrt_base`)](#runtime-helpers-winrt_base)
+   - [Component Module Structs](#component-module-structs)
+   - [Example — Async File I/O](#example--async-file-io)
+   - [Example — WinRT Collections and Property Sets](#example--winrt-collections-and-property-sets)
+   - [Example — WinRT Coroutines](#example--winrt-coroutines)
+4. [Win32 API Projection](#win32-api-projection)
+   - [What is Projected](#what-is-projected)
+   - [Projection Semantics](#projection-semantics)
+   - [Example — Win32 File I/O](#example--win32-file-io)
+   - [Example — Win32 Registry](#example--win32-registry)
+   - [Example — Win32 Window Creation](#example--win32-window-creation)
+5. [Driver (WDK) API Projection](#driver-wdk-api-projection)
+   - [What is Projected](#what-is-projected-1)
+   - [Driver Projection Semantics](#driver-projection-semantics)
+   - [Example — Type-Safe Integer Conversions (BASETSD)](#example--type-safe-integer-conversions-basetsd)
+   - [Example — String Safety (STRSAFE)](#example--string-safety-strsafe)
+   - [Example — Network Extensions (PACKET / RING)](#example--network-extensions-packet--ring)
+   - [Example — RPC Client (RPCDCE)](#example--rpc-client-rpcdce)
+   - [Example — TPM Base Services (TBS)](#example--tpm-base-services-tbs)
+6. [Combined WinUI 3 + WinRT + Win32 + WDK](#combined-winui-3--winrt--win32--wdk)
+   - [Generate All Four Projections](#generate-all-four-projections)
+   - [Example — WinRT Async + Win32 File I/O](#example--winrt-async--win32-file-io)
+   - [Example — Win32 + WDK Shared Types](#example--win32--wdk-shared-types)
+7. [External C++ code: headers, libs, DLLs (externals/)](#external-c-code-headers-libs-dlls-externals)
+8. [Usage & CLI Reference](#usage)
+   - [Generate a Projection](#generate-a-projection)
+   - [Generate a Win32 Projection](#generate-a-win32-projection)
+   - [Generate a Component with `-component`](#generate-a-component-with--component)
+   - [Authoring a General WinRT Component (`-component` for Plain APIs)](#authoring-a-general-winrt-component--component-for-plain-apis)
+   - [MIDL-Authored Components (`midlrt` + `-component`)](#midl-authored-components-midlrt---component)
+   - [Generate a Driver (WDK) Projection](#generate-a-driver-wdk-projection)
+   - [Build the std Module](#build-the-std-module)
+   - [Compile Generated Modules](#compile-generated-modules)
+   - [Build with `-compile` (and `-target`)](#build-with--compile-and--target)
+   - [One-Shot Build with `-winui`](#one-shot-build-with--winui)
+     - [App Naming](#app-naming)
+     - [Experimental Channel (`exp`)](#experimental-channel-exp)
+     - [Debug Builds (`debug`)](#debug-builds-debug)
+     - [System Metadata and Module Selection](#system-metadata-and-module-selection)
+9. [Module Compilation](#module-compilation)
+10. [Long Paths](#long-paths)
+11. [Building the Tool](#building-the-tool)
+12. [Related Projects](#related-projects)
+13. [License](#license)
+
+---
+
 `CppWinC.exe` is a **unified** projection and component generator for C++23.
 It reads ECMA-335 metadata (`.winmd` files) and emits modern C++23
 **named modules** — no header files, no precompiled headers, no `pch.h`.
@@ -25,6 +86,8 @@ WinUI 3 and WinRT modules import `winrt_base` for the runtime wrapper layer
 (`hstring`, `com_ptr`, coroutines, etc.). Win32 and WDK modules are plain C++
 with no runtime dependency — direct `extern "C"` linkage, RAII handle wrappers,
 and correct calling conventions.
+
+---
 
 ## Headline features
 
@@ -90,7 +153,397 @@ and correct calling conventions.
   consumers full access to inherited properties, events and methods without
   casting.
 
+## WinUI 3 Projection
+
+`CppWinC` provides first-class, projection-agnostic compilation for WinUI 3 desktop applications. Driven directly by ECMA-335 `.winmd` metadata containing `WinUIAttribute` AST payloads and `WinUIControlCatalogAttribute` definitions, `CppWinC` generates modular C++23 views and links against the Windows App SDK without requiring manual XAML code-behind.
+
+### Manual Editing, Business Logic & Third-Party Control Integration
+
+While `CppWinC` generates complete, turnkey view modules automatically from XAML AST metadata, developers maintain full control. Generated views are pure C++23 modules with zero proprietary lock-in or "black box" code generation:
+
+#### 1. Inspecting & Manually Customizing Generated Views
+
+Every XAML view compiles into a cleanly formatted C++23 module (`<Namespace>.<ViewName>.ixx`) defining an exported class:
+
+```cpp
+// Example: generated HomePageView in WinUIGallery.HomePage.ixx
+export class HomePageView : public Microsoft::UI::Xaml::Controls::UserControl
+{
+public:
+    HomePageView() { BuildUI(); }
+
+    // Named XAML elements (x:Name="...") emitted as public, strongly-typed members:
+    winrt::Microsoft::UI::Xaml::Controls::GridView FavoriteSamples;
+    winrt::Microsoft::UI::Xaml::Controls::SelectorBar FilterBar;
+    HorizontalScrollContainer RecentlyVisitedContainer;
+    winrt::Microsoft::UI::Xaml::Controls::TextBlock RecentlyVisitedTitle;
+
+    // Reactive bindings and child views:
+    std::vector<std::function<void()>> m_bindings;
+    void update_bindings() { for (auto const& fn : m_bindings) fn(); }
+
+    void BuildUI();
+};
+```
+
+Because elements are strongly typed members:
+- **Direct Event Overrides & Handlers:** Hook events programmatically at runtime without touching generated XAML parser logic:
+  ```cpp
+  auto view = std::make_shared<HomePageView>();
+  view->FilterBar.SelectionChanged([](auto const& sender, auto const& args) {
+      // Bespoke filtering or event handling logic
+  });
+  ```
+- **Custom Composition & Animations:** Access WinUI composition visuals (`ElementCompositionPreview::GetElementVisual(view->RecentlyVisitedContainer)`) to run fluid spring physics, connected animations, or Win2D canvas drawing.
+- **In-Place Editing:** You can directly modify `BuildUI()` inside the generated `.ixx` file to customize layout trees, insert custom UI containers, or override styles.
+
+#### 2. Business Logic & MVVM Integration
+
+Connect views to C++23 view models, state containers, data binding models (`INotifyPropertyChanged`, `IObservableVector`), and background worker coroutines (`co_await winrt::resume_background()`):
+
+```cpp
+// Sample C++23 ViewModel module:
+export module MyApp.SampleViewModel;
+
+import std;
+import winrt_base;
+import winrt.Windows.Foundation;
+import winrt.Windows.Foundation.Collections;
+import winrt.Microsoft.UI.Xaml.Data;
+import winrt.Microsoft.UI.Dispatching;
+
+export struct SampleViewModel : winrt::implements<SampleViewModel,
+    winrt::Microsoft::UI::Xaml::Data::INotifyPropertyChanged>
+{
+    winrt::hstring m_title{ L"Initial Title" };
+    winrt::event<winrt::Microsoft::UI::Xaml::Data::PropertyChangedEventHandler> m_propertyChanged;
+    winrt::Windows::Foundation::Collections::IObservableVector<winrt::IInspectable> m_items =
+        winrt::single_threaded_observable_vector<winrt::IInspectable>();
+
+    winrt::event_token PropertyChanged(winrt::Microsoft::UI::Xaml::Data::PropertyChangedEventHandler const& handler) {
+        return m_propertyChanged.add(handler);
+    }
+    void PropertyChanged(winrt::event_token const& token) noexcept {
+        m_propertyChanged.remove(token);
+    }
+
+    winrt::hstring Title() const { return m_title; }
+    void Title(winrt::hstring const& value) {
+        if (m_title != value) {
+            m_title = value;
+            m_propertyChanged(*this, winrt::Microsoft::UI::Xaml::Data::PropertyChangedEventArgs{ L"Title" });
+        }
+    }
+
+    winrt::Windows::Foundation::Collections::IObservableVector<winrt::IInspectable> Items() const {
+        return m_items;
+    }
+
+    // Coroutine offloading intensive work to thread pool:
+    winrt::Windows::Foundation::IAsyncAction LoadDataAsync(winrt::Microsoft::UI::Dispatching::DispatcherQueue queue) {
+        co_await winrt::resume_background(); // Worker thread
+
+        std::vector<winrt::hstring> loaded;
+        for (int i = 1; i <= 50; ++i) {
+            loaded.push_back(winrt::to_hstring(std::format("Data Record #{}", i)));
+        }
+
+        co_await winrt::resume_foreground(queue); // Dispatch back to UI thread
+        for (auto const& item : loaded) {
+            m_items.Append(winrt::box_value(item));
+        }
+    }
+};
+```
+
+##### Connecting the ViewModel to the View (Same File vs. New File)
+
+You can connect your ViewModel to the View using either of two patterns:
+
+**1. In a Separate File / Host Controller (Recommended for Production & Non-Destructive Regeneration)**
+- **Why:** Re-running `cppwinc` into `-output` updates and overwrites the generated view `.ixx` files when XAML metadata changes. Placing your business logic, ViewModel definitions, and event wiring in a separate companion file (e.g. `SampleViewModel.ixx`, `HomePageController.cpp`, or inside your navigation container in `MainWindow.ixx`) ensures your custom C++ code is never overwritten during UI regeneration.
+- **Implementation:**
+  ```cpp
+  // In a separate host/controller file (e.g., PageNavigator.cpp or MainWindow.ixx):
+  import MyApp.HomePage;
+  import MyApp.SampleViewModel;
+
+  void NavigateToHomePage(Microsoft::UI::Xaml::Controls::Frame const& contentFrame) {
+      auto view = std::make_shared<HomePageView>();
+      auto viewModel = winrt::make_self<SampleViewModel>();
+
+      // Bind ViewModel to View's DataContext:
+      view->DataContext(*viewModel);
+
+      // Trigger background coroutine worker:
+      viewModel->LoadDataAsync(view->DispatcherQueue());
+
+      contentFrame.Content(*view);
+  }
+  ```
+
+**2. Directly Inside the Generated View File (`<ViewName>.ixx`)**
+- **Why:** Convenient when treating `cppwinc` output as a one-time project scaffold or when maintaining the view file directly as authoritative source code.
+- **Implementation:** Import your ViewModel module at the top of `<ViewName>.ixx`, instantiate it inside the View's constructor right after `BuildUI()`, and assign `DataContext`:
+  ```cpp
+  // Inside the generated <ViewName>.ixx:
+  import MyApp.SampleViewModel;
+
+  export class HomePageView : public Microsoft::UI::Xaml::Controls::UserControl
+  {
+  public:
+      HomePageView() {
+          BuildUI();
+
+          // Connect ViewModel directly in the View's constructor:
+          auto vm = winrt::make_self<SampleViewModel>();
+          DataContext(*vm);
+          vm->LoadDataAsync(DispatcherQueue());
+      }
+      // ...
+  };
+  ```
+
+#### 3. Third-Party & In-House Controls Integration
+
+Consume third-party or in-house component suites (vendor controls, open-source libraries, or proprietary internal controls) completely generically with zero hardcoded compiler rules:
+
+- **Modify built-in controls / add your own C++** — put headers and sources under `externals/` and `#include` them from any module; they compile with the same flags as everything else, and their objects join the same links.
+- **Mix in external NuGet third-party controls** — drop the package under `externals/` for its headers/libs/DLLs and pass its `.winmd` manually as a regular `-input` entry (metadata is never auto-discovered). When your own winuic-produced winmd is present in `-input`, every other winmd is treated as a library: its types are projected as ordinary platform types — their namespaces are imported, kept alive by the needed-set, and never misfiled as app/component types.
+- **Create new controls** — write the CppWinC control, pass its `.winmd` via `-input`, drop its binaries under `externals/`, and describe it in a `*.json` catalog next to `winuic.exe` (auto-loaded) if you also want the `.winui` DSL to see it. Downstream, the `.winmd` you consume is language-projection agnostic — winuic/xaml2winuic emit metadata only, and this compiler turns it into C++23 modules.
+
+##### Step-by-Step Integration Workflow:
+
+1. **Drop Binaries into `externals/`:**
+   `cppwinc` automatically creates and scans `externals/` for dependencies without requiring extra compiler flags:
+   ```
+   externals/
+   ├── include/                               <-- C++ headers (added to /I automatically)
+   ├── <ThirdPartyControls>.lib               <-- Import libraries linked automatically
+   └── <ThirdPartyControls>.dll               <-- Copied adjacent to final executable
+   ```
+2. **Provide Metadata to `-input`:**
+   Pass the control's `.winmd` file to `cppwinc`:
+   ```shell
+   cppwinc -input "winuic_out\MyApp.winmd,winmd\Windows.Win32.winmd,externals\<ThirdPartyControls>.winmd" -winui exp -output "out"
+   ```
+3. **Automatic Resource Discovery & Direct Consumption:**
+   `cppwinc` generically inspects the `.winmd` TypeDef tables, automatically discovers and merges any embedded `ResourceDictionary` classes into `Application.Current.Resources.MergedDictionaries` at launch, and projects the controls as strongly-typed C++23 modules:
+   ```cpp
+   import winrt.<ThirdPartyNamespace>;
+
+   // Third-party controls are fully projected and ready to use:
+   winrt::<ThirdPartyNamespace>::<CustomControl> control;
+   control.Header(L"Custom Component");
+   ```
+
+### Metadata-First WinUI 3 Architecture & Rebuild-Free Evolution
+
+All control resolution, type system discovery, container layouts, dimension sizing, property evaluation, and resource handling are driven dynamically from ECMA-335 `.winmd` metadata:
+
+- **Universal Control & Layout Resolution**: The compiler embeds no hardcoded lists of UI controls, panels, or layout containers. Any standard, third-party, custom, or future control (such as future WinUI Gallery releases or new Windows App SDK versions) resolves automatically through its metadata TypeDef, interface hierarchies, and `WinUIControlCatalogAttribute` schema.
+- **Generic Layout & Dimension Sizing**: Layout properties, dimensions (`Width`, `Height`, `MinWidth`, `MaxHeight`), alignment vectors (`HorizontalAlignment`, `VerticalAlignment`), and container-specific sizing definitions (e.g. Grid `Star`, `Auto`, `Pixel`, `GridLength`, and RelativePanel constraints) resolve generically based on the target property type system in metadata, allowing arbitrary nested layouts and containers to size and align correctly.
+- **Dynamic Closure Root Discovery**: Rather than relying on a static set of controls, `cppwinc` parses the `WinUIAttribute` AST payloads from view classes in `.winmd`, extracts all referenced control and type names, matches them against `g_type_ns` in the metadata reader, and dynamically injects them into the module compilation `closure_roots`.
+- **Dynamic Resource Dictionary Integration & Day-1 Unknown Control Discovery**: Controls requiring specialized platform resource dictionaries or external styles are dynamically resolved and instantiated via `winrt::impl::create_instance` and merged into `Application.Current.Resources.MergedDictionaries` at launch. Rather than hardcoding known platform resource dictionaries, `cppwinc` dynamically inspects the `WinUIControlCatalogAttribute` schema from `.winmd` (reading top-level `resource_dictionaries` and per-control `resource_dictionary` declarations) as well as querying all loaded `.winmd` ECMA-335 `TypeDef` tables for any classes ending in `Resources` that derive from `ResourceDictionary`. Discovered resource classes are automatically injected into module `closure_roots` and merged into `MergedDictionaries` at launch, completely decoupling control resources from compiler updates and guaranteeing 100% Day-1 support for any future or unknown controls.
+- **Type-Driven Events & Properties**:
+  - **Events** are resolved dynamically from the winmd `Event` table, flattened across all implemented base classes and interfaces.
+  - **Properties** are resolved from `PropertyDef` rows and getter/setter method signatures. Codegen gates strictly on the property's *underlying metadata type* (primitives, numeric types, enums, strings, brushes, geometries, thicknesses) rather than control names, ensuring full type safety and zero rebuilds for future APIs.
+- **Rebuild-Free Evolution**: Because the entire projection pipeline is generic and metadata-driven, new controls, properties, events, and layouts function seamlessly out of the box with zero compiler rebuilds.
+
+### Brush and Color Handling
+
+WinUI 3 brush and color properties are projected dynamically with full conversion support:
+- **Hex Color Strings (`#RGB`, `#ARGB`, `#RRGGBB`, `#AARRGGBB`)**: Parsed at codegen into 32-bit ARGB values and wrapped in a `SolidColorBrush` via `make_solid_brush(Color{A, R, G, B})`.
+- **Named and Transparent Brushes**: Named colors and `"Transparent"` resolve directly to alpha-zero `Color{0, 0, 0, 0}` solid brushes.
+- **ThemeResource and StaticResource Brushes**: Property setters referencing `{ThemeResource ...}` or `{StaticResource ...}` (e.g. `Foreground="{ThemeResource ButtonForeground}"`) resolve dynamically via runtime resource lookup (`theme_lookup_th` / `resource_lookup_th`) across the application and theme dictionaries.
+- **Property Attribution**: Properties typed as `Microsoft.UI.Xaml.Media.Brush` (e.g. `Foreground`, `Background`, `BorderBrush`, `Fill`, `Stroke`) are safely emitted with SFINAE-guarded setters, preventing empty string or resource-tag misassignment.
+
+### Geometry and SVG Path Handling
+
+Shapes, paths, and vector icons are fully projected without external dependency:
+- **SVG Path Parsing**: Path data strings (such as `M... C... c... a... z` SVG paths) in `PathIcon.Data` or `Path.Data` are parsed at runtime into native WinUI `Geometry` objects via `parse_svg_path(data)`.
+- **Placeholder Geometries**: Properties typed as `Microsoft.UI.Xaml.Media.Geometry` without direct string path data emit safe default `Geometry()` placeholders.
+- **Icon Controls**: Full integration for `PathIcon` (vector paths), `FontIcon` (Segoe Fluent glyphs), `SymbolIcon` (standard symbol enumerations), `BitmapIcon`, and `AnimatedIcon`.
+
+### Font and Icon Handling
+
+- **Font Family Resolution**: Properties typed as `FontFamily` accept string family names (e.g. `Segoe UI`, `Segoe Fluent Icons`) or `{ThemeResource SymbolThemeFontFamily}` and construct `FontFamily(name)`.
+- **Glyph Attribution**: Unicode glyph codepoints (including private-use Segoe Fluent icon glyphs like ``, ``, ``) passed to `FontIcon.Glyph` are forwarded via explicit `winrt::hstring` conversion, ensuring no silent SFINAE discard during C++ template deduction.
+
+### Dynamic Resource Dictionary & Theme Lookup
+
+Resource lookups dynamically search the WinUI 3 resource hierarchy:
+- **Dual Map Interface Query**: WinUI 3 `ResourceDictionary` objects are queried against both WinRT `IMap<IInspectable, IInspectable>` (`0xf5f69427-...`) and `IMap<HSTRING, IInspectable>` (`0x1b0d3570-...`) ABI interfaces, ensuring compatibility across all Windows App SDK versions.
+- **Theme Dictionaries**: Recursive resource traversal (up to 15 levels deep) automatically inspects active `ThemeDictionaries` (`Light`, `Dark`, `HighContrast`) before falling back to application-level resources or default styling.
+
+### Untyped Item Property Access & DataTemplate Handling
+
+- **DataTemplate Property Access**: When data-binding untyped collection items (`item.Property` on `IInspectable`), the compiler guards property access to avoid type-mismatch crashes on heterogeneous collections.
+
+Set `CPPWINC_DUMP_CTRL_MAPS=1` to print the derived maps at startup.
+
 ## WinRT Projection
+
+### Runtime Helpers (`winrt_base`)
+
+Everything an app needs beyond the metadata projection lives in `winrt_base.ixx` (`module winrt_base;`), emitted by `CppWinC` from `strings_data.ixx`. It delivers a complete, headerless C++23 WinRT runtime layer:
+
+- **String Types & Conversions:**
+  - `hstring` — immutable UTF-16 string with atomic reference counting. Supports `size()`, `empty()`, `c_str()`, iterators, concatenation (`+`, `+=`), equality/comparison operators, and implicit conversions to/from `std::wstring`, `std::wstring_view`, `wchar_t const*`, and `std::string_view`.
+  - `hstring_builder` — high-performance string builder for piecewise UTF-16 construction.
+  - `to_hstring(std::string_view)` / `to_hstring(std::wstring_view)` / `to_hstring(char const*)` / `to_hstring(wchar_t const*)` — converts narrow or wide strings to `hstring`.
+  - `to_string(hstring const&)` — converts UTF-16 `hstring` to UTF-8 `std::string`.
+  - `to_wstring(hstring const&)` — converts `hstring` to `std::wstring`.
+
+- **GUIDs & Type Identification:**
+  - `winrt_guid` — 128-bit GUID value type with equality, hashing (`std::hash`), string serialization, and conversion to/from standard Windows `GUID`.
+  - `null_guid` — `constexpr winrt_guid{ 0 }` sentinel.
+  - `iid_of<T>` — template variable resolving the 128-bit interface identifier for any projected WinRT interface or delegate.
+  - `make_generic_iid(pattern, args, count)` — calculates the parameterized interface GUID at runtime using SHA-1 hashing according to the ECMA-335 / WinRT specification.
+
+- **COM & Smart Pointers:**
+  - `com_ptr<T>` — intrusive, atomic reference-counted smart pointer for WinRT and COM interfaces.
+    - Automatic `AddRef()` on copy and `Release()` on destruction.
+    - `put_abi()` — clears current reference and returns `void**` for out-parameters.
+    - `get_abi()` — returns raw underlying interface pointer without affecting ref count.
+    - `detach_abi()` — releases ownership and returns raw pointer.
+    - `attach_abi(raw)` — assumes ownership of an existing raw interface pointer.
+    - `copy_from(raw)` — AddRefs and assigns a raw pointer.
+    - `copy_to(out)` — AddRefs and writes pointer to an out-parameter.
+    - `as<U>()` / `try_as<U>()` — queries interface `U` from `T` via `QueryInterface`.
+  - `IUnknown` / `IInspectable` — projected base interfaces with ABI query, AddRef, Release, and runtime class name interrogation (`GetRuntimeClassName`).
+
+- **Error Handling & Exceptions:**
+  - `hresult_error` — exception class wrapping an `HRESULT` with message formatting and error origin tracking.
+  - Typed exception subclasses:
+    - `hresult_access_denied` (`0x80070005`)
+    - `hresult_invalid_argument` (`0x80070057`)
+    - `hresult_out_of_memory` (`0x8007000E`)
+    - `hresult_canceled` (`0x800704C7`)
+    - `hresult_illegal_method_call` (`0x8000000E`)
+    - `hresult_not_implemented` (`0x80004001`)
+    - `hresult_changed_state`
+    - `hresult_class_not_available`
+    - `hresult_class_not_registered`
+    - `hresult_illegal_delegate_assignment`
+    - `hresult_illegal_state_change`
+    - `hresult_no_interface` (`0x80004002`)
+    - `hresult_out_of_bounds`
+    - `hresult_wrong_thread`
+    - `hresult_type_load`
+  - `check_hresult(HRESULT)` — verifies success; throws the matching typed exception on failure.
+  - `check_bool(bool)` — throws `hresult_invalid_argument` or last error if false.
+  - `check_win32(error)` — validates Win32 error code and throws on failure.
+  - `check_nt(status)` — validates NTSTATUS code and throws on failure.
+  - `check_hresult_allow_bounds(HRESULT)` — allows out-of-bounds sentinel without throwing.
+  - `throw_hresult(HRESULT)` — unconditionally throws the typed error.
+  - `throw_last_error()` — converts Win32 `GetLastError()` to HRESULT and throws.
+  - `hresult_from_win32(error)` — translates a Win32 error code to an HRESULT (`HRESULT_FROM_WIN32`).
+  - `hresult_from_nt(status)` — translates an NTSTATUS code to an HRESULT (`HRESULT_FROM_NT`).
+  - `to_hresult()` / `to_hresult(exception_ptr)` — extracts HRESULT from active C++ exception or structured exception.
+  - `catch_to_hresult()` — catches any in-flight C++ exception and converts it to the equivalent HRESULT.
+
+- **Apartment & Concurrency:**
+  - `apartment_type` — `single_threaded` (STA) or `multi_threaded` (MTA).
+  - `init_apartment(type = multi_threaded)` — initializes COM/WinRT apartment for the current thread.
+  - `uninit_apartment()` — closes the apartment.
+  - `is_sta_thread()` — inspects whether the current thread is in an STA.
+  - `apartment_context` — captures current apartment and dispatches resumption onto it.
+  - `thread_pool` — WinRT system thread pool dispatcher.
+
+- **Coroutines & Asynchronous Programming:**
+  - `cancellable_async_action` / `cancellable_async_operation<T>` — coroutine return types with full cooperative cancellation support.
+  - `attach_cancellable(coro)` — wraps internal coroutines into projected `IAsyncAction` / `IAsyncOperation<T>` interfaces for external callers.
+  - `resume_background()` — awaiter that switches coroutine execution to a thread-pool worker thread.
+  - `resume_apartment()` / `resume_foreground(dispatcher)` — awaiter switching execution to the UI thread or original apartment.
+  - `fire_and_forget` — standard fire-and-forget coroutine return type (no caller synchronization required).
+  - `when_all(...)` — async combinator awaiting completion of all supplied operations.
+  - `when_any(...)` — async combinator awaiting completion of the first supplied operation.
+
+- **Boxing, Unboxing & PropertyValues:**
+  - `box_value(val)` — boxes fundamental types (`bool`, `int8`..`int64`, `uint8`..`uint64`, `float`, `double`, `char16_t`, `hstring`, `winrt_guid`, string literals) into an `IInspectable` PropertyValue.
+  - `unbox_value<T>(inspectable)` — unboxes an `IInspectable` back to type `T` (throws on type mismatch).
+  - `try_unbox<T>(inspectable)` — non-throwing unbox returning `std::optional<T>`.
+  - `unbox_value_at<T>(map, key)` — convenience helper to lookup and unbox from `IMap<hstring, IInspectable>`.
+  - `property_value_factory()` — cached accessor to `IPropertyValueStatics`.
+
+- **Collections & Data Structures:**
+  - `single_threaded_vector<T>()` — instantiates in-memory `IVector<T>` / `IVectorView<T>`.
+  - `single_threaded_observable_vector<T>()` — instantiates `IObservableVector<T>` with change notifications.
+  - `single_threaded_map<K, V>()` — instantiates in-memory `IMap<K, V>` / `IMapView<K, V>`.
+  - `single_threaded_observable_map<K, V>()` — instantiates `IObservableMap<K, V>` with change notifications.
+  - `IReserveableVector<T>` — capacity-reservation extension interface for `IVector<T>` (`Reserve(capacity)`), allowing preallocation before bulk appends without repeated reallocation penalties (the WinRT equivalent of `std::vector::reserve`). Every vector created by the runtime (`single_threaded_vector`, `single_threaded_observable_vector`) implements this interface.
+    > **Provisional IID Warning:** `IReserveableVector` is an extension interface **not** officially defined or shipped by Microsoft in standard WinRT metadata. Its interface ID (`guid_ireserveablevector = { 0x3f7a19c2, 0x6b1e, 0x4d95, { 0x8a, 0x24, 0xd1, 0x5e, 0x9c, 0x47, 0xb3, 0x08 } }`) is **provisional** and defined exclusively in `CppWinC`'s `strings_data.ixx`. It is subject to change if Microsoft or the WinRT specification officially assigns a standardized IID in the future.
+  - Collection GUIDs & type tokens: `guid_iiterable`, `guid_iiterator`, `guid_ivector`, `guid_ivectorview`, `guid_iobservablevector`, `guid_ireserveablevector`, `guid_imap`, `guid_imapview`, `guid_iobservablemap`, `guid_ikeyvaluepair`, `guid_ireference`.
+  - Notification change codes: `collection_change_reset`, `collection_change_item_inserted`, `collection_change_item_removed`, `collection_change_item_changed`.
+  - Change event args: `vector_changed_args<T>`, `map_changed_args<K>`.
+
+- **Events & Delegates:**
+  - Delegates — templated functor wrappers providing `operator()` and comparison for WinRT callbacks.
+  - `event<Delegate>` — type-safe multi-cast event source supporting registration (`+=`), unregistration (`-=`), and invocation.
+  - `event_token` — 64-bit registration token returned upon adding a handler.
+  - `auto_revoke_t` / `auto_revoke` — tag constant for automatic event unregistration.
+  - `event_revoker<I>` — RAII auto-revoker unregistering handlers on destruction.
+
+- **Component Authoring & Class Implementation:**
+  - `implements<D, Interfaces...>` — CRTP base class for authoring custom WinRT runtime classes and interfaces, handling ref counts, `QueryInterface`, and inspectable metadata.
+  - `interface_impl_base<I>` — base class for single interface implementations.
+  - `atomic_ref_count` — atomic thread-safe reference counter used in WinRT classes.
+  - `make<T>(args...)` — allocates a runtime class and returns its default projected interface.
+  - `make_self<T>(args...)` — allocates a runtime class and returns a `com_ptr<T>` to the implementation type.
+  - `get_self<T>(projected)` — extracts the underlying C++ implementation pointer from a projected wrapper.
+  - `non_agile` / `no_weak_ref` — marker mixins for opting out of agile marshaling or weak reference tracking.
+  - `create_instance(class_name)` — activates a runtime class dynamically via `RoGetActivationFactory`.
+  - `register_local_factory(name, fn)` / `try_get_factory(name)` — in-process factory cache for self-hosted components.
+  - `get_factory(name)` / `create_fallback_element()` — factory resolution and fallback instantiation.
+  - `factory_cache<Class, Interface>` — thread-safe activation factory caching helper.
+  - `iface_cache` — per-instance interface query caching.
+  - `deferral_handler` / `iid_of_deferral` — async deferral management helper.
+
+- **Synchronization & Windows Handles:**
+  - `handle_type` / `handle` — RAII wrapper around Win32 `HANDLE`, automatically calling `CloseHandle` on destruction.
+  - `slim_mutex` — lightweight user-mode SRW-based mutex wrapper.
+  - `slim_lock_guard` — RAII exclusive lock guard for `slim_mutex`.
+  - `slim_shared_lock_guard` — RAII shared read lock guard for `slim_mutex`.
+  - `slim_condition_variable` — CONDITION_VARIABLE wrapper.
+
+- **Clock & Time Conversions:**
+  - `clock` — WinRT 100-nanosecond intervals clock type.
+  - `file_time` — `clock::time_point` representation.
+  - `from_file_time(FILETIME)` / `to_file_time(time_point)` — conversions to/from Windows `FILETIME`.
+  - `from_sys(time_point)` / `to_sys(time_point)` — conversions to/from `std::chrono::system_clock`.
+
+- **Diagnostics & Process Lifecycle:**
+  - `boot_log(msg)` / `boot_logf(fmt, ...)` — low-level trace logging.
+  - `crash_report_current_exception()` / `set_crash_reporter()` — automated exception crash reporting with stack and HRESULT diagnostics.
+
+> **Note:** `winrt_base` is only used by WinRT and WinUI projection modules.
+> Win32 and WDK modules do not import `winrt_base` — they use plain C++ types.
+
+### Component Module Structs
+
+The component module (`<Name>.ixx`) exports a struct per WinRT runtime class.
+`class_name()` carries the runtime class's metadata full name **verbatim** —
+including the hyphenated app namespace (`My App` → `My-App`) — because the
+activation key must match the `.winmd`:
+
+```cpp
+export struct MainWindow {
+    static constexpr std::wstring_view class_name() noexcept { return L"My-App.MainWindow"; }
+    winrt::com_ptr<void> m_unknown;
+    mutable winrt::impl::iface_cache m_cache;
+    static MainWindow from_abi(void* ptr) noexcept;
+    template <typename I> void* iface() const;
+    operator winrt::IInspectable() const noexcept;
+    MainWindow() : m_unknown(winrt::impl::create_instance(class_name())) {}
+    using implements_type = MainWindow;
+    using default_interface = winrt::IInspectable;
+};
+```
+
+These structs wrap WinRT activation — constructing one creates the runtime
+instance via the activation factory. The App module uses `Window::from_abi()`
+to project the instance and call `Activate()`.
 
 ### Example — Async file I/O
 
@@ -402,14 +855,28 @@ int main() {
 ### Example — Network extensions (PACKET / RING)
 
 ```cpp
+import std;
 import Windows.Wdk.PACKET;
 import Windows.Wdk.RING;
 
-using namespace Windows::Wdk::PACKET;
-using namespace Windows::Wdk::RING;
+int main() {
+    using namespace Windows::Wdk::PACKET;
+    using namespace Windows::Wdk::RING;
 
-// Query packet extensions and ring buffer management
-// for high-performance network driver I/O
+    // NET_RING descriptor ring for packet queues
+    NET_RING ring{};
+    ring.NumberOfElements = 256;
+    ring.ElementStride = sizeof(NET_PACKET);
+    ring.BeginIndex = 0;
+    ring.EndIndex = 64;
+
+    // Advance ring indices or inspect packet descriptors
+    std::uint32_t available = (ring.EndIndex >= ring.BeginIndex)
+        ? (ring.EndIndex - ring.BeginIndex)
+        : (ring.NumberOfElements - ring.BeginIndex + ring.EndIndex);
+
+    std::cout << "Available packets in ring: " << available << std::endl;
+}
 ```
 
 ### Example — RPC client (RPCDCE)
@@ -523,11 +990,9 @@ void convert_handles() {
 }
 ```
 
-## External C++ code: headers, libs, DLLs (`externals/`)
+## External C++ code: headers, libs, DLLs (externals/)
 
-Extending, modifying and creating controls never requires editing generated
-files or passing extra flags — it is a plain folder convention under the
-projection folder (the `-output` folder, or the folder given to `-compile`):
+Consuming custom C++ code, native C/C++ libraries, and external DLLs never requires editing generated files or passing extra flags — it is a plain folder convention under the projection folder (the `-output` folder, or the folder given to `-compile`):
 
 ```
 externals/
@@ -539,43 +1004,13 @@ externals/
 └── **/*.dll          copied next to the final linked binaries
 ```
 
-NuGet package folders can be dropped in verbatim — `build/native/include`,
-`lib/x64` and `runtimes/win-x64/native` all match the scan. No switches:
-the convention is discovered from the folder itself.
+NuGet package folders can be dropped in verbatim — `build/native/include`, `lib/x64` and `runtimes/win-x64/native` all match the scan. No switches: the convention is discovered from the folder itself. `cppwinc` automatically creates the `externals/` and `externals/include/` directory structure in the target projection folder on every run, so it is always ready for use.
 
-What this gives you:
+What this gives you across all projection targets:
 
-- **Modify built-in controls / add your own C++** — put headers and sources
-  under `externals/` and `#include` them from any module; they compile with
-  the same flags as everything else, and their objects join the same links.
-- **Mix in external NuGet third-party controls** — drop the package under
-  `externals/` for its headers/libs/DLLs and pass its `.winmd` **manually**
-  as a regular `-input` entry (metadata is never auto-discovered). When your
-  own winuic-produced winmd is present in `-input`, every other winmd is
-  treated as a library: its types are projected as ordinary platform types —
-  their namespaces are imported, kept alive by the needed-set, and never
-  misfiled as app/component types.
-- **Create new controls** — write the CppWinC control, pass its `.winmd`
-  via `-input`, drop its binaries under `externals/`, and describe it in a
-  `*.json` catalog next to `winuic.exe` (auto-loaded) if you also want the
-  `.winui` DSL to see it. Downstream, the `.winmd` you consume is
-  language-projection agnostic — winuic/xaml2winuic emit metadata only, and
-  this compiler turns it into C++23 modules.
-
-## Metadata-First WinUI 3 Projection & Rebuild-Free Architecture
-
-`CppWinC` implements a pure **metadata-first** architecture for WinUI 3 applications. All control resolution, type system discovery, container layouts, dimension sizing, property evaluation, and resource handling are driven dynamically from ECMA-335 `.winmd` metadata:
-
-- **Universal Control & Layout Resolution**: The compiler embeds no hardcoded lists of UI controls, panels, or layout containers. Any standard, third-party, custom, or future control (such as future WinUI Gallery releases or new Windows App SDK versions) resolves automatically through its metadata TypeDef, interface hierarchies, and `WinUIControlCatalogAttribute` schema.
-- **Generic Layout & Dimension Sizing**: Layout properties, dimensions (`Width`, `Height`, `MinWidth`, `MaxHeight`), alignment vectors (`HorizontalAlignment`, `VerticalAlignment`), and container-specific sizing definitions (e.g. Grid `Star`, `Auto`, `Pixel`, `GridLength`, and RelativePanel constraints) resolve generically based on the target property type system in metadata, allowing arbitrary nested layouts and containers to size and align correctly.
-- **Dynamic Closure Root Discovery**: Rather than relying on a static set of controls, `cppwinc` parses the `WinUIAttribute` AST payloads from view classes in `.winmd`, extracts all referenced control and type names, matches them against `g_type_ns` in the metadata reader, and dynamically injects them into the module compilation `closure_roots`.
-- **Dynamic Resource Dictionary Integration & Day-1 Unknown Control Discovery**: Controls requiring specialized platform resource dictionaries or external styles are dynamically resolved and instantiated via `winrt::impl::create_instance` and merged into `Application.Current.Resources.MergedDictionaries` at launch. Rather than hardcoding known platform resource dictionaries, `cppwinc` dynamically inspects the `WinUIControlCatalogAttribute` schema from `.winmd` (reading top-level `resource_dictionaries` and per-control `resource_dictionary` declarations) as well as querying all loaded `.winmd` ECMA-335 `TypeDef` tables for any classes ending in `Resources` that derive from `ResourceDictionary`. Discovered resource classes are automatically injected into module `closure_roots` and merged into `MergedDictionaries` at launch, completely decoupling control resources from compiler updates and guaranteeing 100% Day-1 support for any future or unknown controls.
-- **Type-Driven Events & Properties**:
-  - **Events** are resolved dynamically from the winmd `Event` table, flattened across all implemented base classes and interfaces.
-  - **Properties** are resolved from `PropertyDef` rows and getter/setter method signatures. Codegen gates strictly on the property's *underlying metadata type* (primitives, numeric types, enums, strings, brushes, geometries, thicknesses) rather than control names, ensuring full type safety and zero rebuilds for future APIs.
-- **Rebuild-Free Evolution**: Because the entire projection pipeline is generic and metadata-driven, new controls, properties, events, and layouts function seamlessly out of the box with zero compiler rebuilds.
-
-Set `CPPWINC_DUMP_CTRL_MAPS=1` to print the derived maps at startup.
+- **Zero-Config Header Resolution** — headers placed directly in `externals/` or within any `include/` subfolder are instantly discoverable via `#include` across all generated `.ixx` modules and `.cpp` implementation files.
+- **Automatic Linker Ingestion** — every `.lib` file (import libraries, static libraries) discovered recursively within `externals/` is automatically appended to the linker command line for executable (`.exe`), kernel driver (`.sys`), and dynamic library (`.dll`) targets.
+- **Runtime Binary Deployment** — every `.dll` file found anywhere under `externals/` is automatically copied alongside the final linked binaries in the output directory.
 
 ## Usage
 
@@ -614,8 +1049,10 @@ Options:
                          support (+ resources.pri, Assets, LICENSE, bootstrap DLL
                          beside the exe)
     -compile [debug] [<path>]
-                         Compile modules (default: release /MD /O2; with 'debug': /MDd /Od /Zi /D_DEBUG)
-                         + link exe / sys / release dll - see below
+                         Compile all modules; optional 'debug' = unoptimized
+                         debug build (/MDd /Od /Zi /D_DEBUG; default: release
+                         /MD /O2 /DNDEBUG); optional <path> receives ONLY the
+                         final linked binaries (+ link exe / sys / dll)
     -target <list>       Link targets for -compile (requires -compile):
                          comma-separated exe, sys, dll
     -help                Show detailed help with examples
@@ -945,44 +1382,6 @@ pruned at all.
 >
 > Without these switches the file is projected like any other `-input`.
 
-
-#### Component module structs
-
-The component module (`<Name>.ixx`) exports a struct per WinRT runtime class.
-`class_name()` carries the runtime class's metadata full name **verbatim** —
-including the hyphenated app namespace (`My App` → `My-App`) — because the
-activation key must match the `.winmd`:
-
-```cpp
-export struct MainWindow {
-    static constexpr std::wstring_view class_name() noexcept { return L"My-App.MainWindow"; }
-    winrt::com_ptr<void> m_unknown;
-    mutable winrt::impl::iface_cache m_cache;
-    static MainWindow from_abi(void* ptr) noexcept;
-    template <typename I> void* iface() const;
-    operator winrt::IInspectable() const noexcept;
-    MainWindow() : m_unknown(winrt::impl::create_instance(class_name())) {}
-    using implements_type = MainWindow;
-    using default_interface = winrt::IInspectable;
-};
-```
-
-These structs wrap WinRT activation — constructing one creates the runtime
-instance via the activation factory. The App module uses `Window::from_abi()`
-to project the instance and call `Activate()`.
-
-#### Brush and geometry property handling
-
-Properties whose XAML value type has no 1:1 projection are handled at codegen:
-- `Foreground`/`Background`/`IconSource` (Brush types) — skipped when value is
-  empty or a `{ThemeResource}` XAML resource reference.
-- `Data` (Geometry type) — emits `Geometry()` placeholder.
-- `FontFamily` — emits `FontFamily()` default.
-- Hex color values (#RGB, #RRGGBB) — wrapped in `SolidColorBrush` via
-  `make_solid_brush(Color{...})` with ARGB conversion.
-- Untyped item property access (DataTemplate `item.Property`) — skipped for
-  IInspectable items to avoid type mismatches.
-
 ## Module compilation
 
 All generated modules compile with MSVC `/std:c++latest`. Key fixes:
@@ -996,96 +1395,6 @@ All generated modules compile with MSVC `/std:c++latest`. Key fixes:
 - **`/FS` flag** ensures concurrent `.pdb` writes during parallel compilation.
 - **Pruned projection** — only compile modules the app transitively imports,
   not the entire WinRT surface.
-
-## Runtime helpers
-
-Everything an app needs beyond the metadata projection lives in
-`winrt_base.ixx` (`module winrt_base;`), emitted from `strings_data.ixx`:
-
-- **`hstring`** — immutable UTF-16 string with reference counting; implicit
-  conversion to/from `std::wstring`, `wchar_t const*`, and `std::string_view`.
-  Construct with `L"literal"` or `hstring(std::wstring(...))`.
-- **`winrt_guid`** — 128-bit GUID value type; equality comparison, hashing,
-  and conversion to/from `GUID`. Used for interface IDs throughout the
-  projection.
-- **`com_ptr<T>`** — intrusive reference-counted smart pointer for COM
-  interfaces. Calls `AddRef`/`Release` automatically. `put_abi()` returns
-  `void**` for out-parameter initialization. `copy_from()` / `copy_to()`
-  for safe COM pointer transfers.
-- **Marshaling helpers.**
-  - `arg_in<T>` — marshals an input parameter from ABI to projected type.
-  - `put_abi<T>` — returns `void**` for COM out-parameters.
-  - `bind_in<T>` — exposes an input buffer for marshaling.
-  - `detach_abi<T>` — detaches ownership from a `com_ptr` to raw ABI pointer.
-  - `attach_abi<T>` — attaches a raw ABI pointer to a `com_ptr`.
-- **Delegates.** Generated callable constructors for WinRT delegate types.
-  A delegate is a `com_ptr` wrapping a callback; the projection generates
-  a `call()` method and comparison operators.
-- **Coroutines.**
-  - Coroutines return `winrt::impl::cancellable_async_action` /
-    `cancellable_async_operation<T>`; `winrt::attach_cancellable(...)` wraps
-    them into the projected `IAsyncAction` / `IAsyncOperation<T>` (whose
-    `.get()` blocks for a result).
-  - `winrt::impl::resume_background()` — resumes the coroutine on a
-    thread-pool thread.
-  - Full `co_await` support: `auto x = co_await async_op;` works seamlessly.
-  - `fire_and_forget` — fire-and-forget coroutine return type.
-  - `winrt::when_all(...)` / `winrt::when_any(...)` — async combinators.
-- **Boxing / unboxing.**
-  - `box_value(T)` — boxes a value type into `IInspectable`.
-  - `unbox_value<T>(IInspectable)` — unboxes back to `T`.
-  - `try_unbox<T>(IInspectable)` — returns `std::optional<T>`, empty if
-    type mismatch.
-  - Boxed types: `int32_t`, `uint32_t`, `int64_t`, `float`, `double`,
-    `bool`, `hstring`, `guid`, `datetime`, `time_span`, `point`, `size`,
-    `rect`, and any WinRT type.
-- **Errors.**
-  - `hresult_error` — exception type wrapping an `HRESULT` error code.
-  - `check_hresult(HRESULT)` — throws `hresult_error` if failed.
-  - `throw_hresult(HRESULT)` — always throws.
-  - `winrt::hresult_access_denied`, `hresult_invalid_argument`, etc. —
-    typed exception classes for common error codes.
-- **Collections.**
-  - `single_threaded_vector<T>()` / `single_threaded_observable_vector<T>()`
-    — creates `IObservableVector<T>`.
-  - `single_threaded_map<K,V>()` / `single_threaded_observable_map<K,V>()`
-    — creates `IObservableMap<K,V>`.
-  - `unbox_value_at<T>(map, key)` — reads a boxed value out of an
-    `IMap<hstring, IInspectable>` by key.
-  - `IReserveableVector<T>` — capacity-reservation extension of `IVector<T>`;
-    an extension interface not defined by Microsoft (no official WinRT
-    surface ships it). Every vector the runtime creates (`single_threaded_vector`,
-    `single_threaded_observable_vector`, `single_threaded_observable_vector`)
-    also implements this interface, so append-heavy callers can preallocate
-    storage before a bulk insert instead of letting the backing store grow
-    and copy repeatedly — the WinRT equivalent of `std::vector::reserve`:
-    - `Reserve(capacity)` — guarantees room for at least `capacity` elements
-      without further reallocation. It is a no-op when `capacity` is less than
-      or equal to the current capacity, never shrinks the vector, preserves
-      all existing elements, and does not change `Size` or insert anything.
-    The interface is QI-able from any projected `IVector<T>`; its IID is
-    **provisional** (no official Microsoft GUID yet) and defined once as
-    `guid_ireserveablevector` in `strings_data.ixx`, ready to be swapped when
-    an official one is assigned.
-- **Cancellable coroutines** — full `IAsyncAction`/`IAsyncOperation<T>`
-  implementations with cancellation token support. The runtime manages
-  the coroutine state machine, reference counting, and ABI vtable layout.
-- **Component-authoring helpers.**
-  - `implements<D, I...>` — CRTP base for implementing WinRT interfaces.
-  - `interface_impl_base<I>` — base for interface implementation.
-  - `make<T>()` / `make_self<T>()` / `get_self<T>()` — allocation helpers.
-  - Activation factories — `create_instance(class_name)` creates a WinRT
-    runtime class instance via its activation factory.
-  - Event token management — `event_token` registration and revocation.
-  - Threading — `apartment_context` for capturing/resuming on the UI thread.
-- **String helpers.**
-  - `to_hstring(std::string)` — converts narrow string to `hstring`.
-  - `to_hstring(std::wstring)` — converts wide string to `hstring`.
-  - `to_string(hstring)` — converts `hstring` to `std::string`.
-  - `to_wstring(hstring)` — converts `hstring` to `std::wstring`.
-
-> **Note:** `winrt_base` is only used by WinRT projection modules.
-> Win32 and WDK modules do not import `winrt_base` — they use plain C++ types.
 
 ## Long paths
 
