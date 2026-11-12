@@ -49,58 +49,53 @@ cd /d "%~dp0"
 if not exist "build" mkdir "build"
 set "CLF=/nologo /std:c++latest /EHa /MD /O2 /DNDEBUG /GL /utf-8 /bigobj /ifcSearchDir build /ifcOutput build /Fobuild/"
 
-echo [1/11] winmd_reader...
+echo [1/10] winmd_reader...
 cl %CLF% /c winmd_reader.ixx > build/winmd_reader.log 2>&1
 if errorlevel 1 (echo FAIL: winmd_reader & exit /b 1)
 echo   OK
 
-echo [2/11] async_data...
+echo [2/10] async_data...
 cl %CLF% /c async_data.ixx > build/async_data.log 2>&1
 if errorlevel 1 (echo FAIL: async_data & exit /b 1)
 echo   OK
 
-echo [3/11] component_data...
+echo [3/10] component_data...
 cl %CLF% /c component_data.ixx > build/component_data.log 2>&1
 if errorlevel 1 (echo FAIL: component_data & exit /b 1)
 echo   OK
 
-echo [4/11] win32_data...
+echo [4/10] win32_data...
 cl %CLF% /c win32_data.ixx > build/win32_data.log 2>&1
 if errorlevel 1 (echo FAIL: win32_data & exit /b 1)
 echo   OK
 
-echo [5/11] wdk_data...
+echo [5/10] wdk_data...
 cl %CLF% /c wdk_data.ixx > build/wdk_data.log 2>&1
 if errorlevel 1 (echo FAIL: wdk_data & exit /b 1)
 echo   OK
 
-echo [6/11] winuic_helper...
-cl %CLF% /c winuic_helper.ixx > build/winuic_helper.log 2>&1
-if errorlevel 1 (echo FAIL: winuic_helper & exit /b 1)
-echo   OK
-
-echo [7/11] winuic_data...
+echo [6/10] winuic_data...
 cl %CLF% /c winuic_data.ixx > build/winuic_data.log 2>&1
 if errorlevel 1 (echo FAIL: winuic_data & exit /b 1)
 echo   OK
 
-echo [8/11] strings_data...
+echo [7/10] strings_data...
 cl %CLF% /c strings_data.ixx > build/strings_data.log 2>&1
 if errorlevel 1 (echo FAIL: strings_data & exit /b 1)
 echo   OK
 
-echo [9/11] cppwinc...
+echo [8/10] cppwinc...
 cl %CLF% /c cppwinc.ixx > build/cppwinc.log 2>&1
 if errorlevel 1 (echo FAIL: cppwinc & exit /b 1)
 echo   OK
 
-echo [10/11] main...
+echo [9/10] main...
 cl %CLF% /c main.cpp > build/main.log 2>&1
 if errorlevel 1 (echo FAIL: main & exit /b 1)
 echo   OK
 
-echo [11/11] link...
-link /nologo /out:cppwinc.exe /RELEASE /OPT:REF /OPT:ICF /LTCG /MANIFEST:EMBED /MANIFESTINPUT:app.manifest "build\main.obj" "build\cppwinc.obj" "build\winmd_reader.obj" "build\async_data.obj" "build\strings_data.obj" "build\component_data.obj" "build\win32_data.obj" "build\wdk_data.obj" "build\winuic_helper.obj" "build\winuic_data.obj" advapi32.lib ole32.lib > build/link.log 2>&1
+echo [10/10] link...
+link /nologo /out:cppwinc.exe /RELEASE /OPT:REF /OPT:ICF /LTCG /MANIFEST:EMBED /MANIFESTINPUT:app.manifest "build\main.obj" "build\cppwinc.obj" "build\winmd_reader.obj" "build\async_data.obj" "build\strings_data.obj" "build\component_data.obj" "build\win32_data.obj" "build\wdk_data.obj" "build\winuic_data.obj" advapi32.lib ole32.lib > build/link.log 2>&1
 if errorlevel 1 (echo FAIL: link & type build\link.log & exit /b 1)
 
 echo === cppwinc.exe built successfully ===

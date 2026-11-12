@@ -1423,8 +1423,10 @@ cppwinc-compiler/
 ├── async_data.ixx           # async/coroutine runtime text
 ├── strings_data.ixx         # emitted runtime and templates
 ├── component_data.ixx       # component/factory emitted text
-├── winuic_data.ixx          # WinUI3 data types and helpers
-├── winuic_helper.ixx        # WinUI3 helper functions
+├── winuic_data.ixx          # WinUI 3 JSON, AST, catalog, stubs, expr mapping
+├── winuic_template.ixx      # DataTemplates, React factories, runtime helpers
+├── winuic_control.ixx       # Control emission engine and tree traversal
+├── winuic_view.ixx          # View emission, BuildUI, code fixup post-pass
 ├── win32_data.ixx           # Win32 metadata attribute helpers
 ├── wdk_data.ixx             # WDK metadata attribute helpers
 ├── main.cpp                 # CLI entry
