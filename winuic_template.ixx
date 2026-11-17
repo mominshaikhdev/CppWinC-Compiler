@@ -887,8 +887,9 @@ inline auto template_payload_to_cpp_factory(
 }
 
 
-inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
+inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk, std::string const& application_name, bool is_shared_module = false)
 {
+    std::string pfx = is_shared_module ? "export inline " : "static ";
     // SolidColorBrush helpers: construct a REAL Microsoft.UI.Xaml.Media.SolidColorBrush
     // through its projected factory constructor (P1) - the WinUI 3 way. The converting
     // template ctor on projected classes lets it flow into Brush-typed setters.
@@ -908,11 +909,9 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
     // flat IMap - they live in ThemeDictionaries ("Light"/"Default") inside
     // the merged XamlControlsResources dictionary. Resolution order: flat map
     // -> ThemeDictionaries (Light, then Default) -> merged dictionaries
-    // (recursive). All map/vector access goes through the projected wrappers
-    // (their ABI internals handle slots/refcounts); keyed access uses raw
-    // HasKey/Lookup via IMap<Object,Object> since no closed-generic iid_of
-    // exists. The first lookup arg doubles as the unbox scratch so no wrapped
-    // result ever over-releases.
+    // (recursive). ResourceDictionary and ThemeDictionaries both use
+    // IMap<Object,Object>, so their HSTRING keys must be boxed. Sample catalog
+    // maps use IMap<HSTRING,Object> and pass HSTRING handles.
     // WinRT IMap<K, V> ABI vtable layout (inherits IInspectable):
     //   vtable[0..5] = IUnknown / IInspectable
     //   vtable[6]   = Lookup
@@ -922,10 +921,16 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
     //   vtable[10]  = Insert
     //   vtable[11]  = Remove
     //   vtable[12]  = Clear
-    out << "extern \"C\" {\n";
+    if (is_shared_module)
+        out << "export extern \"C\" {\n";
+    else
+        out << "extern \"C\" {\n";
     out << "    __declspec(dllimport) void* __stdcall LoadLibraryExW(const wchar_t*, void*, unsigned long);\n";
     out << "    __declspec(dllimport) void* __stdcall GetProcAddress(void*, const char*);\n";
     out << "    __declspec(dllimport) int __stdcall FreeLibrary(void*);\n";
+    out << "    __declspec(dllimport) unsigned long __stdcall GetEnvironmentVariableW(const wchar_t*, wchar_t*, unsigned long);\n";
+    out << "    __declspec(dllimport) void __stdcall OutputDebugStringW(const wchar_t*);\n";
+    out << "    __declspec(dllimport) int __stdcall MoveFileExW(const wchar_t*, const wchar_t*, unsigned long);\n";
     out << "    struct ThemeState {\n";
     out << "        int theme_idx = 0;\n";
     out << "        int compact = 0;\n";
@@ -948,10 +953,139 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
     out << "        void (*notify_theme_change)() = nullptr;\n";
     out << "        void (*set_nav_mode)(int) = nullptr;\n";
     out << "        void (*navigate_to)(const wchar_t*) = nullptr;\n";
+    out << "        void* (*get_main_window_control)(const wchar_t*) = nullptr;\n";
+    out << "        void* recent_view = nullptr;\n";
+    out << "        void (*record_recent)(void*, const wchar_t*) = nullptr;\n";
     out << "    };\n";
     out << "    __declspec(selectany) ThemeState g_theme_state{};\n";
-    out << "}\n\n";
-    out << "static bool is_system_light_mode() {\n";
+    out << "}\n";
+    out << pfx << "struct RecentItemData { std::wstring id, title, subtitle, image_path; bool is_new = false, is_updated = false, is_experimental = false; };\n";
+    out << pfx << "struct RecentHistoryState {\n";
+    out << "    std::vector<std::wstring> recently_visited_ids;\n";
+    out << "    std::vector<RecentItemData> recently_visited_items;\n";
+    out << "    bool recent_history_loaded = false;\n";
+    out << "};\n";
+    out << pfx << "inline RecentHistoryState& get_recent_history_state() {\n";
+    out << "    static RecentHistoryState s_state;\n";
+    out << "    return s_state;\n";
+    out << "}\n";
+    out << pfx << "bool recent_history_path(std::filesystem::path& path) {\n";
+    out << "    wchar_t local_app_data[32768]{};\n";
+    out << "    auto length = GetEnvironmentVariableW(L\"LOCALAPPDATA\", local_app_data, 32768);\n";
+    out << "    if (!length || length >= 32768) { OutputDebugStringW(L\"CppWinC: LOCALAPPDATA unavailable; recent history was not persisted.\\n\"); return false; }\n";
+    out << "    path = std::filesystem::path(std::wstring(local_app_data, length)) / L\"CppWinC\" / L\""
+        << escape_for_wstring(application_name) << "\" / L\"recently-visited.bin\";\n";
+    out << "    return true;\n";
+    out << "}\n";
+    out << pfx << "winrt::IInspectable make_recent_history_item(RecentItemData const& item) {\n";
+    out << "    auto value = winrt::single_threaded_map<winrt::hstring, winrt::IInspectable>();\n";
+    out << "    value.Insert(winrt::hstring(L\"Title\"), winrt::box_value(winrt::hstring(item.title.c_str())));\n";
+    out << "    value.Insert(winrt::hstring(L\"Subtitle\"), winrt::box_value(winrt::hstring(item.subtitle.c_str())));\n";
+    out << "    value.Insert(winrt::hstring(L\"ImagePath\"), winrt::box_value(winrt::hstring(item.image_path.c_str())));\n";
+    out << "    value.Insert(winrt::hstring(L\"UniqueId\"), winrt::box_value(winrt::hstring(item.id.c_str())));\n";
+    out << "    value.Insert(winrt::hstring(L\"IsNew\"), winrt::box_value(item.is_new));\n";
+    out << "    value.Insert(winrt::hstring(L\"IsUpdated\"), winrt::box_value(item.is_updated));\n";
+    out << "    value.Insert(winrt::hstring(L\"IsExperimental\"), winrt::box_value(item.is_experimental));\n";
+    out << "    return value;\n";
+    out << "}\n";
+    out << pfx << "bool load_recent_history() {\n";
+    out << "    if (get_recent_history_state().recent_history_loaded) return true;\n";
+    out << "    std::filesystem::path path;\n";
+    out << "    if (!recent_history_path(path)) return false;\n";
+    out << "    std::error_code ec;\n";
+    out << "    bool exists = std::filesystem::exists(path, ec);\n";
+    out << "    if (ec) { OutputDebugStringW(L\"CppWinC: unable to inspect recent-history file.\\n\"); return false; }\n";
+    out << "    if (!exists) { get_recent_history_state().recent_history_loaded = true; return true; }\n";
+    out << "    std::ifstream input(path, std::ios::binary);\n";
+    out << "    std::uint32_t version = 0, count = 0;\n";
+    out << "    input.read(reinterpret_cast<char*>(&version), sizeof(version));\n";
+    out << "    input.read(reinterpret_cast<char*>(&count), sizeof(count));\n";
+    out << "    if (!input || (version != 1 && version != 2) || count > 100000) { OutputDebugStringW(L\"CppWinC: invalid recent-history file.\\n\"); return false; }\n";
+    out << "    std::vector<std::wstring> loaded_ids;\n";
+    out << "    std::vector<RecentItemData> loaded_items;\n";
+    out << "    loaded_ids.reserve(count);\n";
+    out << "    loaded_items.reserve(count);\n";
+    out << "    std::uint64_t total_characters = 0;\n";
+    out << "    auto read_string = [&](std::wstring& value) {\n";
+    out << "        std::uint32_t length = 0;\n";
+    out << "        input.read(reinterpret_cast<char*>(&length), sizeof(length));\n";
+    out << "        total_characters += length;\n";
+    out << "        if (!input || length > 1048576 || total_characters > 8388608) return false;\n";
+    out << "        value.resize(length);\n";
+    out << "        input.read(reinterpret_cast<char*>(value.data()), static_cast<std::streamsize>(length * sizeof(wchar_t)));\n";
+    out << "        return static_cast<bool>(input);\n";
+    out << "    };\n";
+    out << "    for (std::uint32_t i = 0; i < count; ++i) {\n";
+    out << "        RecentItemData item;\n";
+    out << "        if (!read_string(item.id)) { OutputDebugStringW(L\"CppWinC: invalid recent-history entry.\\n\"); return false; }\n";
+    out << "        if (version == 2) {\n";
+    out << "            std::uint8_t flags = 0;\n";
+    out << "            if (!read_string(item.title) || !read_string(item.subtitle) || !read_string(item.image_path)) { OutputDebugStringW(L\"CppWinC: invalid recent-history item data.\\n\"); return false; }\n";
+    out << "            input.read(reinterpret_cast<char*>(&flags), sizeof(flags));\n";
+    out << "            if (!input) { OutputDebugStringW(L\"CppWinC: truncated recent-history item data.\\n\"); return false; }\n";
+    out << "            item.is_new = (flags & 1) != 0; item.is_updated = (flags & 2) != 0; item.is_experimental = (flags & 4) != 0;\n";
+    out << "        }\n";
+    out << "        if (!item.id.empty()) { loaded_ids.push_back(item.id); loaded_items.push_back(std::move(item)); }\n";
+    out << "    }\n";
+    out << "    if (input.peek() != std::char_traits<char>::eof()) { OutputDebugStringW(L\"CppWinC: trailing data in recent-history file.\\n\"); return false; }\n";
+    out << "    get_recent_history_state().recently_visited_ids = std::move(loaded_ids);\n";
+    out << "    get_recent_history_state().recently_visited_items = std::move(loaded_items);\n";
+    out << "    get_recent_history_state().recent_history_loaded = true;\n";
+    out << "    return true;\n";
+    out << "}\n";
+    out << pfx << "bool save_recent_history() {\n";
+    out << "    std::filesystem::path path;\n";
+    out << "    if (!recent_history_path(path)) return false;\n";
+    out << "    std::error_code ec;\n";
+    out << "    std::filesystem::create_directories(path.parent_path(), ec);\n";
+    out << "    if (ec) { OutputDebugStringW(L\"CppWinC: unable to create recent-history directory.\\n\"); return false; }\n";
+    out << "    if (get_recent_history_state().recently_visited_ids.size() > 100000) { OutputDebugStringW(L\"CppWinC: too many recent-history entries to persist.\\n\"); return false; }\n";
+    out << "    auto valid_string = [](std::wstring const& value) { return value.size() <= 1048576; };\n";
+    out << "    for (auto const& id : get_recent_history_state().recently_visited_ids)\n";
+    out << "        if (!valid_string(id)) { OutputDebugStringW(L\"CppWinC: recent-history entry is too large to persist.\\n\"); return false; }\n";
+    out << "    auto temporary_path = path;\n";
+    out << "    temporary_path += L\".tmp\";\n";
+    out << "    std::ofstream output(temporary_path, std::ios::binary | std::ios::trunc);\n";
+    out << "    if (!output) { OutputDebugStringW(L\"CppWinC: unable to open recent-history file for writing.\\n\"); return false; }\n";
+    out << "    std::uint32_t version = 2, count = static_cast<std::uint32_t>(get_recent_history_state().recently_visited_ids.size());\n";
+    out << "    output.write(reinterpret_cast<char const*>(&version), sizeof(version));\n";
+    out << "    output.write(reinterpret_cast<char const*>(&count), sizeof(count));\n";
+    out << "    auto write_string = [&](std::wstring const& value) {\n";
+    out << "        auto length = static_cast<std::uint32_t>(value.size());\n";
+    out << "        output.write(reinterpret_cast<char const*>(&length), sizeof(length));\n";
+    out << "        output.write(reinterpret_cast<char const*>(value.data()), static_cast<std::streamsize>(length * sizeof(wchar_t)));\n";
+    out << "    };\n";
+    out << "    for (auto const& id : get_recent_history_state().recently_visited_ids) {\n";
+    out << "        auto item = std::find_if(get_recent_history_state().recently_visited_items.begin(), get_recent_history_state().recently_visited_items.end(), [&](auto const& candidate) { return candidate.id == id; });\n";
+    out << "        RecentItemData empty_item; empty_item.id = id;\n";
+    out << "        auto const& record = item == get_recent_history_state().recently_visited_items.end() ? empty_item : *item;\n";
+    out << "        if (!valid_string(record.title) || !valid_string(record.subtitle) || !valid_string(record.image_path)) { OutputDebugStringW(L\"CppWinC: recent-history item data is too large to persist.\\n\"); return false; }\n";
+    out << "        write_string(id); write_string(record.title); write_string(record.subtitle); write_string(record.image_path);\n";
+    out << "        std::uint8_t flags = (record.is_new ? 1 : 0) | (record.is_updated ? 2 : 0) | (record.is_experimental ? 4 : 0);\n";
+    out << "        output.write(reinterpret_cast<char const*>(&flags), sizeof(flags));\n";
+    out << "    }\n";
+    out << "    output.flush();\n";
+    out << "    if (!output) { OutputDebugStringW(L\"CppWinC: failed to write recent-history file.\\n\"); return false; }\n";
+    out << "    output.close();\n";
+    out << "    if (!output) { OutputDebugStringW(L\"CppWinC: failed to close recent-history file.\\n\"); std::filesystem::remove(temporary_path, ec); return false; }\n";
+    out << "    if (!MoveFileExW(temporary_path.c_str(), path.c_str(), 0x1 | 0x8)) { OutputDebugStringW(L\"CppWinC: unable to replace recent-history file.\\n\"); std::filesystem::remove(temporary_path, ec); return false; }\n";
+    out << "    get_recent_history_state().recent_history_loaded = true;\n";
+    out << "    return true;\n";
+    out << "}\n";
+    if (is_shared_module) {
+        out << "export template <typename T>\n";
+        out << "inline T main_window_control(wchar_t const* control_type) {\n";
+    } else {
+        out << "template <typename T>\n";
+        out << "inline T main_window_control(wchar_t const* control_type) {\n";
+    }
+    out << "        if (!g_theme_state.get_main_window_control) return T{};\n";
+    out << "        void* raw = g_theme_state.get_main_window_control(control_type);\n";
+    out << "        if (!raw) return T{};\n";
+    out << "        return T::wrap_borrowed(raw);\n";
+    out << "    }\n";
+    out << "\n";
+    out << pfx << "bool is_system_light_mode() {\n";
     out << "    try {\n";
     out << "        void* adv = LoadLibraryExW(L\"advapi32.dll\", nullptr, 0x00000800);\n";
     out << "        if (adv) {\n";
@@ -975,20 +1109,20 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
     out << "    } catch (...) {}\n";
     out << "    return false;\n";
     out << "}\n\n";
-    out << "static bool is_current_light_theme() {\n";
+    out << pfx << "bool is_current_light_theme() {\n";
     out << "    if (g_theme_state.theme_idx == 1) return true;\n";
     out << "    if (g_theme_state.theme_idx == 2) return false;\n";
     out << "    return is_system_light_mode();\n";
     out << "}\n\n";
-    out << "inline bool is_current_dark_theme() {\n";
+    out << pfx << "inline bool is_current_dark_theme() {\n";
     out << "    return !is_current_light_theme();\n";
     out << "}\n\n";
-    out << "inline winrt::Microsoft::UI::Xaml::ElementTheme get_global_theme() {\n";
+    out << pfx << "inline winrt::Microsoft::UI::Xaml::ElementTheme get_global_theme() {\n";
     out << "    if (g_theme_state.theme_idx == 1) return winrt::Microsoft::UI::Xaml::ElementTheme::Light;\n";
     out << "    if (g_theme_state.theme_idx == 2) return winrt::Microsoft::UI::Xaml::ElementTheme::Dark;\n";
     out << "    return is_system_light_mode() ? winrt::Microsoft::UI::Xaml::ElementTheme::Light : winrt::Microsoft::UI::Xaml::ElementTheme::Dark;\n";
     out << "}\n\n";
-    out << "static void sync_titlebar_theme(bool is_dark) {\n";
+    out << pfx << "void sync_titlebar_theme(bool is_dark) {\n";
     out << "    try {\n";
     out << "        if (g_theme_state.window_id != 0 && winrt::Microsoft::UI::Windowing::AppWindowTitleBar::IsCustomizationSupported()) {\n";
     out << "            winrt::Microsoft::UI::WindowId wid{ g_theme_state.window_id };\n";
@@ -1022,7 +1156,7 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
     out << "        }\n";
     out << "    } catch (...) {}\n";
     out << "}\n\n";
-    out << "static void sync_window_theme(int is_dark) {\n";
+    out << pfx << "void sync_window_theme(int is_dark) {\n";
     out << "    try {\n";
     out << "        void* hwnd = nullptr;\n";
     out << "        if (g_theme_state.main_hwnd) hwnd = g_theme_state.main_hwnd;\n";
@@ -1077,7 +1211,7 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
     out << "        }\n";
     out << "    } catch (...) {}\n";
     out << "}\n\n";
-    out << "static void update_dynamic_brushes() {\n";
+    out << pfx << "void update_dynamic_brushes() {\n";
     out << "    bool is_light = is_current_light_theme();\n";
     out << "    auto update_brush = [](void* raw_abi, winrt::Windows::UI::Color c) {\n";
     out << "        if (!raw_abi) return;\n";
@@ -1097,7 +1231,7 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
     out << "    update_brush(g_theme_state.page_bg, winrt::Windows::UI::Color{0, 0, 0, 0});\n";
     out << "    update_brush(g_theme_state.solid_bg, is_light ? winrt::Windows::UI::Color{255, 243, 243, 243} : winrt::Windows::UI::Color{255, 32, 32, 32});\n";
     out << "}\n\n";
-    out << "static void apply_app_theme(bool is_dark) {\n";
+    out << pfx << "void apply_app_theme(bool is_dark) {\n";
     out << "    g_theme_state.theme_idx = is_dark ? 2 : 1;\n";
     out << "    sync_titlebar_theme(is_dark);\n";
     out << "    sync_window_theme(is_dark ? 1 : 0);\n";
@@ -1111,24 +1245,33 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
     out << "    } catch (...) {}\n";
     out << "    if (g_theme_state.notify_theme_change) g_theme_state.notify_theme_change();\n";
     out << "}\n\n";
-    out << "static winrt::IInspectable theme_find_in_raw_map(void* map_raw, wchar_t const* key) {\n";
+    out << pfx << "winrt::IInspectable theme_find_in_raw_map(void* map_raw, void* key_abi) {\n";
     out << "    if (!map_raw) return winrt::IInspectable{};\n";
     out << "    auto* map_vt = *reinterpret_cast<void* const**>(map_raw);\n";
-    out << "    winrt::IInspectable key_box = winrt::box_value(winrt::hstring(key));\n";
     out << "    using has_key_t = std::int32_t(__stdcall*)(void*, void*, std::uint8_t*);\n";
     out << "    std::uint8_t has = 0;\n";
-    out << "    if (reinterpret_cast<has_key_t>(map_vt[8])(map_raw, key_box.get_abi(), &has) < 0 || !has) return winrt::IInspectable{};\n";
+    out << "    if (reinterpret_cast<has_key_t>(map_vt[8])(map_raw, key_abi, &has) < 0 || !has) return winrt::IInspectable{};\n";
     out << "    using lookup_t = std::int32_t(__stdcall*)(void*, void*, void**);\n";
     out << "    winrt::IInspectable scratch{};\n";
-    out << "    if (reinterpret_cast<lookup_t>(map_vt[6])(map_raw, key_box.get_abi(), scratch.put()) < 0) return winrt::IInspectable{};\n";
+    out << "    if (reinterpret_cast<lookup_t>(map_vt[6])(map_raw, key_abi, scratch.put()) < 0) return winrt::IInspectable{};\n";
     out << "    return scratch;\n";
     out << "}\n\n";
-    out << "static winrt::IInspectable theme_find_in_obj(winrt::IInspectable const& obj, wchar_t const* key);\n\n";
-    out << "static winrt::IInspectable theme_find_in_dict(winrt::Microsoft::UI::Xaml::ResourceDictionary const& rd, wchar_t const* key) {\n";
+    out << pfx << "winrt::IInspectable theme_find_in_raw_hstring_map(void* map_raw, wchar_t const* key) {\n";
+    out << "    winrt::hstring map_key(key);\n";
+    out << "    return theme_find_in_raw_map(map_raw, map_key.get_abi());\n";
+    out << "}\n\n";
+    out << pfx << "winrt::IInspectable theme_find_in_raw_object_map(void* map_raw, wchar_t const* key) {\n";
+    out << "    if (!map_raw) return winrt::IInspectable{};\n";
+    out << "    winrt::IInspectable boxed_key = winrt::box_value(winrt::hstring(key));\n";
+    out << "    if (!boxed_key) return winrt::IInspectable{};\n";
+    out << "    return theme_find_in_raw_map(map_raw, boxed_key.get_abi());\n";
+    out << "}\n\n";
+    out << pfx << "winrt::IInspectable theme_find_in_obj(winrt::IInspectable const& obj, wchar_t const* key);\n\n";
+    out << pfx << "winrt::IInspectable theme_find_in_dict(winrt::Microsoft::UI::Xaml::ResourceDictionary const& rd, wchar_t const* key) {\n";
     out << "    if (!rd.m_unknown.get()) return winrt::IInspectable{};\n";
     out << "    return theme_find_in_obj(winrt::IInspectable(rd.addref_borrowed()), key);\n";
     out << "}\n\n";
-    out << "static winrt::IInspectable theme_find_in_obj(winrt::IInspectable const& obj, wchar_t const* key) {\n";
+    out << pfx << "winrt::IInspectable theme_find_in_obj(winrt::IInspectable const& obj, wchar_t const* key) {\n";
     out << "    if (!obj) return winrt::IInspectable{};\n";
     out << "    void* inspectable_raw = obj.get_abi();\n";
     out << "    if (!inspectable_raw) return winrt::IInspectable{};\n";
@@ -1138,21 +1281,21 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
     out << "    if (winrt::impl::query_interface(inspectable_raw, iid_map1, &map_raw) < 0 || !map_raw) {\n";
     out << "        if (winrt::impl::query_interface(inspectable_raw, iid_map2, &map_raw) < 0 || !map_raw) return winrt::IInspectable{};\n";
     out << "    }\n";
-    out << "    winrt::IInspectable result = theme_find_in_raw_map(map_raw, key);\n";
+    out << "    winrt::IInspectable result = theme_find_in_raw_object_map(map_raw, key);\n";
     out << "    auto* map_vt = *reinterpret_cast<void* const**>(map_raw);\n";
     out << "    using release_t = std::uint32_t(__stdcall*)(void*);\n";
     out << "    reinterpret_cast<release_t>(map_vt[2])(map_raw);\n";
     out << "    return result;\n";
     out << "}\n\n";
-    out << "static winrt::IInspectable theme_search_rd_recursive(winrt::Microsoft::UI::Xaml::ResourceDictionary const& rd, wchar_t const* key, wchar_t const* th1, wchar_t const* th2, wchar_t const* th3, int depth = 0) {\n";
+    out << pfx << "winrt::IInspectable theme_search_rd_recursive(winrt::Microsoft::UI::Xaml::ResourceDictionary const& rd, wchar_t const* key, wchar_t const* th1, wchar_t const* th2, wchar_t const* th3, int depth = 0) {\n";
     out << "    if (depth > 5 || !rd.m_unknown.get()) return winrt::IInspectable{};\n";
     out << "    winrt::IInspectable v = theme_find_in_dict(rd, key);\n";
     out << "    if (v) return v;\n";
     out << "    auto themes = rd.get_ThemeDictionaries();\n";
     out << "    if (themes.get_abi() && themes.m_ptr) {\n";
-    out << "        winrt::IInspectable tdv = theme_find_in_raw_map(themes.m_ptr, th1);\n";
-    out << "        if (!tdv) tdv = theme_find_in_raw_map(themes.m_ptr, th2);\n";
-    out << "        if (!tdv) tdv = theme_find_in_raw_map(themes.m_ptr, th3);\n";
+    out << "        winrt::IInspectable tdv = theme_find_in_raw_object_map(themes.m_ptr, th1);\n";
+    out << "        if (!tdv) tdv = theme_find_in_raw_object_map(themes.m_ptr, th2);\n";
+    out << "        if (!tdv) tdv = theme_find_in_raw_object_map(themes.m_ptr, th3);\n";
     out << "        if (tdv) {\n";
     out << "            v = theme_find_in_obj(tdv, key);\n";
     out << "            if (v) return v;\n";
@@ -1169,7 +1312,48 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
     out << "    }\n";
     out << "    return winrt::IInspectable{};\n";
     out << "}\n\n";
-    out << "static winrt::IInspectable theme_lookup_th(wchar_t const* key, winrt::IInspectable fallback) {\n";
+    if (is_shared_module) {
+        out << "export template <typename DateRef>\n";
+        out << "inline winrt::hstring format_datetime(DateRef const& value, wchar_t const* format, wchar_t const* prefix, wchar_t const* fallback) {\n";
+    } else {
+        out << "template <typename DateRef>\n";
+        out << "static winrt::hstring format_datetime(DateRef const& value, wchar_t const* format, wchar_t const* prefix, wchar_t const* fallback) {\n";
+    }
+    out << "    if (!value) return winrt::hstring(fallback ? fallback : L\"\");\n";
+    out << "    auto const date = value.Value();\n";
+    out << "    using winrt_duration = std::chrono::duration<std::int64_t, std::ratio<1, 10000000>>;\n";
+    out << "    auto const days = std::chrono::floor<std::chrono::days>(winrt_duration{date.UniversalTime}) - std::chrono::days{134774};\n";
+    out << "    auto const sys_date = std::chrono::sys_days{days};\n";
+    out << "    auto const ymd = std::chrono::year_month_day{sys_date};\n";
+    out << "    std::tm fields{};\n";
+    out << "    fields.tm_year = static_cast<int>(ymd.year()) - 1900;\n";
+    out << "    fields.tm_mon = static_cast<int>(static_cast<unsigned>(ymd.month())) - 1;\n";
+    out << "    fields.tm_mday = static_cast<int>(static_cast<unsigned>(ymd.day()));\n";
+    out << "    fields.tm_wday = std::chrono::weekday{sys_date}.c_encoding();\n";
+    out << "    std::wstring pattern;\n";
+    out << "    std::wstring_view source{format ? format : L\"\"};\n";
+    out << "    for (std::size_t i = 0; i < source.size();) {\n";
+    out << "        auto const tail = source.substr(i);\n";
+    out << "        if (tail.starts_with(L\"dddd\")) { pattern += L\"%A\"; i += 4; }\n";
+    out << "        else if (tail.starts_with(L\"ddd\")) { pattern += L\"%a\"; i += 3; }\n";
+    out << "        else if (tail.starts_with(L\"dd\")) { pattern += L\"%d\"; i += 2; }\n";
+    out << "        else if (tail.starts_with(L\"d\")) { pattern += L\"%#d\"; ++i; }\n";
+    out << "        else if (tail.starts_with(L\"MMMM\")) { pattern += L\"%B\"; i += 4; }\n";
+    out << "        else if (tail.starts_with(L\"MMM\")) { pattern += L\"%b\"; i += 3; }\n";
+    out << "        else if (tail.starts_with(L\"MM\")) { pattern += L\"%m\"; i += 2; }\n";
+    out << "        else if (tail.starts_with(L\"M\")) { pattern += L\"%#m\"; ++i; }\n";
+    out << "        else if (tail.starts_with(L\"yyyy\")) { pattern += L\"%Y\"; i += 4; }\n";
+    out << "        else if (tail.starts_with(L\"yy\")) { pattern += L\"%y\"; i += 2; }\n";
+    out << "        else { pattern += source[i]; ++i; }\n";
+    out << "    }\n";
+    out << "    std::wostringstream formatted;\n";
+    out << "    formatted.imbue(std::locale(\"\"));\n";
+    out << "    formatted << std::put_time(&fields, pattern.c_str());\n";
+    out << "    std::wstring result = prefix ? prefix : L\"\";\n";
+    out << "    result += formatted.str();\n";
+    out << "    return winrt::hstring{result};\n";
+    out << "}\n\n";
+    out << pfx << "winrt::IInspectable theme_lookup_th(wchar_t const* key, winrt::IInspectable fallback) {\n";
     out << "    if (!key) return fallback;\n";
     out << "    try {\n";
     out << "        bool is_light = is_current_light_theme();\n";
@@ -1191,9 +1375,12 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
     out << "    if (key && (std::wstring_view(key) == L\"AppTitleName\" || std::wstring_view(key) == L\"AppTitle\")) {\n";
     out << "        return winrt::box_value(winrt::hstring(L\"WinUI Gallery\"));\n";
     out << "    }\n";
+    out << "    if (key && std::wstring_view(key) == L\"ControlsName\") {\n";
+    out << "        return winrt::box_value(winrt::hstring(L\"All\"));\n";
+    out << "    }\n";
     out << "    return fallback;\n";
     out << "}\n\n";
-    out << "static winrt::Microsoft::UI::Xaml::Media::Brush theme_brush_th(wchar_t const* key) {\n";
+    out << pfx << "winrt::Microsoft::UI::Xaml::Media::Brush theme_brush_th(wchar_t const* key) {\n";
     out << "    bool is_light = is_current_light_theme();\n";
     out << "    std::wstring_view k{ key ? key : L\"\" };\n";
     out << "    auto get_or_create = [&](void*& slot, winrt::Windows::UI::Color light_c, winrt::Windows::UI::Color dark_c) -> winrt::Microsoft::UI::Xaml::Media::Brush {\n";
@@ -1244,10 +1431,13 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
     out << "        return get_or_create(g_theme_state.card_bg, winrt::Windows::UI::Color{255, 255, 255, 255}, winrt::Windows::UI::Color{255, 43, 43, 43});\n";
     out << "    return get_or_create(g_theme_state.text_primary, winrt::Windows::UI::Color{255, 26, 26, 26}, winrt::Windows::UI::Color{255, 255, 255, 255});\n";
     out << "}\n\n";
+    out << pfx << "winrt::Microsoft::UI::Xaml::Media::Brush theme_brush_th(winrt::hstring const& key) {\n";
+    out << "    return theme_brush_th(key.c_str());\n";
+    out << "}\n\n";
     // Style lookup (for {StaticResource Key} style references): walks the same
     // flat/merged resolution as theme_lookup_th. Returns an empty wrapper when
     // missing (a null Style merely clears the property - no factory, no crash).
-    out << "static winrt::Microsoft::UI::Xaml::Style style_lookup_th(wchar_t const* key) {\n";
+    out << pfx << "winrt::Microsoft::UI::Xaml::Style style_lookup_th(wchar_t const* key) {\n";
     out << "    winrt::IInspectable v = theme_lookup_th(key, winrt::IInspectable{});\n";
     out << "    if (v) {\n";
     out << "        winrt::IUnknown::addref_raw(v.get_abi());\n";
@@ -1259,7 +1449,7 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
     out << "            static void* cached_bar = nullptr;\n";
     out << "            if (cached_bar) { winrt::IUnknown::addref_raw(cached_bar); return winrt::Microsoft::UI::Xaml::Style::from_abi(cached_bar); }\n";
     out << "            try {\n";
-    out << "                static const wchar_t* const s_xaml = L\"<Style xmlns=\\\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\\\" TargetType=\\\"SelectorBar\\\"><Setter Property=\\\"HorizontalAlignment\\\" Value=\\\"Left\\\"/><Setter Property=\\\"VerticalAlignment\\\" Value=\\\"Top\\\"/><Setter Property=\\\"IsTabStop\\\" Value=\\\"False\\\"/><Setter Property=\\\"TabNavigation\\\" Value=\\\"Once\\\"/><Setter Property=\\\"Template\\\"><Setter.Value><ControlTemplate TargetType=\\\"SelectorBar\\\"><Grid Background=\\\"{TemplateBinding Background}\\\" BorderBrush=\\\"{TemplateBinding BorderBrush}\\\" CornerRadius=\\\"{TemplateBinding CornerRadius}\\\"><ItemsView x:Name=\\\"PART_ItemsView\\\" MaxWidth=\\\"{TemplateBinding MaxWidth}\\\" MaxHeight=\\\"{TemplateBinding MaxHeight}\\\" Padding=\\\"{TemplateBinding Padding}\\\" ItemsSource=\\\"{TemplateBinding Items}\\\" TabNavigation=\\\"{TemplateBinding TabNavigation}\\\"><ItemsView.Layout><StackLayout Orientation=\\\"Horizontal\\\" Spacing=\\\"8\\\"/></ItemsView.Layout></ItemsView></Grid></ControlTemplate></Setter.Value></Setter></Style>\";\n";
+    out << "                static const wchar_t* const s_xaml = L\"<Style xmlns=\\\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\\\" xmlns:x=\\\"http://schemas.microsoft.com/winfx/2006/xaml\\\" TargetType=\\\"SelectorBar\\\"><Setter Property=\\\"HorizontalAlignment\\\" Value=\\\"Left\\\"/><Setter Property=\\\"VerticalAlignment\\\" Value=\\\"Top\\\"/><Setter Property=\\\"IsTabStop\\\" Value=\\\"False\\\"/><Setter Property=\\\"TabNavigation\\\" Value=\\\"Once\\\"/><Setter Property=\\\"Template\\\"><Setter.Value><ControlTemplate TargetType=\\\"SelectorBar\\\"><Grid Background=\\\"{TemplateBinding Background}\\\" BorderBrush=\\\"{TemplateBinding BorderBrush}\\\" CornerRadius=\\\"{TemplateBinding CornerRadius}\\\"><ItemsView x:Name=\\\"PART_ItemsView\\\" MaxWidth=\\\"{TemplateBinding MaxWidth}\\\" MaxHeight=\\\"{TemplateBinding MaxHeight}\\\" Padding=\\\"{TemplateBinding Padding}\\\" ItemsSource=\\\"{TemplateBinding Items}\\\" TabNavigation=\\\"{TemplateBinding TabNavigation}\\\"><ItemsView.Layout><StackLayout Orientation=\\\"Horizontal\\\" Spacing=\\\"8\\\"/></ItemsView.Layout></ItemsView></Grid></ControlTemplate></Setter.Value></Setter></Style>\";\n";
     out << "                auto obj = winrt::Microsoft::UI::Xaml::Markup::XamlReader::Load(winrt::hstring(s_xaml));\n";
     out << "                if (obj) { cached_bar = obj.get_abi(); winrt::IUnknown::addref_raw(cached_bar); return winrt::Microsoft::UI::Xaml::Style::wrap_borrowed(cached_bar); }\n";
     out << "            } catch (...) {}\n";
@@ -1267,43 +1457,94 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
     out << "            static void* cached_item = nullptr;\n";
     out << "            if (cached_item) { winrt::IUnknown::addref_raw(cached_item); return winrt::Microsoft::UI::Xaml::Style::from_abi(cached_item); }\n";
     out << "            try {\n";
-    out << "                static const wchar_t* const item_xaml = L\"<Style xmlns=\\\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\\\" TargetType=\\\"SelectorBarItem\\\"><Setter Property=\\\"BackgroundSizing\\\" Value=\\\"OuterBorderEdge\\\"/><Setter Property=\\\"Background\\\" Value=\\\"#353535\\\"/><Setter Property=\\\"Foreground\\\" Value=\\\"#FFFFFF\\\"/><Setter Property=\\\"BorderBrush\\\" Value=\\\"#404040\\\"/><Setter Property=\\\"BorderThickness\\\" Value=\\\"1\\\"/><Setter Property=\\\"Padding\\\" Value=\\\"23,5,23,6\\\"/><Setter Property=\\\"CornerRadius\\\" Value=\\\"16\\\"/><Setter Property=\\\"HorizontalAlignment\\\" Value=\\\"Left\\\"/><Setter Property=\\\"VerticalAlignment\\\" Value=\\\"Center\\\"/><Setter Property=\\\"Template\\\"><Setter.Value><ControlTemplate TargetType=\\\"SelectorBarItem\\\"><Grid x:Name=\\\"PART_ContainerRoot\\\" Background=\\\"{TemplateBinding Background}\\\" BackgroundSizing=\\\"{TemplateBinding BackgroundSizing}\\\" BorderBrush=\\\"{TemplateBinding BorderBrush}\\\" BorderThickness=\\\"{TemplateBinding BorderThickness}\\\" CornerRadius=\\\"{TemplateBinding CornerRadius}\\\"><Grid.Resources><SolidColorBrush x:Key=\\\"SelectedForegroundBrush\\\" Color=\\\"#000000\\\"/><SolidColorBrush x:Key=\\\"UnselectedForegroundBrush\\\" Color=\\\"#FFFFFF\\\"/><SolidColorBrush x:Key=\\\"SelectedBgBrush\\\" Color=\\\"#76B9ED\\\"/><SolidColorBrush x:Key=\\\"SelectedHoverBgBrush\\\" Color=\\\"#6BA8D6\\\"/><SolidColorBrush x:Key=\\\"UnselectedNormalBgBrush\\\" Color=\\\"#353535\\\"/><SolidColorBrush x:Key=\\\"UnselectedHoverBgBrush\\\" Color=\\\"#404040\\\"/><SolidColorBrush x:Key=\\\"DarkBorderBrush\\\" Color=\\\"#404040\\\"/></Grid.Resources><StackPanel Margin=\\\"{TemplateBinding Padding}\\\" HorizontalAlignment=\\\"{TemplateBinding HorizontalContentAlignment}\\\" VerticalAlignment=\\\"{TemplateBinding VerticalContentAlignment}\\\" Orientation=\\\"Horizontal\\\" Spacing=\\\"6\\\"><ContentPresenter x:Name=\\\"PART_IconVisual\\\" Content=\\\"{TemplateBinding Icon}\\\" Foreground=\\\"{TemplateBinding Foreground}\\\"/><TextBlock x:Name=\\\"PART_TextVisual\\\" Margin=\\\"4,0,0,0\\\" FontSize=\\\"14\\\" Foreground=\\\"{TemplateBinding Foreground}\\\" Text=\\\"{TemplateBinding Text}\\\"/></StackPanel><VisualStateManager.VisualStateGroups><VisualStateGroup x:Name=\\\"CombinedStates\\\"><VisualState x:Name=\\\"UnselectedNormal\\\"><Storyboard><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_ContainerRoot\\\" Storyboard.TargetProperty=\\\"Background\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource UnselectedNormalBgBrush}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_ContainerRoot\\\" Storyboard.TargetProperty=\\\"BorderBrush\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource DarkBorderBrush}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_TextVisual\\\" Storyboard.TargetProperty=\\\"Foreground\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource UnselectedForegroundBrush}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_IconVisual\\\" Storyboard.TargetProperty=\\\"Foreground\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource UnselectedForegroundBrush}\\\"/></ObjectAnimationUsingKeyFrames></Storyboard></VisualState><VisualState x:Name=\\\"UnselectedPointerOver\\\"><Storyboard><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_ContainerRoot\\\" Storyboard.TargetProperty=\\\"Background\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource UnselectedHoverBgBrush}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_ContainerRoot\\\" Storyboard.TargetProperty=\\\"BorderBrush\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource DarkBorderBrush}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_TextVisual\\\" Storyboard.TargetProperty=\\\"Foreground\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource UnselectedForegroundBrush}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_IconVisual\\\" Storyboard.TargetProperty=\\\"Foreground\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource UnselectedForegroundBrush}\\\"/></ObjectAnimationUsingKeyFrames></Storyboard></VisualState><VisualState x:Name=\\\"SelectedNormal\\\"><Storyboard><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_ContainerRoot\\\" Storyboard.TargetProperty=\\\"Background\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource SelectedBgBrush}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_ContainerRoot\\\" Storyboard.TargetProperty=\\\"BorderBrush\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource SelectedBgBrush}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_TextVisual\\\" Storyboard.TargetProperty=\\\"Foreground\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource SelectedForegroundBrush}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_IconVisual\\\" Storyboard.TargetProperty=\\\"Foreground\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource SelectedForegroundBrush}\\\"/></ObjectAnimationUsingKeyFrames></Storyboard></VisualState><VisualState x:Name=\\\"SelectedPointerOver\\\"><Storyboard><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_ContainerRoot\\\" Storyboard.TargetProperty=\\\"Background\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource SelectedHoverBgBrush}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_ContainerRoot\\\" Storyboard.TargetProperty=\\\"BorderBrush\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource SelectedHoverBgBrush}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_TextVisual\\\" Storyboard.TargetProperty=\\\"Foreground\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource SelectedForegroundBrush}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_IconVisual\\\" Storyboard.TargetProperty=\\\"Foreground\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource SelectedForegroundBrush}\\\"/></ObjectAnimationUsingKeyFrames></Storyboard></VisualState></VisualStateGroup></VisualStateManager.VisualStateGroups></Grid></ControlTemplate></Setter.Value></Setter></Style>\";\n";
+    out << "                static const wchar_t* const item_xaml = L\"<Style xmlns=\\\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\\\" xmlns:x=\\\"http://schemas.microsoft.com/winfx/2006/xaml\\\" TargetType=\\\"SelectorBarItem\\\"><Setter Property=\\\"BackgroundSizing\\\" Value=\\\"OuterBorderEdge\\\"/><Setter Property=\\\"Background\\\" Value=\\\"#353535\\\"/><Setter Property=\\\"Foreground\\\" Value=\\\"#FFFFFF\\\"/><Setter Property=\\\"BorderBrush\\\" Value=\\\"#404040\\\"/><Setter Property=\\\"BorderThickness\\\" Value=\\\"1\\\"/><Setter Property=\\\"Padding\\\" Value=\\\"23,5,23,6\\\"/><Setter Property=\\\"CornerRadius\\\" Value=\\\"16\\\"/><Setter Property=\\\"HorizontalAlignment\\\" Value=\\\"Left\\\"/><Setter Property=\\\"VerticalAlignment\\\" Value=\\\"Center\\\"/><Setter Property=\\\"Template\\\"><Setter.Value><ControlTemplate TargetType=\\\"SelectorBarItem\\\"><Grid x:Name=\\\"PART_ContainerRoot\\\" Background=\\\"{TemplateBinding Background}\\\" BackgroundSizing=\\\"{TemplateBinding BackgroundSizing}\\\" BorderBrush=\\\"{TemplateBinding BorderBrush}\\\" BorderThickness=\\\"{TemplateBinding BorderThickness}\\\" CornerRadius=\\\"{TemplateBinding CornerRadius}\\\"><Grid.Resources><SolidColorBrush x:Key=\\\"SelectedForegroundBrush\\\" Color=\\\"#000000\\\"/><SolidColorBrush x:Key=\\\"UnselectedForegroundBrush\\\" Color=\\\"#FFFFFF\\\"/><SolidColorBrush x:Key=\\\"SelectedBgBrush\\\" Color=\\\"#76B9ED\\\"/><SolidColorBrush x:Key=\\\"SelectedHoverBgBrush\\\" Color=\\\"#6BA8D6\\\"/><SolidColorBrush x:Key=\\\"UnselectedNormalBgBrush\\\" Color=\\\"#353535\\\"/><SolidColorBrush x:Key=\\\"UnselectedHoverBgBrush\\\" Color=\\\"#404040\\\"/><SolidColorBrush x:Key=\\\"DarkBorderBrush\\\" Color=\\\"#404040\\\"/></Grid.Resources><StackPanel Margin=\\\"{TemplateBinding Padding}\\\" HorizontalAlignment=\\\"{TemplateBinding HorizontalContentAlignment}\\\" VerticalAlignment=\\\"{TemplateBinding VerticalContentAlignment}\\\" Orientation=\\\"Horizontal\\\" Spacing=\\\"6\\\"><ContentPresenter x:Name=\\\"PART_IconVisual\\\" Content=\\\"{TemplateBinding Icon}\\\" Foreground=\\\"{TemplateBinding Foreground}\\\"/><TextBlock x:Name=\\\"PART_TextVisual\\\" Margin=\\\"4,0,0,0\\\" FontSize=\\\"14\\\" Foreground=\\\"{TemplateBinding Foreground}\\\" Text=\\\"{TemplateBinding Text}\\\"/></StackPanel><VisualStateManager.VisualStateGroups><VisualStateGroup x:Name=\\\"CombinedStates\\\"><VisualState x:Name=\\\"UnselectedNormal\\\"><Storyboard><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_ContainerRoot\\\" Storyboard.TargetProperty=\\\"Background\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource UnselectedNormalBgBrush}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_ContainerRoot\\\" Storyboard.TargetProperty=\\\"BorderBrush\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource DarkBorderBrush}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_TextVisual\\\" Storyboard.TargetProperty=\\\"Foreground\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource UnselectedForegroundBrush}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_IconVisual\\\" Storyboard.TargetProperty=\\\"Foreground\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource UnselectedForegroundBrush}\\\"/></ObjectAnimationUsingKeyFrames></Storyboard></VisualState><VisualState x:Name=\\\"UnselectedPointerOver\\\"><Storyboard><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_ContainerRoot\\\" Storyboard.TargetProperty=\\\"Background\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource UnselectedHoverBgBrush}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_ContainerRoot\\\" Storyboard.TargetProperty=\\\"BorderBrush\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource DarkBorderBrush}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_TextVisual\\\" Storyboard.TargetProperty=\\\"Foreground\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource UnselectedForegroundBrush}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_IconVisual\\\" Storyboard.TargetProperty=\\\"Foreground\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource UnselectedForegroundBrush}\\\"/></ObjectAnimationUsingKeyFrames></Storyboard></VisualState><VisualState x:Name=\\\"SelectedNormal\\\"><Storyboard><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_ContainerRoot\\\" Storyboard.TargetProperty=\\\"Background\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource SelectedBgBrush}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_ContainerRoot\\\" Storyboard.TargetProperty=\\\"BorderBrush\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource SelectedBgBrush}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_TextVisual\\\" Storyboard.TargetProperty=\\\"Foreground\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource SelectedForegroundBrush}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_IconVisual\\\" Storyboard.TargetProperty=\\\"Foreground\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource SelectedForegroundBrush}\\\"/></ObjectAnimationUsingKeyFrames></Storyboard></VisualState><VisualState x:Name=\\\"SelectedPointerOver\\\"><Storyboard><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_ContainerRoot\\\" Storyboard.TargetProperty=\\\"Background\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource SelectedHoverBgBrush}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_ContainerRoot\\\" Storyboard.TargetProperty=\\\"BorderBrush\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource SelectedHoverBgBrush}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_TextVisual\\\" Storyboard.TargetProperty=\\\"Foreground\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource SelectedForegroundBrush}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"PART_IconVisual\\\" Storyboard.TargetProperty=\\\"Foreground\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{StaticResource SelectedForegroundBrush}\\\"/></ObjectAnimationUsingKeyFrames></Storyboard></VisualState></VisualStateGroup></VisualStateManager.VisualStateGroups></Grid></ControlTemplate></Setter.Value></Setter></Style>\";\n";
     out << "                auto obj = winrt::Microsoft::UI::Xaml::Markup::XamlReader::Load(winrt::hstring(item_xaml));\n";
     out << "                if (obj) { cached_item = obj.get_abi(); winrt::IUnknown::addref_raw(cached_item); return winrt::Microsoft::UI::Xaml::Style::wrap_borrowed(cached_item); }\n";
+    out << "            } catch (...) {}\n";
+    out << "        } else if (sv == L\"ScrollButtonStyle\") {\n";
+    out << "            static void* cached_btn_light = nullptr;\n";
+    out << "            static void* cached_btn_dark = nullptr;\n";
+    out << "            bool is_light = is_current_light_theme();\n";
+    out << "            void*& cached = is_light ? cached_btn_light : cached_btn_dark;\n";
+    out << "            if (cached) { winrt::IUnknown::addref_raw(cached); return winrt::Microsoft::UI::Xaml::Style::from_abi(cached); }\n";
+    out << "            try {\n";
+    out << "                wchar_t const* const btn_xaml = is_light\n";
+    out << "                    ? L\"<Style xmlns=\\\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\\\" xmlns:x=\\\"http://schemas.microsoft.com/winfx/2006/xaml\\\" TargetType=\\\"Button\\\"><Setter Property=\\\"Background\\\" Value=\\\"#E0F3F3F3\\\"/><Setter Property=\\\"Foreground\\\" Value=\\\"#000000\\\"/><Setter Property=\\\"BorderBrush\\\" Value=\\\"#D0D0D0\\\"/><Setter Property=\\\"BorderThickness\\\" Value=\\\"1\\\"/><Setter Property=\\\"Padding\\\" Value=\\\"0\\\"/><Setter Property=\\\"VerticalAlignment\\\" Value=\\\"Center\\\"/><Setter Property=\\\"CornerRadius\\\" Value=\\\"4\\\"/><Setter Property=\\\"Width\\\" Value=\\\"16\\\"/><Setter Property=\\\"Height\\\" Value=\\\"38\\\"/></Style>\"\n";
+    out << "                    : L\"<Style xmlns=\\\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\\\" xmlns:x=\\\"http://schemas.microsoft.com/winfx/2006/xaml\\\" TargetType=\\\"Button\\\"><Setter Property=\\\"Background\\\" Value=\\\"#E0202020\\\"/><Setter Property=\\\"Foreground\\\" Value=\\\"#FFFFFF\\\"/><Setter Property=\\\"BorderBrush\\\" Value=\\\"#404040\\\"/><Setter Property=\\\"BorderThickness\\\" Value=\\\"1\\\"/><Setter Property=\\\"Padding\\\" Value=\\\"0\\\"/><Setter Property=\\\"VerticalAlignment\\\" Value=\\\"Center\\\"/><Setter Property=\\\"CornerRadius\\\" Value=\\\"4\\\"/><Setter Property=\\\"Width\\\" Value=\\\"16\\\"/><Setter Property=\\\"Height\\\" Value=\\\"38\\\"/></Style>\";\n";
+    out << "                auto obj = winrt::Microsoft::UI::Xaml::Markup::XamlReader::Load(winrt::hstring(btn_xaml));\n";
+    out << "                if (obj) { cached = obj.get_abi(); winrt::IUnknown::addref_raw(cached); return winrt::Microsoft::UI::Xaml::Style::wrap_borrowed(cached); }\n";
+    out << "            } catch (...) {}\n";
+    out << "        } else if (sv == L\"SettingsSectionHeaderTextBlockStyle\") {\n";
+    out << "            static void* cached_sh = nullptr;\n";
+    out << "            if (cached_sh) { winrt::IUnknown::addref_raw(cached_sh); return winrt::Microsoft::UI::Xaml::Style::from_abi(cached_sh); }\n";
+    out << "            try {\n";
+    out << "                static const wchar_t* const sh_xaml = L\"<Style xmlns=\\\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\\\" xmlns:x=\\\"http://schemas.microsoft.com/winfx/2006/xaml\\\" TargetType=\\\"TextBlock\\\"><Setter Property=\\\"FontSize\\\" Value=\\\"14\\\"/><Setter Property=\\\"FontWeight\\\" Value=\\\"SemiBold\\\"/><Setter Property=\\\"Margin\\\" Value=\\\"1,30,0,6\\\"/></Style>\";\n";
+    out << "                auto obj = winrt::Microsoft::UI::Xaml::Markup::XamlReader::Load(winrt::hstring(sh_xaml));\n";
+    out << "                if (obj) { cached_sh = obj.get_abi(); winrt::IUnknown::addref_raw(cached_sh); return winrt::Microsoft::UI::Xaml::Style::wrap_borrowed(cached_sh); }\n";
+    out << "            } catch (...) {}\n";
+    out << "        } else if (sv == L\"GridViewItemStyle\" || sv == L\"SingleRowGridViewItemStyle\" || sv == L\"IndentedGridViewItemStyle\" || sv == L\"GridViewItemStyleSmall\" || sv == L\"IndentedGridViewItemStyleSmall\") {\n";
+    out << "            try {\n";
+    out << "                wchar_t const* m = L\"0,0,12,12\";\n";
+    out << "                if (sv == L\"SingleRowGridViewItemStyle\") m = L\"0,0,12,0\";\n";
+    out << "                else if (sv == L\"IndentedGridViewItemStyle\") m = L\"12,0,0,12\";\n";
+    out << "                else if (sv == L\"GridViewItemStyleSmall\") m = L\"0,0,0,12\";\n";
+    out << "                else if (sv == L\"IndentedGridViewItemStyleSmall\") m = L\"12,0,12,12\";\n";
+    out << "                std::wstring gvi_xaml = std::wstring(L\"<Style xmlns=\\\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\\\" xmlns:x=\\\"http://schemas.microsoft.com/winfx/2006/xaml\\\" TargetType=\\\"GridViewItem\\\"><Setter Property=\\\"Margin\\\" Value=\\\"\") + m + L\"\\\"/></Style>\";\n";
+    out << "                auto obj = winrt::Microsoft::UI::Xaml::Markup::XamlReader::Load(winrt::hstring(gvi_xaml.c_str()));\n";
+    out << "                if (obj) { void* p = obj.get_abi(); winrt::IUnknown::addref_raw(p); return winrt::Microsoft::UI::Xaml::Style::from_abi(p); }\n";
+    out << "            } catch (...) {}\n";
+    out << "        } else if (sv == L\"SettingsCardToggleSwitchStyle\") {\n";
+    out << "            static void* cached_ts = nullptr;\n";
+    out << "            if (cached_ts) { winrt::IUnknown::addref_raw(cached_ts); return winrt::Microsoft::UI::Xaml::Style::from_abi(cached_ts); }\n";
+    out << "            try {\n";
+    out << "                static const wchar_t* const ts_xaml = L\"<Style xmlns=\\\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\\\" xmlns:x=\\\"http://schemas.microsoft.com/winfx/2006/xaml\\\" TargetType=\\\"ToggleSwitch\\\"><Setter Property=\\\"Foreground\\\" Value=\\\"{ThemeResource ToggleSwitchContentForeground}\\\"/><Setter Property=\\\"HorizontalAlignment\\\" Value=\\\"Right\\\"/><Setter Property=\\\"VerticalAlignment\\\" Value=\\\"Center\\\"/><Setter Property=\\\"HorizontalContentAlignment\\\" Value=\\\"Right\\\"/><Setter Property=\\\"FontFamily\\\" Value=\\\"{ThemeResource ContentControlThemeFontFamily}\\\"/><Setter Property=\\\"FontSize\\\" Value=\\\"{ThemeResource ControlContentThemeFontSize}\\\"/><Setter Property=\\\"ManipulationMode\\\" Value=\\\"System,TranslateX\\\"/><Setter Property=\\\"MinWidth\\\" Value=\\\"0\\\"/><Setter Property=\\\"CornerRadius\\\" Value=\\\"{ThemeResource ControlCornerRadius}\\\"/><Setter Property=\\\"Template\\\"><Setter.Value><ControlTemplate TargetType=\\\"ToggleSwitch\\\"><Grid Background=\\\"{TemplateBinding Background}\\\" BorderBrush=\\\"{TemplateBinding BorderBrush}\\\" BorderThickness=\\\"{TemplateBinding BorderThickness}\\\" CornerRadius=\\\"{TemplateBinding CornerRadius}\\\"><VisualStateManager.VisualStateGroups><VisualStateGroup x:Name=\\\"CommonStates\\\"><VisualState x:Name=\\\"Normal\\\"/><VisualState x:Name=\\\"PointerOver\\\"><Storyboard><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"OuterBorder\\\" Storyboard.TargetProperty=\\\"Stroke\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{ThemeResource ToggleSwitchStrokeOffPointerOver}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"OuterBorder\\\" Storyboard.TargetProperty=\\\"Fill\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{ThemeResource ToggleSwitchFillOffPointerOver}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"SwitchKnobOff\\\" Storyboard.TargetProperty=\\\"Fill\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{ThemeResource ToggleSwitchKnobFillOffPointerOver}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"SwitchKnobOn\\\" Storyboard.TargetProperty=\\\"Background\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{ThemeResource ToggleSwitchKnobFillOnPointerOver}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"SwitchKnobBounds\\\" Storyboard.TargetProperty=\\\"Fill\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{ThemeResource ToggleSwitchFillOnPointerOver}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"SwitchKnobBounds\\\" Storyboard.TargetProperty=\\\"Stroke\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{ThemeResource ToggleSwitchStrokeOnPointerOver}\\\"/></ObjectAnimationUsingKeyFrames></Storyboard></VisualState><VisualState x:Name=\\\"Pressed\\\"><Storyboard><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"OuterBorder\\\" Storyboard.TargetProperty=\\\"Stroke\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{ThemeResource ToggleSwitchStrokeOffPressed}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"OuterBorder\\\" Storyboard.TargetProperty=\\\"Fill\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{ThemeResource ToggleSwitchFillOffPressed}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"SwitchKnobBounds\\\" Storyboard.TargetProperty=\\\"Fill\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{ThemeResource ToggleSwitchFillOnPressed}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"SwitchKnobBounds\\\" Storyboard.TargetProperty=\\\"Stroke\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{ThemeResource ToggleSwitchStrokeOnPressed}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"SwitchKnobOff\\\" Storyboard.TargetProperty=\\\"Fill\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{ThemeResource ToggleSwitchKnobFillOffPressed}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"SwitchKnobOn\\\" Storyboard.TargetProperty=\\\"Background\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{ThemeResource ToggleSwitchKnobFillOnPressed}\\\"/></ObjectAnimationUsingKeyFrames></Storyboard></VisualState><VisualState x:Name=\\\"Disabled\\\"><Storyboard><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"OffContentPresenter\\\" Storyboard.TargetProperty=\\\"Foreground\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{ThemeResource ToggleSwitchContentForegroundDisabled}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"OnContentPresenter\\\" Storyboard.TargetProperty=\\\"Foreground\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{ThemeResource ToggleSwitchContentForegroundDisabled}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"OuterBorder\\\" Storyboard.TargetProperty=\\\"Stroke\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{ThemeResource ToggleSwitchStrokeOffDisabled}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"OuterBorder\\\" Storyboard.TargetProperty=\\\"Fill\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{ThemeResource ToggleSwitchFillOffDisabled}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"SwitchKnobBounds\\\" Storyboard.TargetProperty=\\\"Fill\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{ThemeResource ToggleSwitchFillOnDisabled}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"SwitchKnobBounds\\\" Storyboard.TargetProperty=\\\"Stroke\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{ThemeResource ToggleSwitchStrokeOnDisabled}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"SwitchKnobOff\\\" Storyboard.TargetProperty=\\\"Fill\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{ThemeResource ToggleSwitchKnobFillOffDisabled}\\\"/></ObjectAnimationUsingKeyFrames><ObjectAnimationUsingKeyFrames Storyboard.TargetName=\\\"SwitchKnobOn\\\" Storyboard.TargetProperty=\\\"Background\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\" Value=\\\"{ThemeResource ToggleSwitchKnobFillOnDisabled}\\\"/></ObjectAnimationUsingKeyFrames></Storyboard></VisualState></VisualStateGroup><VisualStateGroup x:Name=\\\"ToggleStates\\\"><VisualState x:Name=\\\"Dragging\\\"/><VisualState x:Name=\\\"Off\\\"/><VisualState x:Name=\\\"On\\\"><Storyboard><DoubleAnimation Storyboard.TargetName=\\\"KnobTranslateTransform\\\" Storyboard.TargetProperty=\\\"X\\\" To=\\\"20\\\" Duration=\\\"0\\\"/><DoubleAnimationUsingKeyFrames Storyboard.TargetName=\\\"SwitchKnobBounds\\\" Storyboard.TargetProperty=\\\"Opacity\\\"><LinearDoubleKeyFrame KeyTime=\\\"0\\\" Value=\\\"1\\\"/></DoubleAnimationUsingKeyFrames><DoubleAnimationUsingKeyFrames Storyboard.TargetName=\\\"OuterBorder\\\" Storyboard.TargetProperty=\\\"Opacity\\\"><LinearDoubleKeyFrame KeyTime=\\\"0\\\" Value=\\\"0\\\"/></DoubleAnimationUsingKeyFrames><DoubleAnimationUsingKeyFrames Storyboard.TargetName=\\\"SwitchKnobOn\\\" Storyboard.TargetProperty=\\\"Opacity\\\"><LinearDoubleKeyFrame KeyTime=\\\"0\\\" Value=\\\"1\\\"/></DoubleAnimationUsingKeyFrames><DoubleAnimationUsingKeyFrames Storyboard.TargetName=\\\"SwitchKnobOff\\\" Storyboard.TargetProperty=\\\"Opacity\\\"><LinearDoubleKeyFrame KeyTime=\\\"0\\\" Value=\\\"0\\\"/></DoubleAnimationUsingKeyFrames></Storyboard></VisualState></VisualStateGroup><VisualStateGroup x:Name=\\\"ContentStates\\\"><VisualState x:Name=\\\"OffContent\\\"><Storyboard><DoubleAnimation Storyboard.TargetName=\\\"OffContentPresenter\\\" Storyboard.TargetProperty=\\\"Opacity\\\" To=\\\"1\\\" Duration=\\\"0\\\"/><ObjectAnimationUsingKeyFrames Storyboard.TargetProperty=\\\"IsHitTestVisible\\\" Storyboard.TargetName=\\\"OffContentPresenter\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\"><DiscreteObjectKeyFrame.Value><x:Boolean>True</x:Boolean></DiscreteObjectKeyFrame.Value></DiscreteObjectKeyFrame></ObjectAnimationUsingKeyFrames></Storyboard></VisualState><VisualState x:Name=\\\"OnContent\\\"><Storyboard><DoubleAnimation Storyboard.TargetName=\\\"OnContentPresenter\\\" Storyboard.TargetProperty=\\\"Opacity\\\" To=\\\"1\\\" Duration=\\\"0\\\"/><ObjectAnimationUsingKeyFrames Storyboard.TargetProperty=\\\"IsHitTestVisible\\\" Storyboard.TargetName=\\\"OnContentPresenter\\\"><DiscreteObjectKeyFrame KeyTime=\\\"0\\\"><DiscreteObjectKeyFrame.Value><x:Boolean>True</x:Boolean></DiscreteObjectKeyFrame.Value></DiscreteObjectKeyFrame></ObjectAnimationUsingKeyFrames></Storyboard></VisualState></VisualStateGroup></VisualStateManager.VisualStateGroups><Grid.RowDefinitions><RowDefinition Height=\\\"Auto\\\"/><RowDefinition Height=\\\"*\\\"/></Grid.RowDefinitions><ContentPresenter x:Name=\\\"HeaderContentPresenter\\\" Grid.Row=\\\"0\\\" Content=\\\"{TemplateBinding Header}\\\" ContentTemplate=\\\"{TemplateBinding HeaderTemplate}\\\" Foreground=\\\"{ThemeResource ToggleSwitchHeaderForeground}\\\" IsHitTestVisible=\\\"False\\\" Margin=\\\"{ThemeResource ToggleSwitchTopHeaderMargin}\\\" TextWrapping=\\\"Wrap\\\" VerticalAlignment=\\\"Top\\\" Visibility=\\\"Collapsed\\\" AutomationProperties.AccessibilityView=\\\"Raw\\\"/><Grid Grid.Row=\\\"1\\\" HorizontalAlignment=\\\"Right\\\" VerticalAlignment=\\\"Top\\\"><Grid.RowDefinitions><RowDefinition Height=\\\"{ThemeResource ToggleSwitchPreContentMargin}\\\"/><RowDefinition Height=\\\"Auto\\\"/><RowDefinition Height=\\\"{ThemeResource ToggleSwitchPostContentMargin}\\\"/></Grid.RowDefinitions><Grid.ColumnDefinitions><ColumnDefinition Width=\\\"Auto\\\"/><ColumnDefinition Width=\\\"12\\\" MaxWidth=\\\"12\\\"/><ColumnDefinition Width=\\\"Auto\\\"/></Grid.ColumnDefinitions><Grid x:Name=\\\"SwitchAreaGrid\\\" Grid.RowSpan=\\\"3\\\" Grid.ColumnSpan=\\\"3\\\" Margin=\\\"0,5\\\" CornerRadius=\\\"{TemplateBinding CornerRadius}\\\" Background=\\\"{ThemeResource ToggleSwitchContainerBackground}\\\"/><ContentPresenter x:Name=\\\"OffContentPresenter\\\" Grid.RowSpan=\\\"3\\\" Grid.Column=\\\"0\\\" Opacity=\\\"0\\\" Foreground=\\\"{TemplateBinding Foreground}\\\" IsHitTestVisible=\\\"False\\\" Content=\\\"{TemplateBinding OffContent}\\\" ContentTemplate=\\\"{TemplateBinding OffContentTemplate}\\\" HorizontalAlignment=\\\"Right\\\" VerticalAlignment=\\\"Center\\\" AutomationProperties.AccessibilityView=\\\"Raw\\\"/><ContentPresenter x:Name=\\\"OnContentPresenter\\\" Grid.RowSpan=\\\"3\\\" Grid.Column=\\\"0\\\" Opacity=\\\"0\\\" Foreground=\\\"{TemplateBinding Foreground}\\\" IsHitTestVisible=\\\"False\\\" Content=\\\"{TemplateBinding OnContent}\\\" ContentTemplate=\\\"{TemplateBinding OnContentTemplate}\\\" HorizontalAlignment=\\\"Right\\\" VerticalAlignment=\\\"Center\\\" AutomationProperties.AccessibilityView=\\\"Raw\\\"/><Rectangle x:Name=\\\"OuterBorder\\\" Grid.Row=\\\"1\\\" Grid.Column=\\\"2\\\" Height=\\\"20\\\" Width=\\\"40\\\" RadiusX=\\\"10\\\" RadiusY=\\\"10\\\" Fill=\\\"{ThemeResource ToggleSwitchFillOff}\\\" Stroke=\\\"{ThemeResource ToggleSwitchStrokeOff}\\\" StrokeThickness=\\\"{ThemeResource ToggleSwitchOuterBorderStrokeThickness}\\\"/><Rectangle x:Name=\\\"SwitchKnobBounds\\\" Grid.Row=\\\"1\\\" Grid.Column=\\\"2\\\" Height=\\\"20\\\" Width=\\\"40\\\" RadiusX=\\\"10\\\" RadiusY=\\\"10\\\" Fill=\\\"{ThemeResource ToggleSwitchFillOn}\\\" Stroke=\\\"{ThemeResource ToggleSwitchStrokeOn}\\\" StrokeThickness=\\\"{ThemeResource ToggleSwitchOnStrokeThickness}\\\" Opacity=\\\"0\\\"/><Grid x:Name=\\\"SwitchKnob\\\" Grid.Row=\\\"1\\\" Grid.Column=\\\"2\\\" HorizontalAlignment=\\\"Left\\\" Width=\\\"20\\\" Height=\\\"20\\\"><Border x:Name=\\\"SwitchKnobOn\\\" Background=\\\"{ThemeResource ToggleSwitchKnobFillOn}\\\" BorderBrush=\\\"{ThemeResource ToggleSwitchKnobStrokeOn}\\\" BackgroundSizing=\\\"OuterBorderEdge\\\" Width=\\\"12\\\" Height=\\\"12\\\" CornerRadius=\\\"7\\\" Opacity=\\\"0\\\" HorizontalAlignment=\\\"Center\\\" Margin=\\\"0,0,1,0\\\" RenderTransformOrigin=\\\"0.5, 0.5\\\"><Border.RenderTransform><CompositeTransform/></Border.RenderTransform></Border><Rectangle x:Name=\\\"SwitchKnobOff\\\" Fill=\\\"{ThemeResource ToggleSwitchKnobFillOff}\\\" Width=\\\"12\\\" Height=\\\"12\\\" RadiusX=\\\"7\\\" RadiusY=\\\"7\\\" HorizontalAlignment=\\\"Center\\\" Margin=\\\"-1,0,0,0\\\" RenderTransformOrigin=\\\"0.5, 0.5\\\"><Rectangle.RenderTransform><CompositeTransform/></Rectangle.RenderTransform></Rectangle><Grid.RenderTransform><TranslateTransform x:Name=\\\"KnobTranslateTransform\\\"/></Grid.RenderTransform></Grid><Thumb x:Name=\\\"SwitchThumb\\\" AutomationProperties.AccessibilityView=\\\"Raw\\\" Grid.RowSpan=\\\"3\\\" Grid.ColumnSpan=\\\"3\\\"><Thumb.Template><ControlTemplate TargetType=\\\"Thumb\\\"><Rectangle Fill=\\\"Transparent\\\"/></ControlTemplate></Thumb.Template></Thumb></Grid></Grid></ControlTemplate></Setter.Value></Setter></Style>\";\n";
+    out << "                auto obj = winrt::Microsoft::UI::Xaml::Markup::XamlReader::Load(winrt::hstring(ts_xaml));\n";
+    out << "                if (obj) { cached_ts = obj.get_abi(); winrt::IUnknown::addref_raw(cached_ts); return winrt::Microsoft::UI::Xaml::Style::wrap_borrowed(cached_ts); }\n";
     out << "            } catch (...) {}\n";
     out << "        }\n";
     out << "    }\n";
     out << "    return winrt::Microsoft::UI::Xaml::Style::from_abi(nullptr);\n";
     out << "}\n\n";
+    out << pfx << "double theme_double_th(wchar_t const* key, double fallback = 0.0) {\n";
+    out << "    if (!key) return fallback;\n";
+    out << "    std::wstring_view sv(key);\n";
+    out << "    if (sv == L\"FlipViewButtonFontSize\") return 12.0;\n";
+    out << "    if (sv == L\"ControlContentThemeFontSize\") return 14.0;\n";
+    out << "    try {\n";
+    out << "        auto v = theme_lookup_th(key, winrt::IInspectable{});\n";
+    out << "        if (v) return winrt::unbox_value_or<double>(v, fallback);\n";
+    out << "    } catch (...) {}\n";
+    out << "    return fallback;\n";
+    out << "}\n\n";
     // Enum-by-name helpers that take a state var directly (x:Bind style):
     // style_from_name(Var) -> Style (Style-typed setters), theme_string_th(Var)
     // -> hstring (Text-typed setters). Applied by the code-fix pass when a
     // state-var argument meets a Style/Text setter.
-    out << "static winrt::Microsoft::UI::Xaml::Style style_from_name(winrt::hstring const& name)\n";
+    out << pfx << "winrt::Microsoft::UI::Xaml::Style style_from_name(winrt::hstring const& name)\n";
     out << "{\n";
     out << "    return style_lookup_th(name.c_str());\n";
     out << "}\n";
-    out << "static winrt::hstring theme_string_th(winrt::hstring const& name)\n";
+    out << pfx << "winrt::hstring theme_string_th(winrt::hstring const& name)\n";
     out << "{\n";
     out << "    return name;\n";
     out << "}\n";
     // Overloads taking a raw resource lookup result (IInspectable): nesting
     // theme_lookup_th(...) inside the wchar_t*/hstring overloads is a compile
     // error — the resource object is used directly instead.
-    out << "static winrt::Microsoft::UI::Xaml::Media::Brush theme_brush_th(winrt::IInspectable const& v)\n";
+    out << pfx << "winrt::Microsoft::UI::Xaml::Media::Brush theme_brush_th(winrt::IInspectable const& v)\n";
     out << "{\n";
     out << "    if (!v) return winrt::Microsoft::UI::Xaml::Media::Brush::from_abi(nullptr);\n";
     out << "    winrt::IUnknown::addref_raw(v.get_abi());\n";
     out << "    return winrt::Microsoft::UI::Xaml::Media::Brush::from_abi(v.get_abi());\n";
     out << "}\n";
-    out << "static winrt::hstring theme_string_th(winrt::IInspectable const& v)\n";
+    out << pfx << "winrt::hstring theme_string_th(winrt::IInspectable const& v)\n";
     out << "{\n";
     out << "    return winrt::unbox_value_or<winrt::hstring>(v, winrt::hstring{});\n";
     out << "}\n\n";
     // Enum-by-name: a state var holds an alignment name ("Center", ...);
     // enum-typed setters need the projected enum value. Two concrete helpers
     // (the enums share no full member set, so a template cannot work).
-    out << "static winrt::Microsoft::UI::Xaml::HorizontalAlignment halignment_from_name(winrt::hstring const& name)\n";
+    out << pfx << "winrt::Microsoft::UI::Xaml::HorizontalAlignment halignment_from_name(winrt::hstring const& name)\n";
     out << "{\n";
     out << "    std::wstring_view sv = name.to_view();\n";
     out << "    auto cmp = [&](wchar_t const* lit) { return sv == std::wstring_view(lit); };\n";
@@ -1312,7 +1553,7 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
     out << "    if (cmp(L\"Right\")) return winrt::Microsoft::UI::Xaml::HorizontalAlignment::Right;\n";
     out << "    return winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch;\n";
     out << "}\n";
-    out << "static winrt::Microsoft::UI::Xaml::VerticalAlignment valignment_from_name(winrt::hstring const& name)\n";
+    out << pfx << "winrt::Microsoft::UI::Xaml::VerticalAlignment valignment_from_name(winrt::hstring const& name)\n";
     out << "{\n";
     out << "    std::wstring_view sv = name.to_view();\n";
     out << "    auto cmp = [&](wchar_t const* lit) { return sv == std::wstring_view(lit); };\n";
@@ -1324,7 +1565,7 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
     // String-state-var conversions for struct-typed setters: a @state string
     // holding "1,1,1,1" (or a single number) feeds Thickness/CornerRadius
     // setters through these parsers; bare strings would not compile.
-    out << "static winrt::Microsoft::UI::Xaml::Thickness thickness_from_name(winrt::hstring const& name)\n";
+    out << pfx << "winrt::Microsoft::UI::Xaml::Thickness thickness_from_name(winrt::hstring const& name)\n";
     out << "{\n";
     out << "    double v[4] = { 0, 0, 0, 0 };\n";
     out << "    std::wstring_view sv = name.to_view();\n";
@@ -1339,14 +1580,14 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
     out << "    if (n == 2) return winrt::Microsoft::UI::Xaml::Thickness{ v[0], v[1], v[0], v[1] };\n";
     out << "    return winrt::Microsoft::UI::Xaml::Thickness{ v[0], v[1], v[2], v[3] };\n";
     out << "}\n";
-    out << "static winrt::Microsoft::UI::Xaml::CornerRadius corner_from_name(winrt::hstring const& name)\n";
+    out << pfx << "winrt::Microsoft::UI::Xaml::CornerRadius corner_from_name(winrt::hstring const& name)\n";
     out << "{\n";
     out << "    auto th = thickness_from_name(name);\n";
     out << "    return winrt::Microsoft::UI::Xaml::CornerRadius{ th.Left, th.Top, th.Right, th.Bottom };\n";
     out << "}\n\n";
     // DataTemplate-typed setters (ItemTemplate, ContentTemplate) take a
     // DataTemplate wrapper, not the raw IInspectable resource lookup result.
-    out << "static winrt::Microsoft::UI::Xaml::DataTemplate data_template_th(wchar_t const* key) {\n";
+    out << pfx << "winrt::Microsoft::UI::Xaml::DataTemplate data_template_th(wchar_t const* key) {\n";
     out << "    winrt::IInspectable v = theme_lookup_th(key, winrt::IInspectable{});\n";
     out << "    if (v) {\n";
     out << "        winrt::IUnknown::addref_raw(v.get_abi());\n";
@@ -1356,20 +1597,164 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
     out << "        static void* cached_dt = nullptr;\n";
     out << "        if (cached_dt) { winrt::IUnknown::addref_raw(cached_dt); return winrt::Microsoft::UI::Xaml::DataTemplate::from_abi(cached_dt); }\n";
     out << "        try {\n";
-    out << "            static const wchar_t* const dt_xaml = L\"<DataTemplate xmlns=\\\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\\\" xmlns:x=\\\"http://schemas.microsoft.com/winfx/2006/xaml\\\"><Grid x:Name=\\\"controlRoot\\\" Width=\\\"300\\\" Height=\\\"96\\\" Padding=\\\"8\\\" Background=\\\"#2B2B2B\\\" BorderBrush=\\\"#3A3A3A\\\" BorderThickness=\\\"1\\\" CornerRadius=\\\"8\\\"><Grid.ColumnDefinitions><ColumnDefinition Width=\\\"Auto\\\"/><ColumnDefinition Width=\\\"*\\\"/></Grid.ColumnDefinitions><Grid.RowDefinitions><RowDefinition Height=\\\"Auto\\\"/><RowDefinition Height=\\\"*\\\"/></Grid.RowDefinitions><Image x:Name=\\\"gridImage\\\" Grid.RowSpan=\\\"2\\\" Width=\\\"32\\\" Height=\\\"32\\\" Margin=\\\"8,12,16,0\\\" VerticalAlignment=\\\"Top\\\" Stretch=\\\"Uniform\\\" Source=\\\"{Binding ImagePath}\\\"/><TextBlock x:Name=\\\"titleText\\\" Grid.Column=\\\"1\\\" Margin=\\\"0,12,0,0\\\" VerticalAlignment=\\\"Bottom\\\" FontWeight=\\\"SemiBold\\\" FontSize=\\\"14\\\" Foreground=\\\"#FFFFFF\\\" TextTrimming=\\\"CharacterEllipsis\\\" TextWrapping=\\\"NoWrap\\\" Text=\\\"{Binding Title}\\\"/><TextBlock x:Name=\\\"subtitleText\\\" Grid.Row=\\\"1\\\" Grid.Column=\\\"1\\\" Margin=\\\"0,2,0,0\\\" FontSize=\\\"12\\\" Foreground=\\\"#9E9E9E\\\" TextTrimming=\\\"WordEllipsis\\\" TextWrapping=\\\"Wrap\\\" Text=\\\"{Binding Subtitle}\\\"/></Grid></DataTemplate>\";\n";
+    out << "            static const wchar_t* const dt_xaml = L\"<DataTemplate xmlns=\\\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\\\" xmlns:x=\\\"http://schemas.microsoft.com/winfx/2006/xaml\\\"><Grid x:Name=\\\"controlRoot\\\" Width=\\\"300\\\" Height=\\\"96\\\" Padding=\\\"8\\\" Background=\\\"#2B2B2B\\\" BorderBrush=\\\"#3A3A3A\\\" BorderThickness=\\\"1\\\" CornerRadius=\\\"8\\\"><Grid><Grid.ColumnDefinitions><ColumnDefinition Width=\\\"Auto\\\"/><ColumnDefinition Width=\\\"*\\\"/></Grid.ColumnDefinitions><Grid.RowDefinitions><RowDefinition Height=\\\"Auto\\\"/><RowDefinition Height=\\\"*\\\"/></Grid.RowDefinitions><Image x:Name=\\\"gridImage\\\" Grid.RowSpan=\\\"2\\\" Width=\\\"32\\\" Height=\\\"32\\\" Margin=\\\"8,12,16,0\\\" VerticalAlignment=\\\"Top\\\" Stretch=\\\"Uniform\\\" Source=\\\"{Binding ImagePath}\\\"/><TextBlock x:Name=\\\"titleText\\\" Grid.Column=\\\"1\\\" Margin=\\\"0,12,0,0\\\" VerticalAlignment=\\\"Bottom\\\" FontWeight=\\\"SemiBold\\\" FontSize=\\\"14\\\" Foreground=\\\"#FFFFFF\\\" TextTrimming=\\\"CharacterEllipsis\\\" TextWrapping=\\\"NoWrap\\\" Text=\\\"{Binding Title}\\\"/><TextBlock x:Name=\\\"subtitleText\\\" Grid.Row=\\\"1\\\" Grid.Column=\\\"1\\\" Margin=\\\"0,2,0,0\\\" FontSize=\\\"12\\\" Foreground=\\\"#9E9E9E\\\" TextTrimming=\\\"WordEllipsis\\\" TextWrapping=\\\"Wrap\\\" Text=\\\"{Binding Subtitle}\\\"/></Grid><Border x:Name=\\\"experimentalBadge\\\" Margin=\\\"-8\\\" Padding=\\\"8,4\\\" VerticalAlignment=\\\"Bottom\\\" Background=\\\"#433519\\\" CornerRadius=\\\"0,0,7,7\\\" Visibility=\\\"Collapsed\\\"><TextBlock HorizontalAlignment=\\\"Center\\\" Foreground=\\\"#FCE100\\\" FontSize=\\\"12\\\" FontWeight=\\\"SemiBold\\\" Text=\\\"Experimental\\\"/></Border></Grid></DataTemplate>\";\n";
     out << "            auto obj = winrt::Microsoft::UI::Xaml::Markup::XamlReader::Load(winrt::hstring(dt_xaml));\n";
     out << "            if (obj) { cached_dt = obj.get_abi(); winrt::IUnknown::addref_raw(cached_dt); return winrt::Microsoft::UI::Xaml::DataTemplate::wrap_borrowed(cached_dt); }\n";
     out << "        } catch (...) {}\n";
     out << "    }\n";
     out << "    return winrt::Microsoft::UI::Xaml::DataTemplate::from_abi(nullptr);\n";
     out << "}\n\n";
-    out << "static winrt::Microsoft::UI::Xaml::Controls::ControlTemplate control_template_th(wchar_t const* key) {\n";
+    out << pfx << "winrt::Windows::Foundation::Collections::IVector<winrt::IInspectable> get_default_sample_catalog() {\n";
+    out << "    static void* s_cached_cat = nullptr;\n";
+    out << "    if (s_cached_cat) { winrt::IUnknown::addref_raw(s_cached_cat); return winrt::Windows::Foundation::Collections::IVector<winrt::IInspectable>::from_abi(s_cached_cat); }\n";
+    out << "    auto vec = winrt::single_threaded_vector<winrt::IInspectable>();\n";
+    out << "    auto add_item = [&](wchar_t const* title, wchar_t const* subtitle, wchar_t const* img, wchar_t const* uid, bool is_new, bool is_upd, bool is_experimental = false) {\n";
+    out << "        auto m = winrt::single_threaded_map<winrt::hstring, winrt::IInspectable>();\n";
+    out << "        m.Insert(winrt::hstring(L\"Title\"), winrt::box_value(winrt::hstring(title)));\n";
+    out << "        m.Insert(winrt::hstring(L\"Subtitle\"), winrt::box_value(winrt::hstring(subtitle)));\n";
+    out << "        m.Insert(winrt::hstring(L\"ImagePath\"), winrt::box_value(winrt::hstring(img)));\n";
+    out << "        m.Insert(winrt::hstring(L\"UniqueId\"), winrt::box_value(winrt::hstring(uid)));\n";
+    out << "        m.Insert(winrt::hstring(L\"IsNew\"), winrt::box_value(is_new));\n";
+    out << "        m.Insert(winrt::hstring(L\"IsUpdated\"), winrt::box_value(is_upd));\n";
+    out << "        m.Insert(winrt::hstring(L\"IsExperimental\"), winrt::box_value(is_experimental));\n";
+    out << "        vec.Append(m);\n";
+    out << "    };\n";
+out << "    add_item(L\"Resources\", L\"Reusable definitions for shared values to ensure consistency and maintainability.\", L\"ms-appx:///Assets/ControlImages/CodeTagIcon.png\", L\"XamlResources\", true, false, false);\n";
+    out << "    add_item(L\"Style\", L\"A XAML style is a Reusable property settings to define consistent UI design elements.\", L\"ms-appx:///Assets/ControlImages/CodeTagIcon.png\", L\"XamlStyles\", true, false, false);\n";
+    out << "    add_item(L\"Binding\", L\"Connecting UI elements to data for automatic synchronization and updates.\", L\"ms-appx:///Assets/ControlImages/CodeTagIcon.png\", L\"Binding\", true, false, false);\n";
+    out << "    add_item(L\"Templates\", L\"Customize controls' visuals, item layouts, and data presentation in XAML.\", L\"ms-appx:///Assets/ControlImages/CodeTagIcon.png\", L\"Templates\", true, false, false);\n";
+    out << "    add_item(L\"Custom & User Controls\", L\"Create reusable UI components with custom functionality and appearance.\", L\"ms-appx:///Assets/ControlImages/CustomControls.png\", L\"CustomUserControls\", true, false, false);\n";
+    out << "    add_item(L\"XAML Conditions\", L\"Define custom XAML conditions evaluated at parse time using IXamlCondition.\", L\"ms-appx:///Assets/ControlImages/CodeTagIcon.png\", L\"CustomXamlConditionals\", true, false, false);\n";
+    out << "    add_item(L\"Scratch Pad\", L\"Scratch pad for testing simple XAML markup\", L\"ms-appx:///Assets/ControlImages/ScratchPad.png\", L\"ScratchPad\", false, false, false);\n";
+    out << "    add_item(L\"Color\", L\"Balanced color design creates clarity and aesthetic harmony.\", L\"ms-appx:///Assets/ControlImages/ColorPaletteResources.png\", L\"Color\", false, false, false);\n";
+    out << "    add_item(L\"Geometry\", L\"Clear geometric design ensures visual coherence and structure.\", L\"ms-appx:///Assets/ControlImages/Shape.png\", L\"Geometry\", false, false, false);\n";
+    out << "    add_item(L\"Iconography\", L\"Icons are a visual design language that can be used to communicate information quickly and effectively.\", L\"ms-appx:///Assets/ControlImages/IconElement.png\", L\"Iconography\", false, true, false);\n";
+    out << "    add_item(L\"Spacing\", L\"Thoughtful spacing design enhances readability and flow.\", L\"ms-appx:///Assets/ControlImages/CompactSizing.png\", L\"Spacing\", false, false, false);\n";
+    out << "    add_item(L\"Typography\", L\"Typography design guides attention with intuitive fonts and hierarchy.\", L\"ms-appx:///Assets/ControlImages/TextBlock.png\", L\"Typography\", false, false, false);\n";
+    out << "    add_item(L\"Color Contrast\", L\"High contrast design ensures accessibility for all users.\", L\"ms-appx:///Assets/ControlImages/Accessibility.png\", L\"AccessibilityColorContrast\", false, false, false);\n";
+    out << "    add_item(L\"Keyboard Navigation\", L\"Keyboard-friendly design enables seamless interactions.\", L\"ms-appx:///Assets/ControlImages/Accessibility.png\", L\"AccessibilityKeyboard\", false, false, false);\n";
+    out << "    add_item(L\"Screen Reader\", L\"Inclusive design ensures meaningful content for assistive technologies.\", L\"ms-appx:///Assets/ControlImages/Accessibility.png\", L\"AccessibilityScreenReader\", false, false, false);\n";
+    out << "    add_item(L\"AppBarButton\", L\"A button that's styled for use in a CommandBar.\", L\"ms-appx:///Assets/ControlImages/AppBarButton.png\", L\"AppBarButton\", false, false, false);\n";
+    out << "    add_item(L\"AppBarSeparator\", L\"A vertical line that's used to visually separate groups of commands in an app bar.\", L\"ms-appx:///Assets/ControlImages/AppBarSeparator.png\", L\"AppBarSeparator\", false, false, false);\n";
+    out << "    add_item(L\"AppBarToggleButton\", L\"A button that can be on, off, or indeterminate like a CheckBox, and is styled for use in an app bar or other specialized UI.\", L\"ms-appx:///Assets/ControlImages/AppBarToggleButton.png\", L\"AppBarToggleButton\", false, false, false);\n";
+    out << "    add_item(L\"CommandBar\", L\"A toolbar for displaying application-specific commands that handles layout and resizing of its contents.\", L\"ms-appx:///Assets/ControlImages/CommandBar.png\", L\"CommandBar\", false, false, false);\n";
+    out << "    add_item(L\"CommandBarFlyout\", L\"A mini-toolbar displaying proactive commands, and an optional menu of commands.\", L\"ms-appx:///Assets/ControlImages/CommandBarFlyout.png\", L\"CommandBarFlyout\", false, false, false);\n";
+    out << "    add_item(L\"MenuBar\", L\"A classic menu, allowing the display of MenuItems containing MenuFlyoutItems.\", L\"ms-appx:///Assets/ControlImages/MenuBar.png\", L\"MenuBar\", false, false, false);\n";
+    out << "    add_item(L\"MenuFlyout\", L\"Shows a contextual list of simple commands or options.\", L\"ms-appx:///Assets/ControlImages/MenuFlyout.png\", L\"MenuFlyout\", false, false, false);\n";
+    out << "    add_item(L\"SwipeControl\", L\"Touch gesture for quick menu actions on items.\", L\"ms-appx:///Assets/ControlImages/SwipeControl.png\", L\"SwipeControl\", false, false, false);\n";
+    out << "    add_item(L\"StandardUICommand\", L\"A StandardUICommand is a built-in 'XamlUICommand' which represents a commonly used command, e.g. 'Save'.\", L\"ms-appx:///Assets/ControlImages/AppBarSeparator.png\", L\"StandardUICommand\", false, false, false);\n";
+    out << "    add_item(L\"XamlUICommand\", L\"An object which is used to define the look and feel of a given command.\", L\"ms-appx:///Assets/ControlImages/AppBarSeparator.png\", L\"XamlUICommand\", false, false, false);\n";
+    out << "    add_item(L\"FlipView\", L\"Presents a collection of items that the user can flip through, one item at a time.\", L\"ms-appx:///Assets/ControlImages/FlipView.png\", L\"FlipView\", false, false, false);\n";
+    out << "    add_item(L\"GridView\", L\"A control that presents a collection of items in rows and columns.\", L\"ms-appx:///Assets/ControlImages/GridView.png\", L\"GridView\", false, false, false);\n";
+    out << "    add_item(L\"ItemsRepeater\", L\"A flexible, primitive control for data-driven layouts.\", L\"ms-appx:///Assets/ControlImages/ListView.png\", L\"ItemsRepeater\", false, false, false);\n";
+    out << "    add_item(L\"ItemsView\", L\"A control that presents a collection of items using various layouts.\", L\"ms-appx:///Assets/ControlImages/ItemsView.png\", L\"ItemsView\", false, false, false);\n";
+    out << "    add_item(L\"ListView\", L\"A control that presents a collection of items in a vertical list.\", L\"ms-appx:///Assets/ControlImages/ListView.png\", L\"ListView\", false, false, false);\n";
+    out << "    add_item(L\"PullToRefresh\", L\"Provides the ability to pull on a collection of items in a list/grid to refresh the contents of the collection.\", L\"ms-appx:///Assets/ControlImages/PullToRefresh.png\", L\"PullToRefresh\", false, false, false);\n";
+    out << "    add_item(L\"TableView\", L\"A preview control for presenting and editing virtualized tabular data.\", L\"ms-appx:///Assets/ControlImages/DataGrid.png\", L\"TableView\", false, false, true);\n";
+    out << "    add_item(L\"TreeView\", L\"The  TreeView control is a hierarchical list pattern with expanding and collapsing nodes that contain nested items.\", L\"ms-appx:///Assets/ControlImages/TreeView.png\", L\"TreeView\", false, false, false);\n";
+    out << "    add_item(L\"CalendarDatePicker\", L\"A control that lets users pick a date value using a calendar.\", L\"ms-appx:///Assets/ControlImages/CalendarDatePicker.png\", L\"CalendarDatePicker\", false, false, false);\n";
+    out << "    add_item(L\"CalendarView\", L\"A control that presents a calendar for a user to choose a date from.\", L\"ms-appx:///Assets/ControlImages/CalendarView.png\", L\"CalendarView\", false, false, false);\n";
+    out << "    add_item(L\"DatePicker\", L\"A control that lets a user pick a date value.\", L\"ms-appx:///Assets/ControlImages/DatePicker.png\", L\"DatePicker\", false, false, false);\n";
+    out << "    add_item(L\"TimePicker\", L\"A configurable control that lets a user pick a time value.\", L\"ms-appx:///Assets/ControlImages/TimePicker.png\", L\"TimePicker\", false, false, false);\n";
+    out << "    add_item(L\"Button\", L\"A control that responds to user input and raises a Click event.\", L\"ms-appx:///Assets/ControlImages/Button.png\", L\"Button\", false, false, false);\n";
+    out << "    add_item(L\"DropDownButton\", L\"A button that displays a flyout of choices when clicked.\", L\"ms-appx:///Assets/ControlImages/DropDownButton.png\", L\"DropDownButton\", false, false, false);\n";
+    out << "    add_item(L\"HyperlinkButton\", L\"A button that appears as hyperlink text, and can navigate to a URI or handle a Click event.\", L\"ms-appx:///Assets/ControlImages/HyperlinkButton.png\", L\"HyperlinkButton\", false, false, false);\n";
+    out << "    add_item(L\"RepeatButton\", L\"A button that raises its Click event repeatedly from the time it's pressed until it's released.\", L\"ms-appx:///Assets/ControlImages/RepeatButton.png\", L\"RepeatButton\", false, false, false);\n";
+    out << "    add_item(L\"ToggleButton\", L\"A button that can be switched between two states like a CheckBox.\", L\"ms-appx:///Assets/ControlImages/ToggleButton.png\", L\"ToggleButton\", false, false, false);\n";
+    out << "    add_item(L\"SplitButton\", L\"A two-part button that displays a flyout when its secondary part is clicked.\", L\"ms-appx:///Assets/ControlImages/SplitButton.png\", L\"SplitButton\", false, false, false);\n";
+    out << "    add_item(L\"ToggleSplitButton\", L\"A version of the SplitButton where the activation target toggles on/off.\", L\"ms-appx:///Assets/ControlImages/ToggleSplitButton.png\", L\"ToggleSplitButton\", false, false, false);\n";
+    out << "    add_item(L\"CheckBox\", L\"A control that a user can select or clear.\", L\"ms-appx:///Assets/ControlImages/CheckBox.png\", L\"CheckBox\", false, false, false);\n";
+    out << "    add_item(L\"ColorPicker\", L\"A control that displays a selectable color spectrum.\", L\"ms-appx:///Assets/ControlImages/ColorPicker.png\", L\"ColorPicker\", false, false, false);\n";
+    out << "    add_item(L\"ComboBox\", L\"A drop-down list of items a user can select from.\", L\"ms-appx:///Assets/ControlImages/ComboBox.png\", L\"ComboBox\", false, false, false);\n";
+    out << "    add_item(L\"RadioButton\", L\"A control that allows a user to select a single option from a group of options.\", L\"ms-appx:///Assets/ControlImages/RadioButton.png\", L\"RadioButton\", false, false, false);\n";
+    out << "    add_item(L\"RatingControl\", L\"Rate something 1 to 5 stars.\", L\"ms-appx:///Assets/ControlImages/RatingControl.png\", L\"RatingControl\", false, false, false);\n";
+    out << "    add_item(L\"Slider\", L\"A control that lets the user select from a range of values by moving a Thumb control along a track.\", L\"ms-appx:///Assets/ControlImages/Slider.png\", L\"Slider\", false, false, false);\n";
+    out << "    add_item(L\"ToggleSwitch\", L\"A switch that can be toggled between 2 states.\", L\"ms-appx:///Assets/ControlImages/ToggleSwitch.png\", L\"ToggleSwitch\", false, false, false);\n";
+    out << "    add_item(L\"InfoBadge\", L\"An non-intrusive UI to display notifications or bring focus to an area.\", L\"ms-appx:///Assets/ControlImages/InfoBadge.png\", L\"InfoBadge\", false, false, false);\n";
+    out << "    add_item(L\"InfoBar\", L\"An inline message to display app-wide status change information.\", L\"ms-appx:///Assets/ControlImages/InfoBar.png\", L\"InfoBar\", false, false, false);\n";
+    out << "    add_item(L\"ProgressBar\", L\"Shows the apps progress on a task, or that the app is performing ongoing work that doesn't block user interaction.\", L\"ms-appx:///Assets/ControlImages/ProgressBar.png\", L\"ProgressBar\", false, false, false);\n";
+    out << "    add_item(L\"ProgressRing\", L\"Shows the apps progress on a task, or that the app is performing ongoing work that does block user interaction.\", L\"ms-appx:///Assets/ControlImages/ProgressRing.png\", L\"ProgressRing\", false, false, false);\n";
+    out << "    add_item(L\"ToolTip\", L\"Displays information for an element in a pop-up window.\", L\"ms-appx:///Assets/ControlImages/ToolTip.png\", L\"ToolTip\", false, false, false);\n";
+    out << "    add_item(L\"ContentDialog\", L\"A dialog box that can be customized to contain any XAML content.\", L\"ms-appx:///Assets/ControlImages/ContentDialog.png\", L\"ContentDialog\", false, false, false);\n";
+    out << "    add_item(L\"Flyout\", L\"Shows contextual information and enables user interaction.\", L\"ms-appx:///Assets/ControlImages/Flyout.png\", L\"Flyout\", false, false, false);\n";
+    out << "    add_item(L\"Popup\", L\"A UI element displaying temporary content over existing interface.\", L\"ms-appx:///Assets/ControlImages/Popup.png\", L\"Popup\", true, false, false);\n";
+    out << "    add_item(L\"TeachingTip\", L\"A content-rich flyout for guiding users and enabling teaching moments.\", L\"ms-appx:///Assets/ControlImages/TeachingTip.png\", L\"TeachingTip\", false, false, false);\n";
+    out << "    add_item(L\"AnnotatedScrollBar\", L\"A control that extends a regular vertical scrollbar's functionality for an easy navigation through large collections.\", L\"ms-appx:///Assets/ControlImages/AnnotatedScrollbar.png\", L\"AnnotatedScrollBar\", false, false, false);\n";
+    out << "    add_item(L\"PipsPager\", L\"A control to let the user navigate through a paginated collection when the page numbers do not need to be visually known.\", L\"ms-appx:///Assets/ControlImages/PipsPager.png\", L\"PipsPager\", false, false, false);\n";
+    out << "    add_item(L\"PagerControl\", L\"A control that lets users navigate through a numbered collection of pages.\", L\"ms-appx:///Assets/ControlImages/PagerControl.png\", L\"PagerControl\", false, false, true);\n";
+    out << "    add_item(L\"ScrollView\", L\"A container control that lets the user pan and zoom its content.\", L\"ms-appx:///Assets/ControlImages/ScrollView.png\", L\"ScrollView\", false, false, false);\n";
+    out << "    add_item(L\"ScrollViewer\", L\"A container control that lets the user pan and zoom its content.\", L\"ms-appx:///Assets/ControlImages/ScrollViewer.png\", L\"ScrollViewer\", false, false, false);\n";
+    out << "    add_item(L\"SemanticZoom\", L\"Lets the user zoom between two different views of a collection, making it easier to navigate through large collections of items.\", L\"ms-appx:///Assets/ControlImages/SemanticZoom.png\", L\"SemanticZoom\", false, false, false);\n";
+    out << "    add_item(L\"Border\", L\"A container control that draws a boundary line, background, or both, around another object.\", L\"ms-appx:///Assets/ControlImages/Border.png\", L\"Border\", false, false, false);\n";
+    out << "    add_item(L\"Canvas\", L\"A layout panel that supports absolute positioning of child elements relative to the top left corner of the canvas.\", L\"ms-appx:///Assets/ControlImages/Canvas.png\", L\"Canvas\", false, false, false);\n";
+    out << "    add_item(L\"Expander\", L\"A container with a header that can be expanded to show a body with more content.\", L\"ms-appx:///Assets/ControlImages/Expander.png\", L\"Expander\", false, false, false);\n";
+    out << "    add_item(L\"Grid\", L\"A layout panel that supports arranging child elements in rows and columns. \", L\"ms-appx:///Assets/ControlImages/Grid.png\", L\"Grid\", false, false, false);\n";
+    out << "    add_item(L\"LayoutPanel\", L\"A panel that uses a Layout object to measure and arrange its children.\", L\"ms-appx:///Assets/ControlImages/LayoutPanel.png\", L\"LayoutPanel\", false, false, true);\n";
+    out << "    add_item(L\"RelativePanel\", L\"A panel that uses relationships between elements to define layout.\", L\"ms-appx:///Assets/ControlImages/RelativePanel.png\", L\"RelativePanel\", false, false, false);\n";
+    out << "    add_item(L\"SplitView\", L\"A container that has 2 content areas, with multiple display options for the pane.\", L\"ms-appx:///Assets/ControlImages/SplitView.png\", L\"SplitView\", false, false, false);\n";
+    out << "    add_item(L\"StackPanel\", L\"A layout panel that arranges child elements into a single line that can be oriented horizontally or vertically.\", L\"ms-appx:///Assets/ControlImages/StackPanel.png\", L\"StackPanel\", false, false, false);\n";
+    out << "    add_item(L\"VariableSizedWrapGrid\", L\"A layout panel that supports arranging child elements in rows and columns. Each child element can span multiple rows and columns.\", L\"ms-appx:///Assets/ControlImages/VariableSizedWrapGrid.png\", L\"VariableSizedWrapGrid\", false, false, false);\n";
+    out << "    add_item(L\"WrapPanel\", L\"A layout panel that arranges child elements in rows or columns and automatically wraps them onto new lines.\", L\"ms-appx:///Assets/ControlImages/WrapPanel.png\", L\"WrapPanel\", false, false, true);\n";
+    out << "    add_item(L\"Viewbox\", L\"A container control that scales its content to a specified size.\", L\"ms-appx:///Assets/ControlImages/Viewbox.png\", L\"Viewbox\", false, false, false);\n";
+    out << "    add_item(L\"BreadcrumbBar\", L\"Shows the trail of navigation taken to the current location.\", L\"ms-appx:///Assets/ControlImages/BreadcrumbBar.png\", L\"BreadcrumbBar\", false, false, false);\n";
+    out << "    add_item(L\"NavigationView\", L\"Common vertical layout for top-level areas of your app via a collapsible navigation menu.\", L\"ms-appx:///Assets/ControlImages/NavigationView.png\", L\"NavigationView\", false, false, false);\n";
+    out << "    add_item(L\"Pivot\", L\"Presents information from different sources in a tabbed view.\", L\"ms-appx:///Assets/ControlImages/Pivot.png\", L\"Pivot\", false, false, false);\n";
+    out << "    add_item(L\"SelectorBar\", L\"Presents information from a small set of different sources. The user can pick one of them.\", L\"ms-appx:///Assets/ControlImages/Pivot.png\", L\"SelectorBar\", true, false, false);\n";
+    out << "    add_item(L\"TabView\", L\"A control that displays a collection of tabs that can be used to display several documents.\", L\"ms-appx:///Assets/ControlImages/TabView.png\", L\"TabView\", false, true, false);\n";
+    out << "    add_item(L\"AnimatedVisualPlayer\", L\"An element to render and control playback of motion graphics.\", L\"ms-appx:///Assets/ControlImages/AnimatedVisualPlayer.png\", L\"AnimatedVisualPlayer\", false, false, false);\n";
+    out << "    add_item(L\"Capture Element / Camera Preview\", L\"A sample for doing a camera preview.\", L\"ms-appx:///Assets/ControlImages/CaptureElement.png\", L\"CaptureElementPreview\", true, false, false);\n";
+    out << "    add_item(L\"Chart\", L\"A preview control for visualizing numeric, category, and date-time data.\", L\"ms-appx:///Assets/ControlImages/Chart.png\", L\"Chart\", false, false, true);\n";
+    out << "    add_item(L\"Image\", L\"A control to display image content.\", L\"ms-appx:///Assets/ControlImages/Image.png\", L\"Image\", false, false, false);\n";
+    out << "    add_item(L\"InkCanvas / InkToolbar\", L\"Draw with pen, touch, or mouse and choose tools with an InkToolbar.\", L\"ms-appx:///Assets/ControlImages/InkToolbar.png\", L\"InkCanvas\", true, false, true);\n";
+    out << "    add_item(L\"MapControl\", L\"Displays a symbolic map of the Earth.\", L\"ms-appx:///Assets/ControlImages/MapControl.png\", L\"MapControl\", false, false, false);\n";
+    out << "    add_item(L\"MediaPlayerElement\", L\"A control to display video and image content.\", L\"ms-appx:///Assets/ControlImages/MediaPlayerElement.png\", L\"MediaPlayerElement\", false, false, false);\n";
+    out << "    add_item(L\"PersonPicture\", L\"Displays the picture of a person/contact.\", L\"ms-appx:///Assets/ControlImages/PersonPicture.png\", L\"PersonPicture\", false, false, false);\n";
+    out << "    add_item(L\"Sound\", L\"A code-behind only API that enables 2D and 3D UI sounds on all XAML controls.\", L\"ms-appx:///Assets/ControlImages/Sound.png\", L\"Sound\", false, false, false);\n";
+    out << "    add_item(L\"WebView2\", L\"A Microsoft Edge (Chromium) based control that hosts HTML content in an app.\", L\"ms-appx:///Assets/ControlImages/WebView.png\", L\"WebView2\", false, false, false);\n";
+    out << "    add_item(L\"AcrylicBrush\", L\"A translucent material recommended for panel backgrounds.\", L\"ms-appx:///Assets/ControlImages/Acrylic.png\", L\"Acrylic\", false, true, false);\n";
+    out << "    add_item(L\"AnimatedIcon\", L\"An element that displays and controls an icon that animates when the user interacts with the control.\", L\"ms-appx:///Assets/ControlImages/AnimatedIcon.png\", L\"AnimatedIcon\", false, false, false);\n";
+    out << "    add_item(L\"Compact Sizing\", L\"How to use a Resource Dictionary to enable compact sizing.\", L\"ms-appx:///Assets/ControlImages/CompactSizing.png\", L\"CompactSizing\", false, true, false);\n";
+    out << "    add_item(L\"IconElement\", L\"Represents icon controls that use different image types as its content.\", L\"ms-appx:///Assets/ControlImages/Image.png\", L\"IconElement\", false, false, false);\n";
+    out << "    add_item(L\"Line\", L\"Draws a straight line between two points.\", L\"ms-appx:///Assets/ControlImages/Line.png\", L\"Line\", false, false, false);\n";
+    out << "    add_item(L\"Shape\", L\"How to draw shapes, such as ellipses, rectangles, and polygons.\", L\"ms-appx:///Assets/ControlImages/Shape.png\", L\"Shape\", false, false, false);\n";
+    out << "    add_item(L\"RadialGradientBrush\", L\"A brush to show radial gradients.\", L\"ms-appx:///Assets/ControlImages/Canvas.png\", L\"RadialGradientBrush\", false, false, false);\n";
+    out << "    add_item(L\"System Backdrops (Mica/Acrylic)\", L\"System backdrops, like Mica and Acrylic, for app windows.\", L\"ms-appx:///Assets/ControlImages/Acrylic.png\", L\"SystemBackdrops\", false, false, false);\n";
+    out << "    add_item(L\"SystemBackdropElement\", L\"An element to host system backdrop materials.\", L\"ms-appx:///Assets/ControlImages/Acrylic.png\", L\"SystemBackdropElement\", true, false, false);\n";
+    out << "    add_item(L\"ThemeShadow\", L\"Adds a depth-aware shadow to UI elements using system lighting.\", L\"ms-appx:///Assets/ControlImages/ThemeShadow.png\", L\"ThemeShadow\", true, false, false);\n";
+    out << "    add_item(L\"AutoSuggestBox\", L\"A control to provide suggestions as a user is typing.\", L\"ms-appx:///Assets/ControlImages/AutoSuggestBox.png\", L\"AutoSuggestBox\", false, false, false);\n";
+    out << "    add_item(L\"NumberBox\", L\"A text control used for numeric input and evaluation of algebraic equations.\", L\"ms-appx:///Assets/ControlImages/NumberBox.png\", L\"NumberBox\", false, false, false);\n";
+    out << "    add_item(L\"PasswordBox\", L\"A control for entering passwords.\", L\"ms-appx:///Assets/ControlImages/PasswordBox.png\", L\"PasswordBox\", false, false, false);\n";
+    out << "    add_item(L\"RichEditBox\", L\"A rich text editing control that supports formatted text, hyperlinks, and other rich content.\", L\"ms-appx:///Assets/ControlImages/RichEditBox.png\", L\"RichEditBox\", false, true, false);\n";
+    out << "    add_item(L\"RichTextBlock\", L\"A control that displays formatted text, hyperlinks, inline images, and other rich content.\", L\"ms-appx:///Assets/ControlImages/RichTextBlock.png\", L\"RichTextBlock\", false, false, false);\n";
+    out << "    add_item(L\"TextBlock\", L\"A lightweight control for displaying small amounts of text.\", L\"ms-appx:///Assets/ControlImages/TextBlock.png\", L\"TextBlock\", false, false, false);\n";
+    out << "    add_item(L\"TextBox\", L\"A single-line or multi-line plain text field.\", L\"ms-appx:///Assets/ControlImages/TextBox.png\", L\"TextBox\", false, false, false);\n";
+    out << "    add_item(L\"Animation interop\", L\"XAML and Composition interop allows you to animate elements using expressions, natural animations, and more.\", L\"ms-appx:///Assets/ControlImages/AnimationInterop.png\", L\"XamlCompInterop\", false, false, false);\n";
+    out << "    add_item(L\"Connected Animation\", L\"Connected animations continue elements during page navigation and help the user maintain their context between views.\", L\"ms-appx:///Assets/ControlImages/ConnectedAnimation.png\", L\"ConnectedAnimation\", false, false, false);\n";
+    out << "    add_item(L\"Easing Functions\", L\"Easing is a way to manipulate the velocity of an object as it animates.\", L\"ms-appx:///Assets/ControlImages/EasingFunction.png\", L\"EasingFunction\", false, false, false);\n";
+    out << "    add_item(L\"Implicit Transitions\", L\"Use Implicit Transitions to automatically animate changes to properties.\", L\"ms-appx:///Assets/ControlImages/ImplicitTransition.png\", L\"ImplicitTransition\", false, false, false);\n";
+    out << "    add_item(L\"Page Transitions\", L\"Page transitions provide visual feedback about the relationship between pages.\", L\"ms-appx:///Assets/ControlImages/PageTransition.png\", L\"PageTransition\", false, false, false);\n";
+    out << "    add_item(L\"Theme Transitions\", L\"Theme transitions are pre-packaged, easy-to-apply animations.\", L\"ms-appx:///Assets/ControlImages/ThemeTransition.png\", L\"ThemeTransition\", false, false, false);\n";
+    out << "    add_item(L\"ParallaxView\", L\"A container control that provides the parallax effect when scrolling.\", L\"ms-appx:///Assets/ControlImages/ParallaxView.png\", L\"ParallaxView\", false, false, false);\n";
+    out << "    add_item(L\"AppWindow\", L\"A flexible, customizable window management system for app development.\", L\"ms-appx:///Assets/ControlImages/AppWindow.png\", L\"AppWindow\", true, false, false);\n";
+    out << "    add_item(L\"AppWindowTitleBar\", L\"Provides control over the app window title bar.\", L\"ms-appx:///Assets/ControlImages/TitleBar.png\", L\"AppWindowTitleBar\", false, false, false);\n";
+    out << "    add_item(L\"TitleBar\", L\"An example showing how to use the default TitleBar control.\", L\"ms-appx:///Assets/ControlImages/TitleBar.png\", L\"TitleBar\", false, true, false);\n";
+    out << "    add_item(L\"Window\", L\"Create top-level XAML windows and configure their client-area size.\", L\"ms-appx:///Assets/ControlImages/Windowing.png\", L\"Windowing\", true, false, false);\n";
+    out << "    add_item(L\"Clipboard\", L\"Copy and paste text, images, and files to and from the system Clipboard.\", L\"ms-appx:///Assets/ControlImages/Clipboard.png\", L\"Clipboard\", false, false, false);\n";
+    out << "    add_item(L\"ContentIsland\", L\"Create ContentIslands to host other frameworks in your app.\", L\"ms-appx:///Assets/ControlImages/ContentIsland.png\", L\"ContentIsland\", true, false, false);\n";
+    out << "    add_item(L\"Storage pickers\", L\"Select files and folders with modern system pickers.\", L\"ms-appx:///Assets/ControlImages/StoragePickers.png\", L\"StoragePickers\", false, true, false);\n";
+    out << "    add_item(L\"App notifications\", L\"Send notifications that appear in the Action Center and as toast popups.\", L\"ms-appx:///Assets/ControlImages/AppNotification.png\", L\"AppNotification\", true, false, false);\n";
+    out << "    add_item(L\"Badge notifications\", L\"Show numeric or icon badges on your app’s taskbar icon.\", L\"ms-appx:///Assets/ControlImages/BadgeNotification.png\", L\"BadgeNotificationManager\", true, false, false);\n";
+    out << "    add_item(L\"JumpList\", L\"Add custom tasks and groups to the app's taskbar jump list.\", L\"ms-appx:///Assets/ControlImages/JumpList.png\", L\"JumpList\", true, false, false);\n";
+    out << "    s_cached_cat = vec.get_abi(); winrt::IUnknown::addref_raw(s_cached_cat);\n";
+    out << "    return vec;\n";
+    out << "}\n\n";
+    out << pfx << "winrt::Microsoft::UI::Xaml::Controls::ControlTemplate control_template_th(wchar_t const* key) {\n";
     out << "    winrt::IInspectable v = theme_lookup_th(key, winrt::IInspectable{});\n";
     out << "    if (!v) return winrt::Microsoft::UI::Xaml::Controls::ControlTemplate::from_abi(nullptr);\n";
     out << "    winrt::IUnknown::addref_raw(v.get_abi());\n";
     out << "    return winrt::Microsoft::UI::Xaml::Controls::ControlTemplate::from_abi(v.get_abi());\n";
     out << "}\n\n";
-    out << "static winrt::Microsoft::UI::Xaml::Media::ImageSource image_source_lookup_th(wchar_t const* key) {\n";
+    out << pfx << "winrt::Microsoft::UI::Xaml::Media::ImageSource image_source_lookup_th(wchar_t const* key) {\n";
     out << "    if (key && std::wstring_view(key) == L\"StoreIcon\") {\n";
     out << "        bool is_light = is_current_light_theme();\n";
     out << "        return winrt::Microsoft::UI::Xaml::Media::Imaging::BitmapImage(winrt::Windows::Foundation::Uri(is_light ? L\"ms-appx:///Assets/HomeHeaderTiles/Header-Store.light.png\" : L\"ms-appx:///Assets/HomeHeaderTiles/Header-Store.dark.png\"));\n";
@@ -1393,7 +1778,10 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
     out << "    }\n";
     out << "    return winrt::Microsoft::UI::Xaml::Media::ImageSource::from_abi(nullptr);\n";
     out << "}\n\n";
-    out << "static void apply_xaml_resources(winrt::Microsoft::UI::Xaml::FrameworkElement const& el, wchar_t const* xaml) {\n";
+    out << pfx << "winrt::Microsoft::UI::Xaml::Media::ImageSource image_source_lookup_th(winrt::hstring const& key) {\n";
+    out << "    return image_source_lookup_th(key.c_str());\n";
+    out << "}\n\n";
+    out << pfx << "void apply_xaml_resources(winrt::Microsoft::UI::Xaml::FrameworkElement const& el, wchar_t const* xaml) {\n";
     out << "    if (!el.get_abi() || !xaml || !*xaml) return;\n";
     out << "    try {\n";
     out << "        std::wstring s = xaml;\n";
@@ -1419,7 +1807,7 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
     out << "        }\n";
     out << "    } catch (...) {}\n";
     out << "}\n\n";
-    out << "static void insert_resource(winrt::Microsoft::UI::Xaml::ResourceDictionary const& rd, wchar_t const* key, winrt::IInspectable const& val) {\n";
+    out << pfx << "void insert_resource(winrt::Microsoft::UI::Xaml::ResourceDictionary const& rd, wchar_t const* key, winrt::IInspectable const& val) {\n";
     out << "    if (!rd.get_abi() || !key || !val.get_abi()) return;\n";
     out << "    static winrt::winrt_guid const imap_iid{ 0x1b0d3570, 0x0877, 0x5ec2, { 0x8a, 0x2c, 0x1b, 0x95, 0x37, 0x37, 0x0a, 0x4a } };\n";
     out << "    void* map_ptr = nullptr;\n";
@@ -1436,7 +1824,7 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
     out << "        reinterpret_cast<std::uint32_t(__stdcall*)(void*)>(vtbl[2])(map_ptr);\n";
     out << "    }\n";
     out << "}\n\n";
-    out << "static void apply_app_resources(winrt::Microsoft::UI::Xaml::Application const& app, wchar_t const* xaml) {\n";
+    out << pfx << "void apply_app_resources(winrt::Microsoft::UI::Xaml::Application const& app, wchar_t const* xaml) {\n";
     out << "    if (!app.get_abi() || !xaml || !*xaml) return;\n";
     out << "    try {\n";
     out << "        std::wstring s = xaml;\n";
@@ -1499,11 +1887,24 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
     out << "        }\n";
     out << "    } catch (...) {}\n";
     out << "}\n\n";
-    out << "static void apply_visual_state_groups(winrt::Microsoft::UI::Xaml::FrameworkElement const& el, wchar_t const* xaml) {\n";
+    out << pfx << "void apply_visual_state_groups(winrt::Microsoft::UI::Xaml::FrameworkElement const& el, wchar_t const* xaml) {\n";
     out << "    if (!el.get_abi() || !xaml || !*xaml) return;\n";
     out << "    try {\n";
+    out << "        std::wstring s = xaml;\n";
+    out << "        size_t p = 0;\n";
+    out << "        while ((p = s.find(L\"<VisualState.Setters\")) != std::wstring::npos) {\n";
+    out << "            size_t end = s.find(L\"</VisualState.Setters>\", p);\n";
+    out << "            if (end != std::wstring::npos) s.erase(p, end + 22 - p);\n";
+    out << "            else { size_t tag_end = s.find(L\"/>\", p); if (tag_end != std::wstring::npos) s.erase(p, tag_end + 2 - p); else break; }\n";
+    out << "        }\n";
+    out << "        p = 0;\n";
+    out << "        while ((p = s.find(L\"<Setter \")) != std::wstring::npos) {\n";
+    out << "            size_t end = s.find(L\"/>\", p);\n";
+    out << "            if (end != std::wstring::npos) s.erase(p, end + 2 - p);\n";
+    out << "            else { size_t close_tag = s.find(L\"</Setter>\", p); if (close_tag != std::wstring::npos) s.erase(p, close_tag + 9 - p); else break; }\n";
+    out << "        }\n";
     out << "        static const wchar_t* const xml_ns = L\" xmlns=\\\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\\\" xmlns:x=\\\"http://schemas.microsoft.com/winfx/2006/xaml\\\" xmlns:d=\\\"http://schemas.microsoft.com/expression/blend/2008\\\" xmlns:mc=\\\"http://schemas.openxmlformats.org/markup-compatibility/2006\\\" xmlns:local=\\\"using:WinUIGallery\\\" xmlns:controls=\\\"using:WinUIGallery.Controls\\\" xmlns:animations=\\\"using:CommunityToolkit.WinUI.Animations\\\" xmlns:media=\\\"using:CommunityToolkit.WinUI.Media\\\" xmlns:wuxdata=\\\"using:Microsoft.UI.Xaml.Data\\\"\";\n";
-    out << "        std::wstring full = std::wstring(L\"<Grid\") + xml_ns + L\"><VisualStateManager.VisualStateGroups>\" + std::wstring(xaml) + L\"</VisualStateManager.VisualStateGroups></Grid>\";\n";
+    out << "        std::wstring full = std::wstring(L\"<Grid\") + xml_ns + L\"><VisualStateManager.VisualStateGroups>\" + s + L\"</VisualStateManager.VisualStateGroups></Grid>\";\n";
     out << "        auto obj = winrt::Microsoft::UI::Xaml::Markup::XamlReader::Load(winrt::hstring(full.c_str()));\n";
     out << "        if (obj) {\n";
     out << "            auto host = winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(obj.get_abi());\n";
@@ -1518,7 +1919,7 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
     out << "        }\n";
     out << "    } catch (...) {}\n";
     out << "}\n\n";
-    out << "static winrt::Microsoft::UI::Xaml::Controls::ControlTemplate load_control_template(wchar_t const* xaml) {\n";
+    out << pfx << "winrt::Microsoft::UI::Xaml::Controls::ControlTemplate load_control_template(wchar_t const* xaml) {\n";
     out << "    if (!xaml || !*xaml) return winrt::Microsoft::UI::Xaml::Controls::ControlTemplate::from_abi(nullptr);\n";
     out << "    try {\n";
     out << "        std::wstring s = xaml;\n";
@@ -1537,12 +1938,12 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
     out << "    } catch (...) {}\n";
     out << "    return winrt::Microsoft::UI::Xaml::Controls::ControlTemplate::from_abi(nullptr);\n";
     out << "}\n\n";
-    out << "static winrt::Microsoft::UI::Xaml::Media::SolidColorBrush make_solid_brush(winrt::Windows::UI::Color const& c) {\n";
+    out << pfx << "winrt::Microsoft::UI::Xaml::Media::SolidColorBrush make_solid_brush(winrt::Windows::UI::Color const& c) {\n";
     out << "    return winrt::Microsoft::UI::Xaml::Media::SolidColorBrush(c);\n";
     out << "}\n\n";
     // SolidColorBrush-typed setters (SelectionHighlightColor) take SolidColorBrush,
     // not the Brush base (projected structs are standalone).
-    out << "static winrt::Microsoft::UI::Xaml::Media::SolidColorBrush solid_color_brush(winrt::Windows::UI::Color const& c) {\n";
+    out << pfx << "winrt::Microsoft::UI::Xaml::Media::SolidColorBrush solid_color_brush(winrt::Windows::UI::Color const& c) {\n";
     out << "    return winrt::Microsoft::UI::Xaml::Media::SolidColorBrush(c);\n";
     out << "}\n\n";
     // Named color lookup for Brush properties (maps string names to Color ARGB)
@@ -1553,7 +1954,7 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
     // setters (PathIcon.Data). Uses get_/put_ accessors + raw IVector::Append
     // (slot 13) because the projection emits no property-syntax wrappers for
     // these media types. Point is a plain struct (winrt::Windows::Foundation).
-    out << "static winrt::Microsoft::UI::Xaml::Media::PathGeometry parse_svg_path(char const* d) {\n";
+    out << pfx << "winrt::Microsoft::UI::Xaml::Media::PathGeometry parse_svg_path(char const* d) {\n";
     out << "    winrt::Microsoft::UI::Xaml::Media::PathGeometry geo;\n";
     out << "    auto figs = geo.get_Figures();\n";
     out << "    auto cur = winrt::Microsoft::UI::Xaml::Media::PathFigure();\n";
@@ -1673,7 +2074,7 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
     out << "    flush_fig();\n";
     out << "    return geo;\n";
     out << "}\n\n";
-    out << "static winrt::Microsoft::UI::Xaml::Media::Geometry geometry_lookup_th(wchar_t const* key) {\n";
+    out << pfx << "winrt::Microsoft::UI::Xaml::Media::Geometry geometry_lookup_th(wchar_t const* key) {\n";
     out << "    if (key && std::wstring_view(key) == L\"GitHubIconPath\") {\n";
     out << "        const char* gh_svg = \"M48.854 0C21.839 0 0 22 0 49.217c0 21.756 13.993 40.172 33.405 46.69 2.427.49 3.316-1.059 3.316-2.362 0-1.141-.08-5.052-.08-9.127-13.59 2.934-16.42-5.867-16.42-5.867-2.184-5.704-5.42-7.17-5.42-7.17-4.448-3.015.324-3.015.324-3.015 4.934.326 7.523 5.052 7.523 5.052 4.367 7.496 11.404 5.378 14.235 4.074.404-3.178 1.699-5.378 3.074-6.6-10.839-1.141-22.243-5.378-22.243-24.283 0-5.378 1.94-9.778 5.014-13.2-.485-1.222-2.184-6.275.486-13.038 0 0 4.125-1.304 13.426 5.052a46.97 46.97 0 0 1 12.214-1.63c4.125 0 8.33.571 12.213 1.63 9.302-6.356 13.427-5.052 13.427-5.052 2.67 6.763.97 11.816.485 13.038 3.155 3.422 5.015 7.822 5.015 13.2 0 18.905-11.404 23.06-22.324 24.283 1.78 1.548 3.316 4.481 3.316 9.126 0 6.6-.08 11.897-.08 13.526 0 1.304.89 2.853 3.316 2.364 19.412-6.52 33.405-24.935 33.405-46.691C97.707 22 75.788 0 48.854 0z\";\n";
     out << "        auto pg = parse_svg_path(gh_svg);\n";
@@ -1694,7 +2095,7 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
     out << "    }\n";
     out << "    return winrt::Microsoft::UI::Xaml::Media::Geometry::from_abi(nullptr);\n";
     out << "}\n\n";
-    out << "static winrt::Windows::UI::Color named_color(char const* name) {\n";
+    out << pfx << "winrt::Windows::UI::Color named_color(char const* name) {\n";
     out << "    struct { char const* n; std::uint8_t r,g,b; } table[] = {\n";
     out << "        {\"Black\",0,0,0},{\"White\",255,255,255},{\"Red\",255,0,0},{\"Green\",0,128,0},\n";
     out << "        {\"Blue\",0,0,255},{\"Yellow\",255,255,0},{\"Orange\",255,165,0},{\"Gray\",128,128,128},\n";
@@ -1749,7 +2150,7 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
         out << "        m_unknown = winrt::com_ptr<void>::attach(unk);\n";
         out << "    }\n";
     };
-    out << "namespace winrt::Microsoft::UI::Xaml::Shapes {\n";
+    out << (is_shared_module ? "export namespace winrt::Microsoft::UI::Xaml::Shapes {\n" : "namespace winrt::Microsoft::UI::Xaml::Shapes {\n");
     out << "struct Shape : winrt::Microsoft::UI::Xaml::FrameworkElement {\n";
     out << "    using FrameworkElement::FrameworkElement;\n";
     out << "    Shape() : FrameworkElement(typename FrameworkElement::wrap_tag_t{}) {} // null wrapper: derived stubs activate their own class\n";
@@ -1796,7 +2197,7 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
     // real entity and split every cross-module symbol passing a Uri
     // (LNK2019 $$_A vs $$_B). Stub only for SDK-less runs.
     if (!have_windows_sdk) {
-    out << "namespace winrt::Windows::Foundation {\n";
+    out << (is_shared_module ? "export namespace winrt::Windows::Foundation {\n" : "namespace winrt::Windows::Foundation {\n");
     out << "struct Uri : winrt::IInspectable {\n";
     out << "    Uri() {}\n";
     out << "    Uri(winrt::hstring const&) {}\n";
@@ -1810,12 +2211,12 @@ inline void emit_runtime_helpers(std::ostringstream& out, bool have_windows_sdk)
     // present, emit a namespace alias (an alias is not a new entity — no
     // ODR/symbol split); without it, fall back to a local stub.
     if (have_windows_sdk) {
-    out << "namespace winrt::Microsoft::UI::Xaml::Media {\n";
+    out << (is_shared_module ? "export namespace winrt::Microsoft::UI::Xaml::Media {\n" : "namespace winrt::Microsoft::UI::Xaml::Media {\n");
     out << "using BitmapImage = winrt::Microsoft::UI::Xaml::Media::Imaging::BitmapImage;\n";
     out << "} // namespace winrt::Microsoft::UI::Xaml::Media\n\n";
     }
     else {
-    out << "namespace winrt::Microsoft::UI::Xaml::Media {\n";
+    out << (is_shared_module ? "export namespace winrt::Microsoft::UI::Xaml::Media {\n" : "namespace winrt::Microsoft::UI::Xaml::Media {\n");
     out << "struct BitmapImage : ImageSource {\n";
     out << "    using ImageSource::ImageSource;\n";
     out << "    BitmapImage() {}\n";

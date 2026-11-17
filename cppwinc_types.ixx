@@ -520,10 +520,10 @@ bool in_projection(winmd::type_info const& type)
     {
         return false;
     }
-    if (type.ns == "Windows.Foundation.Metadata")
-    {
+    if (type.ns == "Windows.Foundation.Metadata"
+        && !((type.is_class() && !type.statics.empty())
+            || (type.is_interface() && !type.methods.empty())))
         return false;
-    }
     if (type.api_contract)
     {
         return false;
@@ -682,17 +682,36 @@ std::string tpl_args(winmd::type_info const& type)
 }
 
 // flattened method list (base interface methods first)
+bool is_async_info(winmd::type_info const& t);
+
 std::vector<winmd::method_info const*> flattened_methods(winmd::type_info const& type, winmd::metadata const& metadata)
 {
     std::vector<winmd::method_info const*> result;
-    if (type.base && type.base->is_interface())
+    std::set<winmd::type_info const*> visited;
+    std::function<void(winmd::type_info const&)> append = [&](winmd::type_info const& current)
     {
-        result = flattened_methods(*type.base, metadata);
-    }
-    for (auto const& method : type.methods)
-    {
-        result.push_back(&method);
-    }
+        if (!visited.insert(&current).second)
+        {
+            return;
+        }
+        if (current.base && current.base->is_interface())
+        {
+            append(*current.base);
+        }
+        for (auto const& method : current.methods)
+        {
+            result.push_back(&method);
+        }
+        for (auto const* iface : current.interfaces)
+        {
+            if (iface && iface->is_interface() && !is_async_info(*iface))
+            {
+                append(*iface);
+            }
+        }
+    };
+    append(type);
+    (void)metadata;
     return result;
 }
 
@@ -756,6 +775,13 @@ winmd::type_info const* find_declaring_in(winmd::type_info const& iface, winmd::
 // "own" means "not declared by any base").
 winmd::type_info const* find_declaring(winmd::type_info const& type, winmd::method_info const& method)
 {
+    for (auto const& own : type.methods)
+    {
+        if (own.name == method.name && own.params.size() == method.params.size())
+        {
+            return &type;
+        }
+    }
     for (auto const* b : type.interfaces)
     {
         if (!b || !b->is_interface())
@@ -983,8 +1009,8 @@ void collect_type_edges(winmd::type_info const& type, winmd::metadata const& met
     {
         if (t && !t->ns.empty() && out.insert(t).second)
         {
-            // closures over Windows.Foundation.Metadata are attribute-only;
-            // the pruned in_projection already rejects them
+            // Metadata attributes are filtered by in_projection; runtime
+            // static APIs and their signatures remain available to projects.
         }
     };
     // Resolves every named type inside a signature type. Generic
@@ -1105,7 +1131,7 @@ void build_winui_type_closure(winmd::metadata const& metadata,
     {
         if (!ns.starts_with("winrt.")) continue;
         std::string ns_name = ns.substr(6);
-        if (ns_name == "Windows.Foundation" || ns_name == "Windows.Foundation.Metadata") continue;
+        if (ns_name == "Windows.Foundation") continue;
         auto it = metadata.namespaces().find(ns_name);
         if (it == metadata.namespaces().end()) continue;
         auto const& info = it->second;

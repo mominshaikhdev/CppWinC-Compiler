@@ -6,6 +6,47 @@
     // e.g. "rootFrame.CanGoBack" → "rootFrame.CanGoBack()"
     auto resolve_binding_to_cpp = [&](std::string const& expr, std::vector<layout_state_var> const& state_vars) -> std::string {
         if (expr.empty()) return expr;
+        auto state_member_name = [&](layout_state_var const& state) {
+            std::string cap_name = state.name;
+            if (!cap_name.empty())
+                cap_name[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(cap_name[0])));
+            bool const is_control_state = inferred_types.count(state.name) != 0;
+            std::string type_key(state.type);
+            if (auto const scope = type_key.rfind("::"); scope != std::string::npos)
+                type_key = type_key.substr(scope + 2);
+            for (auto& ch : type_key)
+                ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            bool const is_projected_type = g_type_prop_kinds.count(type_key) != 0;
+            return cap_name == state.name && !element_named_types.count(state.name)
+                && !is_control_state && !is_projected_type
+                ? "m_" + state.name : state.name;
+        };
+        if (expr.find('(') != std::string::npos)
+        {
+            std::string rewritten = expr;
+            bool in_string = false;
+            char string_quote = '\0';
+            for (std::size_t i = 0; i < rewritten.size(); ++i)
+            {
+                if ((rewritten[i] == '"' || rewritten[i] == '\'')
+                    && (i == 0 || rewritten[i - 1] != '\\'))
+                {
+                    if (!in_string) { in_string = true; string_quote = rewritten[i]; }
+                    else if (rewritten[i] == string_quote) in_string = false;
+                    continue;
+                }
+                if (in_string || rewritten[i] != '.') continue;
+                std::size_t end = i + 1;
+                while (end < rewritten.size()
+                    && (std::isalnum(static_cast<unsigned char>(rewritten[end])) || rewritten[end] == '_')) ++end;
+                if (end > i + 1 && (end == rewritten.size() || rewritten[end] != '('))
+                {
+                    rewritten.insert(end, "()");
+                    i = end + 1;
+                }
+            }
+            return rewritten;
+        }
         // Guard: SVG/XAML path data ("M 20 6 h -8 ... c .9 2 ... V 8 ... Z") is a
         // string value, not a binding. Its spaces + dots + command letters make it
         // look dot-containing and paren-less, which used to be rewritten into
@@ -29,7 +70,7 @@
             {
                 std::string sv_lo = sv.name;
                 for (auto& c : sv_lo) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                if (sv_lo == expr_nodot) return sv.name;
+                if (sv_lo == expr_nodot) return state_member_name(sv);
             }
         }
         // Member access: obj.prop → obj.Prop() — but skip dots inside numeric literals
@@ -46,18 +87,21 @@
             if (!is_numeric && !is_in_string) {
                 std::string obj = expr.substr(0, dot_pos);
 
+                bool exact_state_match = false;
                 for (auto const& sv : state_vars) {
-
-                    std::string lo_sv = sv.name;
-
-                    for (auto& c : lo_sv) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-
+                    if (sv.name != obj) continue;
+                    obj = state_member_name(sv);
+                    exact_state_match = true;
+                    break;
+                }
+                if (!exact_state_match) {
                     std::string lo_obj = obj;
-
                     for (auto& c : lo_obj) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-
-                    if (lo_sv == lo_obj) { obj = sv.name; break; }
-
+                    for (auto const& sv : state_vars) {
+                        std::string lo_sv = sv.name;
+                        for (auto& c : lo_sv) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                        if (lo_sv == lo_obj) { obj = state_member_name(sv); break; }
+                    }
                 }
                 std::string prop = expr.substr(dot_pos + 1);
                 if (!prop.empty()) prop[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(prop[0])));
@@ -95,11 +139,11 @@
         // Case-insensitive match for state vars (XAML bindings may differ in case)
         for (auto const& sv : state_vars)
         {
-            if (sv.name == expr) return sv.name;
+            if (sv.name == expr) return state_member_name(sv);
             std::string sv_lo = sv.name, expr_lo = expr;
             for (auto& c : sv_lo) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             for (auto& c : expr_lo) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            if (sv_lo == expr_lo) return sv.name;
+            if (sv_lo == expr_lo) return state_member_name(sv);
         }
         return expr;
     };
@@ -111,6 +155,35 @@
     // All control type resolution goes through the catalog — zero hardcoded control names.
     // parent_chain: closest enclosing panel var names (innermost last) so nodes
     // emitted inside if/foreach blocks still attach to their visual parent.
+    auto cast_child_for_property = [&](std::string const& child, std::string const& control, std::string const& property)
+    {
+        std::string control_key = control;
+        if (auto const scope = control_key.rfind("::"); scope != std::string::npos)
+            control_key = control_key.substr(scope + 2);
+        for (auto& ch : control_key)
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        std::string property_key = property;
+        for (auto& ch : property_key)
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        if (auto const properties = g_type_prop_kinds.find(control_key); properties != g_type_prop_kinds.end()) {
+            if (auto const property_type = properties->second.find(property_key); property_type != properties->second.end()) {
+                std::string type_name = property_type->second;
+                if (auto const scope = type_name.rfind("::"); scope != std::string::npos)
+                    type_name = type_name.substr(scope + 2);
+                std::string borrowed_abi = "[](void* ptr) { if (ptr) winrt::IUnknown::addref_raw(ptr); return ptr; }("
+                    + child + ".m_unknown.get())";
+                if (type_name == "IInspectable")
+                    return "winrt::IInspectable::from_abi(" + borrowed_abi + ")";
+                if (auto const type_ns = g_type_ns.find(type_name); type_ns != g_type_ns.end()) {
+                    std::string qualified = "winrt::";
+                    for (char ch : type_ns->second)
+                        qualified += ch == '.' ? "::" : std::string(1, ch);
+                    return qualified + "::" + type_name + "::from_abi(" + borrowed_abi + ")";
+                }
+            }
+        }
+        return "winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(" + child + ".m_unknown.get())";
+    };
     auto emit_node = [&](auto const& self, layout_node const& n, int depth, std::vector<std::string> const& parent_chain = {}) -> std::string
     {
         std::string indent(depth * 4 + 8, ' ');
@@ -241,6 +314,8 @@
             || n.control == "Raw" || n.control == "StaticResource" || n.control == "x:Uid")
             return {};  // skip — not a real WinUI control
 
+        out << indent << "winrt::boot_log(\"ui:node:" << escape_wstr(n.control) << "\");\n";
+
         // Construct the WinRT object. App-view types (pages, custom views)
         // are not platform controls: reference them through their view
         // module's get_<Name>() accessor - the same singleton the host
@@ -257,6 +332,40 @@
         }
         else
             out << indent << "auto " << var_name << " = " << winui_type << "();\n";
+        auto alignment_value = [](layout_node const& node) {
+            auto normalize = [](std::string value) {
+                while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) value.erase(value.begin());
+                while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) value.pop_back();
+                if (value.size() >= 3 && value.front() == 'L' && value[1] == '"' && value.back() == '"')
+                    value = value.substr(2, value.size() - 3);
+                else if (value.size() >= 2 && value.front() == '"' && value.back() == '"')
+                    value = value.substr(1, value.size() - 2);
+                for (auto& c : value) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                return value;
+            };
+            for (auto const& [name, value] : node.props) {
+                std::string lowered = name;
+                for (auto& c : lowered) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (lowered == "horizontalalignment") return normalize(value);
+            }
+            for (auto const& [name, value] : node.raw_attrs) {
+                std::string lowered = name;
+                for (auto& c : lowered) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (lowered == "horizontalalignment") return normalize(value);
+            }
+            return std::string{};
+        };
+        bool has_explicit_alignment = !alignment_value(n).empty();
+        bool all_children_centered = !n.children.empty();
+        for (auto const& child : n.children)
+            if (alignment_value(child) != "center") { all_children_centered = false; break; }
+        if (!has_explicit_alignment && all_children_centered)
+        {
+            out << indent << "[&]<typename __Element>(__Element& __element) {\n";
+            out << indent << "    if constexpr (requires { __element.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Center); })\n";
+            out << indent << "        __element.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Center);\n";
+            out << indent << "}(" << var_name << ");\n";
+        }
         if (n.control == "Row")
         {
             out << indent << var_name << ".Orientation(winrt::Microsoft::UI::Xaml::Controls::Orientation::Horizontal);\n";
@@ -286,6 +395,25 @@
         else if (n.control == "Input")
         {
             out << indent << var_name << ".MinWidth(260);\n";
+        }
+        else if (n.control == "Image")
+        {
+            bool has_halign = false;
+            for (auto const& [pk, pv] : n.props) {
+                std::string lo_pk = pk;
+                for (auto& c : lo_pk) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (lo_pk == "horizontalalignment") { has_halign = true; break; }
+            }
+            if (!has_halign) {
+                for (auto const& [rk, rv] : n.raw_attrs) {
+                    std::string lo_rk = rk;
+                    for (auto& c : lo_rk) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    if (lo_rk == "horizontalalignment") { has_halign = true; break; }
+                }
+            }
+            if (!has_halign && !parent_chain.empty() && parent_chain.back().starts_with("StackPanel")) {
+                out << indent << var_name << ".HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Center);\n";
+            }
         }
         if (n.control == "PathIcon")
         {
@@ -394,7 +522,10 @@
                     }
                     else if (named_elements.count(resolved_rv))
                     {
-                        out << indent << "_deferred_relative_panel.push_back([this, " << var_name << "]() { if (" << var_name << ".m_unknown.get() && " << resolved_rv << ".m_unknown.get()) winrt::Microsoft::UI::Xaml::Controls::RelativePanel::Set" << prop << "(winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(" << var_name << ".m_unknown.get()), winrt::IInspectable(" << resolved_rv << ".addref_borrowed())); });\n";
+                        std::string capture = is_child_view ? "__sp_" + var_name : var_name;
+                        out << indent << "_deferred_relative_panel.push_back([this, " << capture << "]() { ";
+                        if (is_child_view) out << "auto& " << var_name << " = *" << capture << "; ";
+                        out << "if (" << var_name << ".m_unknown.get() && " << resolved_rv << ".m_unknown.get()) winrt::Microsoft::UI::Xaml::Controls::RelativePanel::Set" << prop << "(winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(" << var_name << ".m_unknown.get()), winrt::IInspectable(" << resolved_rv << ".addref_borrowed())); });\n";
                     }
                 }
             }
@@ -503,8 +634,8 @@
         // remap property names based on control type
         std::string prop = ctrl_prop(n.control, pk);
         if (prop.empty()) continue; // skip unsupported props (e.g. NumberBox::Inline)
-        // Skip ALL properties on component types (except registered app views)
-        if (is_app_or_unknown_type(n.control) && !g_view_type_names.count(n.control) && n.control != "SettingsCard" && n.control != "SettingsExpander") continue;
+        // Skip ALL properties on component types (except registered app views and synthesized CommunityToolkit controls)
+        if (is_app_or_unknown_type(n.control) && !g_view_type_names.count(n.control) && n.control != "SettingsCard" && n.control != "SettingsExpander" && n.control != "SwitchPresenter" && n.control != "Segmented" && n.control != "SegmentedItem" && n.control != "WrapPanel") continue;
         // Skip collection/dictionary properties that need special handling (Append, not setter)
         {
             std::string pk_lo_check = pk;
@@ -513,6 +644,7 @@
                 || pk_lo_check == "inlines" || pk_lo_check == "ticks"
                 || pk_lo_check == "resources" || pk_lo_check == "visualstategroups"
                 || pk_lo_check == "children" || (pk_lo_check == "content" && !n.children.empty())
+                || (pk_lo_check == "value" && n.control == "SwitchPresenter")
                 || pk_lo_check == "items" || pk_lo_check == "menuitems"
                 || pk_lo_check == "tabitems" || pk_lo_check == "primarycommands"
                 || pk_lo_check == "secondarycommands" || pk_lo_check == "flyout"
@@ -550,17 +682,9 @@
                     { std::string c; c.reserve(text_val.size());
                       for (char ch : text_val) { if (ch=='\n'||ch=='\r') c+=' '; else c+=ch; } text_val = c; }
 
-                    // Check if text_val matches a state variable
-                    std::string sv_match;
-                    for (auto const& sv : view.state_vars) {
-                        if (sv.name == text_val || sv.name == pv) { sv_match = sv.name; break; }
-                    }
-
                     out << indent << "{\n";
                     out << indent << "    auto _run = winrt::Microsoft::UI::Xaml::Documents::Run();\n";
-                    if (!sv_match.empty()) {
-                        out << indent << "    _run.Text(this->" << sv_match << ");\n";
-                    } else if (text_val == "AppTitleName" || text_val.find("{StaticResource ") != std::string::npos || text_val.find("{ThemeResource ") != std::string::npos) {
+                    if (text_val == "AppTitleName" || text_val.find("{StaticResource ") != std::string::npos || text_val.find("{ThemeResource ") != std::string::npos) {
                         std::string rk = text_val;
                         if (rk.find("{StaticResource ") != std::string::npos) {
                             auto sr = rk.find("{StaticResource ");
@@ -583,6 +707,23 @@
                 }
             }
             std::string val = pv;
+            bool const tagged_literal = n.literal_props.count(pk) != 0;
+            std::string const* state_ref = nullptr;
+            if (auto state = n.state_refs.find(pk); state != n.state_refs.end())
+                state_ref = &state->second;
+            else if (auto binding = n.binding_refs.find(pk); binding != n.binding_refs.end())
+                state_ref = &binding->second;
+            if (state_ref)
+            {
+                std::string const value = resolve_binding_to_cpp(*state_ref, view.state_vars);
+                std::string const set_val = box_if_inspectable(
+                    n.control, pk,
+                    resolve_typed_value(n.control, pk, value, &g_type_prop_kinds, &g_enum_info));
+                out << indent << var_name << "." << prop << "(" << set_val << ");\n";
+                out << indent << "m_bindings.push_back([this, " << cap_var << "]() mutable { "
+                    << var_name << "." << prop << "(" << set_val << "); });\n";
+                continue;
+            }
             // Collapse embedded newlines in raw values before any processing
             {
                 std::string clean;
@@ -591,20 +732,51 @@
                 val = clean;
             }
             // Markup we can't evaluate (x:Bind, {Binding}, DataTemplate serializations)
-            if (is_unbindable_value(val)) continue;
+            if (!tagged_literal && is_unbindable_value(val)) continue;
             // Resolve binding expressions (var.prop → var.Prop())
-            if (!val.empty() && val.front() != '"' && !std::isdigit(static_cast<unsigned char>(val[0]))
+            bool const is_state_reference = std::any_of(view.state_vars.begin(), view.state_vars.end(),
+                [&](layout_state_var const& state) {
+                    if (state.name.size() != val.size()) return false;
+                    for (std::size_t i = 0; i < state.name.size(); ++i)
+                        if (std::tolower(static_cast<unsigned char>(state.name[i]))
+                            != std::tolower(static_cast<unsigned char>(val[i]))) return false;
+                    return true;
+                });
+            if (!tagged_literal && is_state_reference)
+            {
+                std::string value = resolve_binding_to_cpp(val, view.state_vars);
+                std::string property_key = pk;
+                for (auto& ch : property_key)
+                    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                if (property_key == "visibility" || property_key == "visible")
+                    value = "make_visibility(" + value + ")";
+                else if (property_key.find("alignment") != std::string::npos)
+                    value = (property_key.find("horizontal") != std::string::npos || property_key == "alignment"
+                        ? "halignment_from_name(" : "valignment_from_name(") + value + ")";
+                else if (is_brush_property(pk))
+                    value = "theme_brush_th(" + value + ")";
+                else
+                    value = box_if_inspectable(n.control, pk,
+                        resolve_typed_value(n.control, pk, value, &g_type_prop_kinds, &g_enum_info));
+                out << indent << var_name << "." << prop << "(" << value << ");\n";
+                out << indent << "m_bindings.push_back([this, " << cap_var << "]() mutable { "
+                    << var_name << "." << prop << "(" << value << "); });\n";
+                continue;
+            }
+            if (!tagged_literal && !val.empty() && val.front() != '"' && !std::isdigit(static_cast<unsigned char>(val[0]))
                 && val != "true" && val != "false" && val != "nullptr" && val != "True" && val != "False"
-                && val.find('.') != std::string::npos && val.find('(') == std::string::npos)
+                && val.find('.') != std::string::npos)
             {
                 val = resolve_binding_to_cpp(val, view.state_vars);
+                val = box_if_inspectable(n.control, pk,
+                    resolve_typed_value(n.control, pk, val, &g_type_prop_kinds, &g_enum_info));
             }
-            bool plain_quoted = (val.size() >= 2 && val.front() == '"' && val.back() == '"');
+            bool plain_quoted = val.size() >= 2 && val.front() == '"' && val.back() == '"';
             bool escaped_quoted = (val.size() >= 4 && val[0] == '\\' && val[1] == '"'
                                    && val[val.size() - 2] == '\\' && val.back() == '"');
             if (plain_quoted || escaped_quoted)
             {
-                std::string inner = normalize_payload_value(val);
+                std::string inner = tagged_literal ? val : normalize_payload_value(val);
                 std::string collapsed;
                 for (char c : inner) { if (c == '\n' || c == '\r') collapsed += ' '; else collapsed += c; }
                 // Strip trailing () artifact from parsed attribute values (e.g. URLs)
@@ -1107,12 +1279,12 @@
                 else
                 {
                     // Check for binding expressions BEFORE wrapping in L"..."
-                    bool is_binding = (val.find("self->") != std::string::npos)
+                    bool is_binding = !tagged_literal && ((val.find("self->") != std::string::npos)
                         || (val.find("x:Bind") != std::string::npos)
-                        || (!val.empty() && val[0] == '$');
+                        || (!val.empty() && val[0] == '$'));
 
                     // Check for bare state variable references
-                    if (!is_binding) {
+                    if (!is_binding && !tagged_literal) {
                         for (auto const& sv : view.state_vars) {
                             if (val.size() >= sv.name.size()
                                 && val.substr(0, sv.name.size()) == sv.name
@@ -1206,8 +1378,7 @@
                             for (auto& c : pk_lo_bind) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
                             bool is_brush_prop_b = is_brush_property(pk);
                             // Detect the leading variable of a chain like name.Value()
-                            bool skip_binding = (pk_lo_bind == "target" || pk_lo_bind == "child"
-                                || is_brush_prop_b);
+                            bool skip_binding = (pk_lo_bind == "target" || pk_lo_bind == "child");
                             bool is_source_ctrl = (pk_lo_bind == "source" || pk_lo_bind == "urisource");
                             if (is_source_ctrl) skip_binding = true; // hstring state vars can't feed ImageSource/Uri
                             // Chains ending in .X() on non-numeric state vars can't be evaluated
@@ -1337,6 +1508,8 @@
                                     bval = "halignment_from_name(" + val + ")";
                                 else if (pk_lo_bind2.find("alignment") != std::string::npos)
                                     bval = "valignment_from_name(" + val + ")";
+                                else
+                                    bval = resolve_typed_value(n.control, pk, bval, &g_type_prop_kinds, &g_enum_info);
                                 if (is_numeric_prop(n.control, pk) && bval.find(".Value()") == std::string::npos)
                                 {
                                     // Numeric DP fed a string state var: no C++ conversion exists.
@@ -1431,36 +1604,45 @@
                             }
                             else if (!resolved.empty())
                             {
+                                resolved = resolve_typed_value(n.control, pk,
+                                    box_if_inspectable(n.control, pk, resolved),
+                                    &g_type_prop_kinds, &g_enum_info);
                                 if (n.control == "TextBlock" && pk_lo_st == "style")
                                 {
+                                    bool has_explicit_fs = false;
+                                    for (auto const& [k, v] : n.props) {
+                                        std::string lk = k;
+                                        for (auto& c : lk) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                                        if (lk == "fontsize") { has_explicit_fs = true; break; }
+                                    }
                                     if (resolved.find("DisplayTextBlockStyle") != std::string::npos)
                                     {
-                                        out << indent << var_name << ".FontSize(68);\n";
+                                        if (!has_explicit_fs) out << indent << var_name << ".FontSize(68);\n";
                                         out << indent << var_name << ".FontWeight(winrt::Windows::UI::Text::FontWeight{600});\n";
                                     }
                                     else if (resolved.find("TitleLargeTextBlockStyle") != std::string::npos)
                                     {
-                                        out << indent << var_name << ".FontSize(40);\n";
+                                        if (!has_explicit_fs) out << indent << var_name << ".FontSize(40);\n";
                                         out << indent << var_name << ".FontWeight(winrt::Windows::UI::Text::FontWeight{600});\n";
                                     }
                                     else if (resolved.find("TitleTextBlockStyle") != std::string::npos)
                                     {
-                                        out << indent << var_name << ".FontSize(28);\n";
+                                        if (!has_explicit_fs) out << indent << var_name << ".FontSize(28);\n";
                                         out << indent << var_name << ".FontWeight(winrt::Windows::UI::Text::FontWeight{600});\n";
                                     }
                                     else if (resolved.find("SubtitleTextBlockStyle") != std::string::npos)
                                     {
-                                        out << indent << var_name << ".FontSize(20);\n";
+                                        if (!has_explicit_fs) out << indent << var_name << ".FontSize(20);\n";
                                         out << indent << var_name << ".FontWeight(winrt::Windows::UI::Text::FontWeight{600});\n";
                                     }
                                     else if (resolved.find("BodyStrongTextBlockStyle") != std::string::npos)
                                     {
-                                        out << indent << var_name << ".FontSize(14);\n";
+                                        if (!has_explicit_fs) out << indent << var_name << ".FontSize(14);\n";
                                         out << indent << var_name << ".FontWeight(winrt::Windows::UI::Text::FontWeight{600});\n";
                                     }
                                     else if (resolved.find("CaptionTextBlockStyle") != std::string::npos)
                                     {
-                                        out << indent << var_name << ".FontSize(12);\n";
+                                        if (!has_explicit_fs) out << indent << var_name << ".FontSize(12);\n";
                                     }
                                 }
                                 out << indent << var_name << "." << prop << "(" << resolved << ");\n";
@@ -1609,7 +1791,29 @@
                 std::string evt_prop = ctrl_prop(n.control.c_str(), ev_prop_name);
                 std::string handler_call = cb_name;
                 if (handler_call.starts_with("self.")) handler_call = handler_call.substr(5);
-                if (g_view_type_names.count(n.control) && n.control != class_name)
+                auto normalize_type_key = [](std::string type_name) {
+                    auto separator = type_name.find_last_of(".:");
+                    if (separator != std::string::npos) type_name = type_name.substr(separator + 1);
+                    for (auto& ch : type_name)
+                        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                    return type_name;
+                };
+                std::string base_type_key = normalize_type_key(view.base_type);
+                std::string control_type_key = normalize_type_key(n.control);
+                std::string event_key = ev_prop_name;
+                for (auto& ch : event_key)
+                    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                auto base_events = g_type_events.find(base_type_key);
+                auto control_events = g_type_events.find(control_type_key);
+                bool event_belongs_to_view = depth == 0
+                    && base_events != g_type_events.end()
+                    && base_events->second.count(event_key) != 0
+                    && (control_events == g_type_events.end()
+                        || control_events->second.count(event_key) == 0);
+                if (event_belongs_to_view)
+                    out << indent << ev_prop_name << "([this](auto const& s, auto const& e) { "
+                        << (handler_call.empty() ? "" : (handler_call + "(s, e); ")) << "});\n";
+                else if (g_view_type_names.count(n.control) && n.control != class_name)
                 {
                     out << indent << var_name << ".add_" << ev_prop_name
                         << "([this](auto const& s, auto const& e) { " << (handler_call.empty() ? "" : (handler_call + "(s, e); ")) << "});\n";
@@ -1810,8 +2014,8 @@
                 for (auto& c : dl) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
                 if (dl.rfind("<datatemplate", 0) == 0) continue;
             }
-            // Skip ALL raw attrs on component types (except registered app views)
-            if (is_app_or_unknown_type(n.control) && !g_view_type_names.count(n.control) && n.control != "SettingsCard" && n.control != "SettingsExpander") continue;
+            // Skip ALL raw attrs on component types (except registered app views and synthesized CommunityToolkit controls)
+            if (is_app_or_unknown_type(n.control) && !g_view_type_names.count(n.control) && n.control != "SettingsCard" && n.control != "SettingsExpander" && n.control != "SwitchPresenter" && n.control != "Segmented" && n.control != "SegmentedItem" && n.control != "WrapPanel") continue;
             // TeachingTip.Target takes a FrameworkElement (x:Name ref) — drop plain-string attrs
             {
                 std::string lo_ctrl_tt = n.control;
@@ -1967,9 +2171,11 @@
                         else
                             rval = wstr_literal(collapsed);
                     }
-                    bool is_xml_fragment = (!collapsed.empty() && collapsed.front() == '<') ||
+                    auto first_non_ws = collapsed.find_first_not_of(" \t\r\n");
+                    bool is_xml_fragment = (first_non_ws != std::string::npos && collapsed[first_non_ws] == '<') ||
                         (!rval.empty() && rval.front() == '<') ||
-                        (rval.size() > 2 && rval[0] == 'L' && rval[1] == '"' && rval[2] == '<');
+                        (rval.size() > 2 && rval[0] == 'L' && rval[1] == '"' && rval[2] == '<') ||
+                        rk == "Resources" || rk == "resources" || rk == "VisualStateGroups" || rk == "visualstategroups";
                     // {ThemeResource Key} -> guarded resource lookup with a
                     // codegen-baked literal fallback. Handles both the raw
                     // markup form (special keys kept rval = collapsed) and the
@@ -2035,6 +2241,8 @@
                                 rval = "theme_brush_th(L\"" + res_key + "\")";
                             else if (kind == "thickness")
                                 rval = fallback;
+                            else if (rk_lo_tr == "style" || rk_lo_tr.ends_with("style"))
+                                rval = "style_lookup_th(L\"" + res_key + "\")";
                             else if (rk_lo_tr == "template")
                                 rval = "control_template_th(L\"" + res_key + "\")";
                             else if (rk_lo_tr == "itemtemplate" || rk_lo_tr == "contenttemplate"
@@ -2060,7 +2268,7 @@
                             std::string res_key = tr.substr(ks, ke - ks);
                             std::string rk_lo_sr = rk;
                             for (auto& c : rk_lo_sr) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                            if (rk_lo_sr == "style")
+                            if (rk_lo_sr == "style" || rk_lo_sr.ends_with("style"))
                                 rval = "style_lookup_th(L\"" + res_key + "\")";
                             else if (rk_lo_sr == "template")
                                 rval = "control_template_th(L\"" + res_key + "\")";
@@ -2343,6 +2551,9 @@
                         if ((rk_lo_bind2 == "margin" || rk_lo_bind2 == "borderthickness" || rk_lo_bind2 == "padding")
                             && !cpp_val.empty())
                             cpp_val = "winrt::Microsoft::UI::Xaml::Thickness{" + cpp_val + ", " + cpp_val + ", " + cpp_val + ", " + cpp_val + "}";
+                        cpp_val = box_if_inspectable(n.control, rk,
+                            resolve_typed_value(n.control, rk, std::move(cpp_val),
+                                &g_type_prop_kinds, &g_enum_info));
                         out << indent << var_name << "." << rk << "(" << cpp_val << ");\n";
                         out << indent << "m_bindings.push_back([this, " << cap_var << "]() mutable { " << var_name << "." << rk << "(" << cpp_val << "); });\n";
                     }
@@ -2509,7 +2720,10 @@
                     }
                     else if (named_elements.count(raw_val))
                     {
-                        out << indent << "_deferred_relative_panel.push_back([this, " << var_name << "]() { if (" << var_name << ".m_unknown.get() && " << raw_val << ".m_unknown.get()) winrt::Microsoft::UI::Xaml::Controls::RelativePanel::Set" << prop << "(winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(" << var_name << ".m_unknown.get()), winrt::IInspectable(" << raw_val << ".addref_borrowed())); });\n";
+                        std::string capture = is_child_view ? "__sp_" + var_name : var_name;
+                        out << indent << "_deferred_relative_panel.push_back([this, " << capture << "]() { ";
+                        if (is_child_view) out << "auto& " << var_name << " = *" << capture << "; ";
+                        out << "if (" << var_name << ".m_unknown.get() && " << raw_val << ".m_unknown.get()) winrt::Microsoft::UI::Xaml::Controls::RelativePanel::Set" << prop << "(winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(" << var_name << ".m_unknown.get()), winrt::IInspectable(" << raw_val << ".addref_borrowed())); });\n";
                     }
                 }
                 else if (rk == "Header")
@@ -2596,11 +2810,11 @@
                     // so route the constructed SymbolIcon through from_abi with a
                     // scoped temp (same pattern as the element-child icon paths).
                     if (is_bad_icon_val)
-                        out << indent << "{ auto __ic = SymbolIcon(); " << var_name << ".Icon(IconElement::wrap_borrowed(__ic.m_unknown.get())); }\n";
+                        out << indent << "{ auto __ic = SymbolIcon(); __ic.Foreground(theme_brush_th(L\"TextFillColorPrimaryBrush\")); " << var_name << ".Icon(IconElement::wrap_borrowed(__ic.m_unknown.get())); }\n";
                     else if (!icon_val.empty() && icon_val[0] != '{')
-                        out << indent << "{ auto __ic = SymbolIcon(symbol_from_name(L\"" << icon_val << "\")); " << var_name << ".Icon(IconElement::wrap_borrowed(__ic.m_unknown.get())); }\n";
+                        out << indent << "{ auto __ic = SymbolIcon(symbol_from_name(L\"" << icon_val << "\")); __ic.Foreground(theme_brush_th(L\"TextFillColorPrimaryBrush\")); " << var_name << ".Icon(IconElement::wrap_borrowed(__ic.m_unknown.get())); }\n";
                     else
-                        out << indent << "{ auto __ic = SymbolIcon(); " << var_name << ".Icon(IconElement::wrap_borrowed(__ic.m_unknown.get())); }\n";
+                        out << indent << "{ auto __ic = SymbolIcon(); __ic.Foreground(theme_brush_th(L\"TextFillColorPrimaryBrush\")); " << var_name << ".Icon(IconElement::wrap_borrowed(__ic.m_unknown.get())); }\n";
                 }
                 else
                 {
@@ -2649,7 +2863,7 @@
                                 img_val = "ms-appx:///" + img_val.substr(1);
                             else if (img_val.rfind("Assets/", 0) == 0)
                                 img_val = "ms-appx:///" + img_val;
-                            out << indent << var_name << ".Source(winrt::Microsoft::UI::Xaml::Media::BitmapImage(winrt::Windows::Foundation::Uri(L\"" << img_val << "\")));\n";
+                            out << indent << var_name << ".Source(image_source_lookup_th(L\"" << escape_wstr(img_val) << "\"));\n";
                         }
                     }
                     // ImageIconSource.Source/ImageSource(L"url") -> BitmapImage(Uri)
@@ -2884,12 +3098,7 @@
                                         out << indent << var_name << "." << raw_prop_name(rk) << "(" << resolve_typed_value(n.control, rk, emit_val, &g_type_prop_kinds, &g_enum_info) << ");\n";
                                     else
                                     {
-                                        // String state var on a numeric DP: no C++
-                                        // conversion exists - skip both the call and
-                                        // its deferred binding (hstring -> int32_t is
-                                        // a compile error otherwise).
-                                        out << indent << "// " << var_name << "." << raw_prop_name(rk) << " skipped: non-numeric value on numeric property\n";
-                                        skip_binding_push = true;
+                                        out << indent << var_name << "." << raw_prop_name(rk) << "(theme_double_th(L\"" << escape_wstr(num_txt) << "\"));\n";
                                     }
                                 }
                                 else if (lo_ctrl == "titlebar" && lo_rk == "title")
@@ -2909,40 +3118,56 @@ else if (lo_ctrl == "comboboxitem" && lo_rk == "content")
                                 }
                                 else if (lo_rk == "itemssource" && emit_val == "nullptr")
                                 {
-                                    // ItemsSource(nullptr) — use IInspectable nullptr
-                                    out << indent << var_name << "." << raw_prop_name(rk) << "(winrt::IInspectable{nullptr})";
+                                    out << indent << var_name << "." << raw_prop_name(rk) << "(nullptr)";
                                 }
                                 else if (lo_ctrl == "textblock" && lo_rk == "style")
                                 {
+                                    bool has_explicit_fs = false;
+                                    for (auto const& [k, v] : n.props) {
+                                        std::string lk = k;
+                                        for (auto& c : lk) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                                        if (lk == "fontsize") { has_explicit_fs = true; break; }
+                                    }
                                     // Apply standard WinUI 3 typography fallback directly
                                     if (emit_val.find("DisplayTextBlockStyle") != std::string::npos)
                                     {
-                                        out << indent << var_name << ".FontSize(68);\n";
+                                        if (!has_explicit_fs) out << indent << var_name << ".FontSize(68);\n";
                                         out << indent << var_name << ".FontWeight(winrt::Windows::UI::Text::FontWeight{600});\n";
                                     }
                                     else if (emit_val.find("TitleLargeTextBlockStyle") != std::string::npos)
                                     {
-                                        out << indent << var_name << ".FontSize(40);\n";
+                                        if (!has_explicit_fs) out << indent << var_name << ".FontSize(40);\n";
                                         out << indent << var_name << ".FontWeight(winrt::Windows::UI::Text::FontWeight{600});\n";
                                     }
                                     else if (emit_val.find("TitleTextBlockStyle") != std::string::npos)
                                     {
-                                        out << indent << var_name << ".FontSize(28);\n";
+                                        if (!has_explicit_fs) out << indent << var_name << ".FontSize(28);\n";
                                         out << indent << var_name << ".FontWeight(winrt::Windows::UI::Text::FontWeight{600});\n";
                                     }
                                     else if (emit_val.find("SubtitleTextBlockStyle") != std::string::npos)
                                     {
-                                        out << indent << var_name << ".FontSize(20);\n";
+                                        if (!has_explicit_fs) out << indent << var_name << ".FontSize(20);\n";
                                         out << indent << var_name << ".FontWeight(winrt::Windows::UI::Text::FontWeight{600});\n";
                                     }
                                     else if (emit_val.find("BodyStrongTextBlockStyle") != std::string::npos)
                                     {
-                                        out << indent << var_name << ".FontSize(14);\n";
+                                        if (!has_explicit_fs) out << indent << var_name << ".FontSize(14);\n";
                                         out << indent << var_name << ".FontWeight(winrt::Windows::UI::Text::FontWeight{600});\n";
                                     }
                                     else if (emit_val.find("CaptionTextBlockStyle") != std::string::npos)
                                     {
-                                        out << indent << var_name << ".FontSize(12);\n";
+                                        if (!has_explicit_fs) out << indent << var_name << ".FontSize(12);\n";
+                                    }
+                                    else if (emit_val.find("SettingsSectionHeaderTextBlockStyle") != std::string::npos)
+                                    {
+                                        out << indent << var_name << ".FontSize(14);\n";
+                                        out << indent << var_name << ".FontWeight(winrt::Windows::UI::Text::FontWeight{600});\n";
+                                        out << indent << var_name << ".Margin(winrt::Microsoft::UI::Xaml::Thickness{1, 30, 0, 6});\n";
+                                    }
+                                    else if (emit_val.find("ScrollButtonStyle") != std::string::npos)
+                                    {
+                                        out << indent << var_name << ".Padding(winrt::Microsoft::UI::Xaml::Thickness{0,0,0,0});\n";
+                                        out << indent << var_name << ".VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center);\n";
                                     }
                                     out << indent << var_name << ".Style(" << emit_val << ")";
                                 }
@@ -3019,17 +3244,26 @@ else if (lo_ctrl == "comboboxitem" && lo_rk == "content")
                 }
                 else
                 {
-                    std::string ch_slot;
-                    for (auto const& [rpk, rpv] : ch.raw_attrs)
+                    std::string ch_slot = ch.slot;
+                    auto find_slot = [&](auto const& attributes)
                     {
-                        if (rpk == "Slot")
+                        for (auto const& [name, value] : attributes)
                         {
-                            ch_slot = rpv;
-                            if (ch_slot.size() > 2 && ch_slot[0] == 'L' && ch_slot[1] == '"') ch_slot = ch_slot.substr(2, ch_slot.size() - 3);
-                            else if (ch_slot.size() >= 2 && ch_slot.front() == '"' && ch_slot.back() == '"') ch_slot = ch_slot.substr(1, ch_slot.size() - 2);
-                            break;
+                            std::string lowered = name;
+                            for (auto& c : lowered) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                            if (lowered == "slot")
+                            {
+                                ch_slot = value;
+                                return;
+                            }
                         }
-                    }
+                    };
+                    if (ch_slot.empty()) find_slot(ch.raw_attrs);
+                    if (ch_slot.empty()) find_slot(ch.props);
+                    if (ch_slot.size() > 2 && ch_slot[0] == 'L' && ch_slot[1] == '"')
+                        ch_slot = ch_slot.substr(2, ch_slot.size() - 3);
+                    else if (ch_slot.size() >= 2 && ch_slot.front() == '"' && ch_slot.back() == '"')
+                        ch_slot = ch_slot.substr(1, ch_slot.size() - 2);
                     child_vars.push_back(std::move(cv));
                     child_ctrls.push_back(ch.control);
                     child_slots.push_back(std::move(ch_slot));
@@ -3146,6 +3380,41 @@ else if (lo_ctrl == "comboboxitem" && lo_rk == "content")
                     coll_prop = "Items";
                 for (auto const& cv : child_vars)
                     out << indent << "inspectable_append(" << var_name << "." << coll_prop << "(), " << cv << ");\n";
+                if (lo_ctrl == "selectorbar")
+                {
+                    for (auto const& cv : child_vars)
+                    {
+                        out << indent << cv << ".add_Tapped([" << var_name;
+                        for (auto const& other : child_vars) out << ", " << other;
+                        out << "](auto const&, auto const&) {\n";
+                        for (auto const& other : child_vars)
+                        {
+                            if (other == cv)
+                            {
+                                out << indent << "    " << other << ".IsSelected(true);\n";
+                                out << indent << "    if (" << other << ".Icon().get_abi()) " << other << ".Icon().Foreground(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush(winrt::Windows::UI::Color{255, 0, 0, 0}));\n";
+                            }
+                            else
+                            {
+                                out << indent << "    " << other << ".IsSelected(false);\n";
+                                out << indent << "    if (" << other << ".Icon().get_abi()) " << other << ".Icon().Foreground(theme_brush_th(L\"TextFillColorPrimaryBrush\"));\n";
+                            }
+                        }
+                        out << indent << "    if (" << var_name << ".SelectedItem() != " << cv << ") " << var_name << ".SelectedItem(" << cv << ");\n";
+                        out << indent << "});\n";
+                    }
+                    if (!child_vars.empty())
+                    {
+                        out << indent << child_vars[0] << ".IsSelected(true);\n";
+                        out << indent << "if (" << child_vars[0] << ".Icon().get_abi()) " << child_vars[0] << ".Icon().Foreground(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush(winrt::Windows::UI::Color{255, 0, 0, 0}));\n";
+                        for (size_t i = 1; i < child_vars.size(); ++i)
+                        {
+                            out << indent << child_vars[i] << ".IsSelected(false);\n";
+                            out << indent << "if (" << child_vars[i] << ".Icon().get_abi()) " << child_vars[i] << ".Icon().Foreground(theme_brush_th(L\"TextFillColorPrimaryBrush\"));\n";
+                        }
+                        out << indent << var_name << ".SelectedItem(" << child_vars[0] << ");\n";
+                    }
+                }
             }
             else if (ck == "items_panel")
             {
@@ -3176,7 +3445,7 @@ else if (lo_ctrl == "comboboxitem" && lo_rk == "content")
                 for (size_t i = 0; i < n.children.size() && i < child_vars.size(); ++i)
                 {
                     if (is_icon_element(n.children[i].control))
-                        out << indent << var_name << ".Icon(IconElement::wrap_borrowed(" << child_vars[i] << ".m_unknown.get()));\n";
+                        out << indent << var_name << ".Icon(" << child_vars[i] << ");\n";
                     else
                         out << indent << "inspectable_append(" << var_name << ".MenuItems(), " << child_vars[i] << ");\n";
                 }
@@ -3215,7 +3484,39 @@ else if (lo_ctrl == "comboboxitem" && lo_rk == "content")
             else if (ck == "content")
             {
                 std::string scp = catalog.single_child_prop(n.control);
-                if (scp.empty())
+                bool has_named_slot = std::any_of(child_slots.begin(), child_slots.end(),
+                    [](std::string const& slot) { return !slot.empty(); });
+                if (has_named_slot)
+                {
+                    std::vector<std::string> content_vars;
+                    for (size_t i = 0; i < child_vars.size(); ++i)
+                    {
+                        std::string slot = (i < child_slots.size()) ? child_slots[i] : "";
+                        if (!slot.empty())
+                        {
+                            out << indent << var_name << "." << slot << "("
+                                << cast_child_for_property(child_vars[i], n.control, slot) << ");\n";
+                        }
+                        else
+                        {
+                            content_vars.push_back(child_vars[i]);
+                        }
+                    }
+                    if (!scp.empty() && content_vars.size() == 1)
+                        out << indent << var_name << "." << scp << "("
+                            << catalog.cast_child(content_vars[0], n.control) << ");\n";
+                    else if (!scp.empty() && content_vars.size() > 1)
+                    {
+                        out << indent << "{\n";
+                        out << indent << "    auto _wrap_sp = winrt::Microsoft::UI::Xaml::Controls::StackPanel();\n";
+                        for (auto const& cv : content_vars)
+                            out << indent << "    _wrap_sp.Children().Append(" << cv << ");\n";
+                        out << indent << "    " << var_name << "." << scp
+                            << "(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(_wrap_sp.m_unknown.get()));\n";
+                        out << indent << "}\n";
+                    }
+                }
+                else if (scp.empty())
                 {
                     // Control has no child/content property — skip children
                 }
@@ -3224,7 +3525,7 @@ else if (lo_ctrl == "comboboxitem" && lo_rk == "content")
                     for (size_t i = 0; i < n.children.size() && i < child_vars.size(); ++i)
                     {
                         if (is_icon_element(n.children[i].control))
-                            out << indent << var_name << ".Icon(IconElement::wrap_borrowed(" << child_vars[i] << ".m_unknown.get()));\n";
+                            out << indent << var_name << ".Icon(" << child_vars[i] << ");\n";
                     }
                     std::vector<std::string> non_icon;
                     for (size_t i = 0; i < n.children.size() && i < child_vars.size(); ++i)
@@ -3262,50 +3563,68 @@ else if (lo_ctrl == "comboboxitem" && lo_rk == "content")
                     }
                     else if (n.control == "SwitchPresenter")
                     {
-                        if (!child_vars.empty())
+                        out << indent << "auto _sp_host = winrt::Microsoft::UI::Xaml::Controls::Grid();\n";
+                        for (size_t i = 0; i < child_vars.size(); ++i)
                         {
-                            out << indent << var_name << ".Content(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(" << child_vars[0] << ".m_unknown.get()));\n";
-                            if (named_elements.count("FilterBar") && child_vars.size() >= 2)
-                            {
-                                out << indent << "FilterBar.SelectionChanged([this, " << var_name << ", p0 = " << child_vars[0] << ", p1 = " << child_vars[1] << "](auto const&, auto const&)\n";
-                                out << indent << "{\n";
-                                out << indent << "    auto sel = FilterBar.SelectedItem();\n";
-                                out << indent << "    if (sel.get_abi())\n";
-                                out << indent << "    {\n";
-                                out << indent << "        auto tag = winrt::unbox_value_or<winrt::hstring>(sel.Tag(), winrt::hstring{});\n";
-                                out << indent << "        if (tag == L\"Favorites\") {\n";
-                                out << indent << "            " << var_name << ".Content(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(p1.m_unknown.get()));\n";
-                                out << indent << "            if (FavoriteSamples.m_unknown.get()) FavoriteSamples.Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);\n";
-                                out << indent << "            if (FavoriteSamplesFallbackMessage.m_unknown.get()) FavoriteSamplesFallbackMessage.Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible);\n";
-                                out << indent << "        } else {\n";
-                                out << indent << "            " << var_name << ".Content(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(p0.m_unknown.get()));\n";
-                                out << indent << "        }\n";
-                                out << indent << "        try {\n";
-                                out << indent << "            auto items = FilterBar.get_Items();\n";
-                                out << indent << "            if (items && items.get_Size() >= 2) {\n";
-                                out << indent << "                auto it0 = items.GetAt(0);\n";
-                                out << indent << "                auto it1 = items.GetAt(1);\n";
-                                out << indent << "                auto accent_b = winrt::Microsoft::UI::Xaml::Media::SolidColorBrush(winrt::Windows::UI::Color{255, 118, 185, 237});\n";
-                                out << indent << "                auto dark_b = winrt::Microsoft::UI::Xaml::Media::SolidColorBrush(winrt::Windows::UI::Color{255, 0, 0, 0});\n";
-                                out << indent << "                auto gray_b = winrt::Microsoft::UI::Xaml::Media::SolidColorBrush(winrt::Windows::UI::Color{255, 53, 53, 53});\n";
-                                out << indent << "                auto white_b = winrt::Microsoft::UI::Xaml::Media::SolidColorBrush(winrt::Windows::UI::Color{255, 255, 255, 255});\n";
-                                out << indent << "                auto border_gray = winrt::Microsoft::UI::Xaml::Media::SolidColorBrush(winrt::Windows::UI::Color{255, 64, 64, 64});\n";
-                                out << indent << "                bool fav = (tag == L\"Favorites\");\n";
-                                out << indent << "                it0.Background(fav ? gray_b : accent_b);\n";
-                                out << indent << "                it0.Foreground(fav ? white_b : dark_b);\n";
-                                out << indent << "                it0.BorderBrush(fav ? border_gray : accent_b);\n";
-                                out << indent << "                auto ic0 = it0.get_Icon();\n";
-                                out << indent << "                if (ic0.m_unknown.get()) ic0.Foreground(fav ? white_b : dark_b);\n";
-                                out << indent << "                it1.Background(fav ? accent_b : gray_b);\n";
-                                out << indent << "                it1.Foreground(fav ? dark_b : white_b);\n";
-                                out << indent << "                it1.BorderBrush(fav ? accent_b : border_gray);\n";
-                                out << indent << "                auto ic1 = it1.get_Icon();\n";
-                                out << indent << "                if (ic1.m_unknown.get()) ic1.Foreground(fav ? dark_b : white_b);\n";
-                                out << indent << "            }\n";
-                                out << indent << "        } catch (...) {}\n";
-                                out << indent << "    }\n";
-                                out << indent << "});\n";
+                            if (i > 0)
+                                out << indent << child_vars[i] << ".Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);\n";
+                            out << indent << "_sp_host.Children().Append(" << child_vars[i] << ");\n";
+                        }
+                        out << indent << var_name << ".Content(_sp_host);\n";
+                        out << indent << "if (FavoriteSamplesFallbackMessage.m_unknown.get() && FavoriteSamples.m_unknown.get()) {\n";
+                        out << indent << "    bool __has_favs = (m_FavoriteSamplesList.get_Size() > 0);\n";
+                        out << indent << "    FavoriteSamplesFallbackMessage.Visibility(__has_favs ? winrt::Microsoft::UI::Xaml::Visibility::Collapsed : winrt::Microsoft::UI::Xaml::Visibility::Visible);\n";
+                        out << indent << "    FavoriteSamples.Visibility(__has_favs ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed);\n";
+                        out << indent << "}\n";
+                        std::string val_expr;
+                        for (auto const& [k, v] : n.props) {
+                            if (k == "value" || k == "Value") { val_expr = v; break; }
+                        }
+                        if (val_expr.empty()) {
+                            for (auto const& [k, v] : n.raw_attrs) {
+                                if (k == "value" || k == "Value") { val_expr = v; break; }
                             }
+                        }
+                        std::vector<std::pair<std::string, std::string>> switch_cases;
+                        for (size_t i = 0; i < n.children.size() && i < child_vars.size(); ++i) {
+                            std::string c_val;
+                            for (auto const& [k, v] : n.children[i].props) {
+                                if (k == "Value" || k == "value") { c_val = v; break; }
+                            }
+                            if (c_val.empty()) {
+                                for (auto const& [k, v] : n.children[i].raw_attrs) {
+                                    if (k == "Value" || k == "value") { c_val = v; break; }
+                                }
+                            }
+                            if (!c_val.empty()) switch_cases.emplace_back(c_val, child_vars[i]);
+                        }
+                        if (!val_expr.empty() && switch_cases.size() > 1) {
+                            auto dot_pos = val_expr.find('.');
+                            std::string ctl_name = (dot_pos != std::string::npos) ? val_expr.substr(0, dot_pos) : val_expr;
+                            out << indent << "if (" << ctl_name << ".m_unknown.get()) {\n";
+                            out << indent << "    " << ctl_name << ".add_SelectionChanged([this";
+                            for (auto const& [cval, cvar] : switch_cases) {
+                                out << ", _c_" << cval << " = " << cvar;
+                            }
+                            out << "](auto const& __sender, auto const& __args) mutable {\n";
+                            out << indent << "        try {\n";
+                            out << indent << "            auto __sel = __sender.SelectedItem();\n";
+                            out << indent << "            if (!__sel.m_unknown.get()) return;\n";
+                            out << indent << "            auto __tag = winrt::unbox_value_or<winrt::hstring>(__sel.Tag(), L\"\");\n";
+                            out << indent << "            if (__tag == L\"Favorites\") {\n";
+                            out << indent << "                if (FavoriteSamplesFallbackMessage.m_unknown.get() && FavoriteSamples.m_unknown.get()) {\n";
+                            out << indent << "                    bool __has_favs = (m_FavoriteSamplesList.get_Size() > 0);\n";
+                            out << indent << "                    FavoriteSamplesFallbackMessage.Visibility(__has_favs ? winrt::Microsoft::UI::Xaml::Visibility::Collapsed : winrt::Microsoft::UI::Xaml::Visibility::Visible);\n";
+                            out << indent << "                    FavoriteSamples.Visibility(__has_favs ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed);\n";
+                            out << indent << "                }\n";
+                            out << indent << "            }\n";
+                            for (size_t i = 0; i < switch_cases.size(); ++i) {
+                                auto const& [cval, cvar] = switch_cases[i];
+                                out << indent << "            _c_" << cval << ".Visibility((__tag == L\"" << cval << "\") ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed);\n";
+                            }
+                            out << indent << "        } catch (...) {}\n";
+                            out << indent << "    });\n";
+                            out << indent << "}\n";
                         }
                     }
                     else if (child_vars.size() == 1)
@@ -3439,11 +3758,16 @@ else if (lo_ctrl == "comboboxitem" && lo_rk == "content")
                     {
                         std::vector<std::string> items_vars;
                         std::vector<std::string> content_vars;
-                        for (size_t i = 0; i < n.children.size() && i < child_vars.size(); ++i)
+                        for (size_t i = 0; i < child_vars.size(); ++i)
                         {
                             std::string sl = (i < child_slots.size()) ? child_slots[i] : "";
-                            if (sl == "Items") items_vars.push_back(child_vars[i]);
-                            else content_vars.push_back(child_vars[i]);
+                            if (sl == "Items")
+                                items_vars.push_back(child_vars[i]);
+                            else if (!sl.empty())
+                                out << indent << var_name << "." << sl << "("
+                                    << cast_child_for_property(child_vars[i], n.control, sl) << ");\n";
+                            else
+                                content_vars.push_back(child_vars[i]);
                         }
                         if (!items_vars.empty())
                         {
@@ -3494,7 +3818,7 @@ else if (lo_ctrl == "comboboxitem" && lo_rk == "content")
                     for (size_t i = 0; i < n.children.size() && i < child_vars.size(); ++i)
                     {
                         if (is_icon_element(n.children[i].control))
-                            out << indent << var_name << ".Icon(IconElement::wrap_borrowed(" << child_vars[i] << ".m_unknown.get()));\n";
+                            out << indent << var_name << ".Icon(" << child_vars[i] << ");\n";
                     }
                     std::vector<std::string> non_icon;
                     for (size_t i = 0; i < n.children.size() && i < child_vars.size(); ++i)

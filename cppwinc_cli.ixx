@@ -49,6 +49,14 @@ option const* find_option(std::string_view name)
     return nullptr;
 }
 
+std::string canonical_option_name(std::string_view arg)
+{
+    if (arg.starts_with("--")) arg.remove_prefix(2);
+    else if (arg.starts_with('-')) arg.remove_prefix(1);
+    if (arg == "h") return "help";
+    return std::string(arg);
+}
+
 std::string to_utf8(std::wstring_view value)
 {
     if (value.empty())
@@ -225,7 +233,7 @@ struct arg_parser
             {
                 throw usage_exception{};
             }
-            std::string name = arg.substr(1);
+            std::string name = canonical_option_name(arg);
             option const* opt = find_option(name);
             if (!opt)
             {
@@ -233,7 +241,9 @@ struct arg_parser
             }
             std::vector<std::string> values;
             ++i;
-            while (i < raw.size() && !(raw[i].size() >= 2 && raw[i][0] == '-' && find_option(raw[i].substr(1))))
+            while (i < raw.size()
+                && !(raw[i].size() >= 2 && raw[i][0] == '-'
+                    && find_option(canonical_option_name(raw[i]))))
             {
                 values.push_back(raw[i]);
                 ++i;

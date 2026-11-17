@@ -400,13 +400,6 @@ void write_module_preamble(writer& w, std::string_view module_name)
 {
     w.write("// %\n", module_name);
     w.write("\n");
-    w.write("module;\n\n");
-    // Header-free: no COM headers are included. IUnknown/IInspectable and
-    // every Win32/COM API come from winrt_base (hand-laid ABI + winversec
-    // module imports), and the standard library comes from `import std;`,
-    // which winrt_base re-exports (`export import std;`), so every module
-    // in the projection shares one parsed copy of the standard library.
-    w.write("#include <cstdint>\n\n");
     w.write("export module %;\n\n", module_name);
     w.write("import std;\n\n");
     w.write("export import winrt_base;\n\n");
@@ -419,16 +412,6 @@ void write_win32_wdk_module_preamble(writer& w, std::string_view module_name, bo
     w.write("// %\n", module_name);
     w.write("// CppWinC % projection\n", is_wdk ? "WDK" : "Win32");
     w.write("\n");
-    w.write("module;\n\n");
-    // Never include <windows.h>: the projected APIs are self-contained
-    // (every type maps to void*/stdint and constants are emitted inline),
-    // and including it would redeclare the very APIs being projected
-    // (CloseHandle, IsDebuggerPresent, ...) with conflicting signatures.
-    w.write("#include <cstdint>\n");
-    w.write("#include <string>\n");
-    w.write("#include <string_view>\n");
-    w.write("#include <vector>\n");
-    w.write("#include <functional>\n\n");
     w.write("export module %;\n\n", module_name);
     w.write("import std;\n\n");
 }
@@ -634,6 +617,16 @@ void write_interface(writer& w, winmd::type_info const& type, type_mapper const&
     std::string targs = tpl_args(type);
     std::string qual = cpp_name + (generic ? "<" + targs + ">" : "");
     auto methods = flattened_methods(type, metadata);
+    std::vector<winmd::type_info const*> projected_interfaces = type.interfaces;
+    if (type.ns == "Windows.Foundation.Collections" && type.name == "IObservableVector")
+    {
+        // The WinRT projection exposes the IVector surface on observable vectors,
+        // although the WinMD omits that relationship from InterfaceImpl.
+        if (auto const* vector = metadata.find(type.ns, "IVector"))
+        {
+            projected_interfaces.push_back(vector);
+        }
+    }
 
     // Inherited methods cannot be dispatched through the derived
     // interface's vtable slot: OS objects may implement the derived
@@ -811,6 +804,117 @@ operator winrt::IInspectable() const noexcept { if (m_ptr) IUnknown::addref_raw(
         else
         {
             bodies += out_of_line(type, metadata, method_sig(method, mapper, true, qual), body);
+        }
+    }
+
+    std::vector<winmd::method_info const*> wrapper_methods = methods;
+    for (auto const* implemented : projected_interfaces)
+    {
+        if (!implemented || !implemented->is_interface() || is_async_info(*implemented))
+        {
+            continue;
+        }
+        for (auto const* method_ptr : flattened_methods(*implemented, metadata))
+        {
+            auto const& method = *method_ptr;
+            if (method.is_static)
+            {
+                continue;
+            }
+            std::string mkey = method.name;
+            for (auto const& p : method.params)
+            {
+                mkey += "|" + mapper.map(p.value);
+            }
+            if (!iface_emitted.insert(mkey).second)
+            {
+                continue;
+            }
+
+            wrapper_methods.push_back(&method);
+            auto const* decl = find_declaring(*implemented, method);
+            std::set<winmd::type_info const*> seen;
+            std::size_t const slot = 6 + chain_method_count(*decl, seen) + own_method_index(*decl, method);
+            std::string iid_expr;
+            if (decl->generic_params.empty())
+            {
+                iid_expr = "winrt::iid_of<" + type_cpp_name(*decl) + ">";
+            }
+            else
+            {
+                std::string args;
+                for (std::size_t p = 0; p < decl->generic_params.size(); ++p)
+                {
+                    if (p) args += ", ";
+                    args += "winrt::generic_arg_of<T" + std::to_string(p) + ">";
+                }
+                iid_expr = "winrt::impl::make_generic_iid(" + guid_literal(*decl) + ", " + args + ")";
+            }
+            writer q;
+            q.write("        winrt::com_ptr<void> base;\n");
+            q.write("        if (m_ptr) winrt::impl::query_interface(m_ptr, %, base.put());\n", iid_expr);
+            q.write("%", abi_call_body(method, "base.get()", slot, mapper, metadata, "        "));
+            std::string const signature = method_sig(method, mapper, true);
+            if (settings.component && method_refs_component(method, metadata))
+            {
+                std::lock_guard<std::mutex> guard(component_bodies_mutex);
+                component_bodies += out_of_line(type, metadata, method_sig(method, mapper, true, qual), q.str());
+            }
+            else
+            {
+                bodies += out_of_line(type, metadata, method_sig(method, mapper, true, qual), q.str());
+            }
+            w.write("    %;\n", signature);
+        }
+    }
+
+    std::set<std::string> property_wrappers;
+    for (auto const* method_ptr : wrapper_methods)
+    {
+        auto const& method = *method_ptr;
+        if (method.name.starts_with("get_") && method.name.size() > 4 && method.params.empty())
+        {
+            std::string const property = method.name.substr(4);
+            if (!property_wrappers.insert("get_" + property).second) continue;
+            bool const has_method = std::any_of(methods.begin(), methods.end(), [&](auto const* candidate) {
+                return candidate->name == property && candidate->params.empty();
+            });
+            if (has_method) continue;
+            std::string const result_type = mapper.map(method.ret);
+            w.write("    % %() const;\n", result_type, property);
+            bodies += out_of_line(type, metadata,
+                result_type + " " + qual + "::" + property + "() const",
+                "    return get_" + property + "();\n");
+        }
+        else if (method.name.starts_with("put_") && method.name.size() > 4 && method.params.size() == 1)
+        {
+            std::string const property = method.name.substr(4);
+            if (!property_wrappers.insert("put_" + property).second) continue;
+            std::string const parameter_type = mapper.map(method.params[0].value);
+            bool const inspectable = parameter_type == "winrt::IInspectable";
+            bool const has_method = std::any_of(methods.begin(), methods.end(), [&](auto const* candidate) {
+                return candidate->name == property && candidate->params.size() == 1
+                    && mapper.map(candidate->params[0].value) == parameter_type;
+            });
+            if (has_method) continue;
+            if (inspectable)
+            {
+                w.write("    void %(const winrt::hstring& value) const;\n", property);
+                bodies += out_of_line(type, metadata,
+                    "void " + qual + "::" + property + "(winrt::hstring const& value) const",
+                    "    put_" + property + "(winrt::IInspectable(winrt::box_value(value)));\n");
+                w.write("    void %(const winrt::IInspectable& value) const;\n", property);
+                bodies += out_of_line(type, metadata,
+                    "void " + qual + "::" + property + "(winrt::IInspectable const& value) const",
+                    "    put_" + property + "(value);\n");
+            }
+            else
+            {
+                w.write("    void %(const %& value) const;\n", property, parameter_type);
+                bodies += out_of_line(type, metadata,
+                    "void " + qual + "::" + property + "(" + parameter_type + " const& value) const",
+                    "    put_" + property + "(value);\n");
+            }
         }
     }
 
@@ -1221,18 +1325,17 @@ operator winrt::IInspectable() const noexcept { if (m_ptr) IUnknown::addref_raw(
         else if (pt.kind == winmd::et_var || pt.kind == winmd::et_mvar)
         {
             // Generic params (TypedEventHandler<T0,T1> etc.) have unknown
-            // ABI shapes until instantiation: arg_in_t<T> is a projected
-            // struct by value for runtime classes, or void* for hstring /
-            // com_ptr. Cast the ADDRESS of the slot to the exact projected
-            // type the user lambda expects - every projected wrapper leads
-            // with void* m_ptr, so the reinterpret is layout-identical for
-            // both the struct and the bare-pointer shape.
+            // ABI shapes until instantiation: arg_in_t<T> is void* for runtime
+            // classes/interfaces/hstring/com_ptr, or the value type itself.
+            // Construct a borrowed wrapper around the slot (or pass value types
+            // directly) via borrow_arg_in so runtime-class wrappers have a valid,
+            // zero-initialized iface_cache instead of reading caller stack bytes!
             std::string t = "winrt::impl::arg_in_t<" + mapper.map(pt) + ">";
             abi_fn_type += t;
             abi_params += t + " " + a;
             abi_call_params += t + " " + a;
             abi_arg_names += a;
-            conv_args += "*reinterpret_cast<" + mapper.map(pt) + " const*>(static_cast<void const*>(&" + a + "))";
+            conv_args += "winrt::impl::borrow_arg_in<" + mapper.map(pt) + ">(" + a + ")";
         }
         else if (pt.kind == winmd::et_genericinst)
         {
@@ -1248,7 +1351,7 @@ operator winrt::IInspectable() const noexcept { if (m_ptr) IUnknown::addref_raw(
             abi_arg_names += a;
             // Alias the SLOT, not the pointee (see et_class above): the
             // projected wrapper's m_ptr must become the raw object pointer.
-            conv_args += "*reinterpret_cast<" + mapper.map(pt) + " const*>(&" + a + ")";
+            conv_args += "winrt::impl::borrow_arg_in<" + mapper.map(pt) + ">(" + a + ")";
         }
         else if (pt.kind == winmd::et_class)
         {
@@ -1273,11 +1376,9 @@ operator winrt::IInspectable() const noexcept { if (m_ptr) IUnknown::addref_raw(
                 abi_params += "void* " + a;
                 abi_call_params += "void* " + a;
                 abi_arg_names += a;
-                // Alias the SLOT, not the pointee: the projected wrapper
-                // leads with void* m_ptr, so reinterpreting the parameter's
-                // address yields m_ptr = the raw object pointer. Reinterpreting
-                // the VALUE instead would read the object's vtable as m_ptr.
-                conv_args += "*reinterpret_cast<" + mapper.map(pt) + " const*>(&" + a + ")";
+                // Construct a safe borrowed wrapper via borrow_arg_in so runtime
+                // classes with m_cache don't read uninitialized caller stack bytes!
+                conv_args += "winrt::impl::borrow_arg_in<" + mapper.map(pt) + ">(" + a + ")";
             }
         }
         else
@@ -1301,7 +1402,7 @@ operator winrt::IInspectable() const noexcept { if (m_ptr) IUnknown::addref_raw(
     w.write("        explicit %(std::function<%> const& callable) : m_callable(callable) {}\n", impl_name, abi_fn_type);
     w.write("        static std::int32_t __stdcall invoke(% ) noexcept\n        {\n", abi_params);
     w.write("            auto* me = static_cast<%*>(self);\n", impl_name);
-    w.write("            me->m_callable(%);\n            return 0;\n        }\n", abi_arg_names);
+    w.write("            try\n            {\n                me->m_callable(%);\n                return winrt::hr_ok;\n            }\n            catch (...)\n            {\n                return winrt::hr_error;\n            }\n        }\n", abi_arg_names);
     if (generic)
     {
         std::string args;
@@ -1371,6 +1472,11 @@ void write_class(writer& w, winmd::type_info const& type, type_mapper const& map
     // generic-parameter ABI slots (IVector<ResourceDictionary>::Append,
     // Style.Setters, event args, ...), and by collection_element for GetAt.
     void* get_abi() const noexcept { return m_unknown.get(); }
+
+    explicit operator bool() const noexcept { return m_unknown.get() != nullptr; }
+    bool operator!() const noexcept { return m_unknown.get() == nullptr; }
+    bool operator==(std::nullptr_t) const noexcept { return m_unknown.get() == nullptr; }
+    bool operator!=(std::nullptr_t) const noexcept { return m_unknown.get() != nullptr; }
 
 template <typename I>
 void* iface() const
@@ -2182,6 +2288,17 @@ operator U() const noexcept { return U::from_abi(addref_borrowed()); }
                 w.write("        auto** vtbl = *reinterpret_cast<void***>(vec);\n");
                 w.write("        reinterpret_cast<void(__stdcall*)(void*)>(vtbl[15])(vec);\n");
                 w.write("        winrt::IUnknown::release_raw(vec);\n");
+                w.write("    }\n");
+                w.write("    std::uint32_t Size() const\n");
+                w.write("    {\n");
+                w.write("        void* vec = vector_abi();\n");
+                w.write("        std::uint32_t r = 0;\n");
+                w.write("        if (vec) {\n");
+                w.write("            auto** vtbl = *reinterpret_cast<void***>(vec);\n");
+                w.write("            reinterpret_cast<std::int32_t(__stdcall*)(void*, std::uint32_t*)>(vtbl[7])(vec, &r);\n");
+                w.write("            winrt::IUnknown::release_raw(vec);\n");
+                w.write("        }\n");
+                w.write("        return r;\n");
                 w.write("    }\n");
             }
         }

@@ -4,6 +4,10 @@
 
 // driver
 
+void copy_winui_pri();
+void copy_winui_framework_pri();
+void copy_winui_bootstrap_dll();
+
 void replace_all(std::string& value, std::string_view from, std::string_view to)
 {
     std::size_t pos = 0;
@@ -18,7 +22,9 @@ inline bool is_path_under_externals(std::filesystem::path const& p)
 {
     for (auto const& part : p)
     {
-        if (part == "externals") return true;
+        std::string name = part.string();
+        for (auto& ch : name) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        if (name == "externals") return true;
     }
     return false;
 }
@@ -354,6 +360,7 @@ void print_usage()
         }
         std::string name = "  -";
         name += opt.name;
+        if (opt.name == "help") name += ", -h, --help";
         if (!opt.arg.empty())
         {
             name += " ";
@@ -757,8 +764,9 @@ void process_args(arg_parser const& args)
     std::filesystem::create_directories(output);
     settings.output_folder = std::filesystem::canonical(output).string();
     settings.output_folder += std::filesystem::path::preferred_separator;
-    std::error_code ext_ec;
-    std::filesystem::create_directories(std::filesystem::path(settings.output_folder) / "externals" / "include", ext_ec);
+    std::filesystem::path externals_root = std::filesystem::path(settings.output_folder) / "externals";
+    if (!std::filesystem::exists(externals_root))
+        std::filesystem::create_directories(externals_root);
 
     if (settings.component)
     {
@@ -860,6 +868,13 @@ void process_args(arg_parser const& args)
                 settings.component_name = sanitize_app_name(std::filesystem::path(*settings.input_dbs.begin()).filename().replace_extension().string());
             }
         }
+    }
+
+    if (settings.winui)
+    {
+        copy_winui_pri();
+        copy_winui_framework_pri();
+        copy_winui_bootstrap_dll();
     }
 }
 
@@ -2034,9 +2049,8 @@ static void write_wdk_ioctl_constant(writer& w, std::string const& name, std::ui
 // The CRT argv/argc are intentionally unused: the raw command line is
 // re-split below (the CRT mangles quoted paths ending in a backslash).
 // compile/copy helpers shared by -winui and -compile (defined after run)
-int compile_project_folder(std::filesystem::path const& proj_folder, std::string const& app_name, std::string const& final_out = {});    void copy_winui_pri();
-    void copy_winui_assets();
-    void copy_winui_bootstrap_dll();
+int compile_project_folder(std::filesystem::path const& proj_folder, std::string const& app_name, std::string const& final_out = {});
+void copy_winui_assets(std::vector<std::filesystem::path> const& view_modules);
 
 export int run(int const, char**)
 {
@@ -2354,10 +2368,6 @@ export int run(int const, char**)
                             ns.c_str(), info.classes.size(), info.interfaces.size(), info.enums.size(),
                             info.structs.size(), info.delegates.size());
                     }
-                    if (ns == "Windows.Foundation.Metadata")
-                    {
-                        continue;
-                    }
                     auto model = classify_namespace(ns);
                     if (model == ns_projection_model::win32)
                         acc.win32.insert(ns);
@@ -2500,7 +2510,6 @@ export int run(int const, char**)
                     for (auto const& d : dit->second)
                     {
                         if (d == ns || selected.contains(d)) continue;
-                        if (d == "Windows.Foundation.Metadata") continue;
                         if (settings.module_exclude.contains(d)) continue;
                         if (!metadata.namespaces().contains(d)) continue;
                         selected.insert(d);
@@ -2766,6 +2775,8 @@ export int run(int const, char**)
         // event or property type ships in metadata only - no cppwinc rebuild.
         winuic::g_type_events.clear();
         winuic::g_type_prop_kinds.clear();
+        winuic::g_type_methods.clear();
+        winuic::g_type_static_methods.clear();
         // Types the WINMD itself declared a property surface for. Registry
         // gap-fill below must never invent props for these: winmd truth wins
         // on conflicts (an entry may claim composition_kind "content" while
@@ -2851,11 +2862,20 @@ export int run(int const, char**)
                 winmd_prop_keys.insert(type_key);
                 auto& evs = winuic::g_type_events[type_key];
                 auto& props = winuic::g_type_prop_kinds[type_key];
+                auto& methods = winuic::g_type_methods[type_key];
+                auto& static_methods = winuic::g_type_static_methods[type_key];
                 while (!stack.empty())
                 {
                     winmd::type_info const* t = stack.back();
                     stack.pop_back();
                     if (!t || !done.insert(t).second) continue;
+                    for (auto const& method : t->methods)
+                    {
+                        if (method.name.empty()) continue;
+                        std::string name = method.name;
+                        lower_in_place(name);
+                        (method.is_static ? static_methods : methods).insert(std::move(name));
+                    }
                     for (auto const& ev : t->events)
                     {
                         std::string n = ev.name;
@@ -2883,6 +2903,15 @@ export int run(int const, char**)
                         if (pname.empty()) continue;
                         if (pname == "DependencyProperty" || pname == "RoutedEvent" || pname == "AutomationProperty")
                             continue; // static *Property accessor slots, not value-typed props
+                        std::string pn = m.name.substr(4);
+                        lower_in_place(pn);
+                        props.insert_or_assign(std::move(pn), std::move(pname));
+                    }
+                    for (auto const& m : t->methods)
+                    {
+                        if (m.is_static || m.name.rfind("get_", 0) != 0 || !m.params.empty()) continue;
+                        std::string pname = resolve_pname(m.ret);
+                        if (pname.empty()) continue;
                         std::string pn = m.name.substr(4);
                         lower_in_place(pn);
                         props.insert_or_assign(std::move(pn), std::move(pname));
@@ -3087,8 +3116,12 @@ export int run(int const, char**)
             bool any_main_window = false;
             std::string main_window_class;
             std::string main_window_ns;
+            std::string application_class;
             for (auto const& [ns, info] : metadata.namespaces())
                 for (auto const* t : info.classes)
+                {
+                    if (t->base && t->base->name == "Application" && application_class.empty())
+                        application_class = t->name;
                     if (t->base && t->base->name == "Window")
                     {
                         if (!any_main_window || t->name == "MainWindow" || t->name == "MainView")
@@ -3099,6 +3132,7 @@ export int run(int const, char**)
                             if (t->name == "MainWindow") goto found_main_window;
                         }
                     }
+                }
         found_main_window:;
             // Collect all view generation jobs first, then emit in parallel (all cores)
             struct view_job {
@@ -3112,6 +3146,8 @@ export int run(int const, char**)
                 bool has_main_window;
                 std::string main_window_class;
                 std::string main_window_ns;
+                std::string application_class;
+                std::vector<std::pair<std::string, std::string>> main_window_controls;
                 std::string base_type;
                 std::string app_icon_path;
                 std::string backdrop_type;
@@ -3163,6 +3199,7 @@ export int run(int const, char**)
                     vj.has_main_window = any_main_window;
                     vj.main_window_class = main_window_class;
                     vj.main_window_ns = main_window_ns;
+                    vj.application_class = application_class;
                     if (t->base)
                     {
                         if (t->base->name == "Application") vj.base_type = "Application";
@@ -3174,6 +3211,21 @@ export int run(int const, char**)
                 }
             }
             for (auto const& n : view_class_names) winuic::g_view_type_names.insert(n);
+            for (auto const& vj : view_jobs)
+            {
+                winuic::layout_view const layout = winuic::parse_layout_json(vj.json, vj.view_name);
+                std::string type_key = vj.view_name;
+                for (auto& c : type_key)
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                auto& props = winuic::g_type_prop_kinds[type_key];
+                for (auto const& state : layout.state_vars)
+                {
+                    std::string property_key = state.name;
+                    for (auto& c : property_key)
+                        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    props.try_emplace(std::move(property_key), state.type);
+                }
+            }
             // A view may carry the whole shell (nav host + pages) inside the
             // Application view itself (winui syntax: `export view App` with
             // .titlebar/.darkTitlebar/.backdrop chrome and a body). Nothing
@@ -3199,14 +3251,20 @@ export int run(int const, char**)
                     vj.main_window_ns = main_window_ns;
                 }
             }
-            // Navigation map: NavigationView tags (raw "Tag" attrs in the
-// window view's layout JSON, in menu order) -> page runtime class
-            // names. Tag->page resolution is name-normalized (home -> HomePage),
-            // never hardcoded: whatever the project names its pages, the
-            // projection emits a Frame::Navigate registry for them. The .winmd
-            // stays language-agnostic - this map only shapes the emitted C++.
+            // Navigation tags from the window layout are resolved against
+            // discovered view metadata; this map only shapes emitted C++.
             std::vector<std::pair<std::string, std::string>> nav_pages;
+            std::vector<std::pair<std::string, std::string>> main_window_controls;
             {
+                std::function<void(winuic::layout_node const&)> collect_main_window_controls =
+                    [&](winuic::layout_node const& n)
+                {
+                    for (auto const& [k, v] : n.raw_attrs)
+                        if ((k == "x:Name" || k == "Name") && !v.empty())
+                            main_window_controls.emplace_back(n.control, v);
+                    for (auto const& ch : n.children) collect_main_window_controls(ch);
+                    for (auto const& ch : n.else_branch) collect_main_window_controls(ch);
+                };
                 std::function<void(winuic::layout_node const&, std::vector<std::string>&)> collect_tags =
                     [&](winuic::layout_node const& n, std::vector<std::string>& out)
                 {
@@ -3223,7 +3281,11 @@ export int run(int const, char**)
                     if (vj.view_name != main_window_class) continue;
                     winuic::layout_view lv = winuic::parse_layout_json(vj.json, vj.view_name);
                     std::vector<std::string> tags;
-                    for (auto const& rn : lv.root) collect_tags(rn, tags);
+                    for (auto const& rn : lv.root)
+                    {
+                        collect_tags(rn, tags);
+                        collect_main_window_controls(rn);
+                    }
                     auto norm = [](std::string s) { for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); return s; };
                     for (auto const& tag : tags)
                     {
@@ -3236,49 +3298,31 @@ export int run(int const, char**)
                             std::string nm = norm(pj.view_name);
                             std::string nt = norm(tag);
                             std::string nt_stem = (nt.size() > 4 && nt.ends_with("item")) ? nt.substr(0, nt.size() - 4) : nt;
-                            if (nm == nt || nm == nt + "page" || nm == nt_stem + "page" || (nt == "all" && nm == "allcontrolspage"))
+                            if (nm == nt || nm == nt + "page" || nm == nt_stem + "page")
                             {
                                 nav_pages.emplace_back(tag, pj.mod_ns + "." + pj.view_name);
                                 break;
                             }
                         }
+                        for (auto& vj : view_jobs)
+                            vj.main_window_controls = main_window_controls;
                     }
-                    // Ensure Home item maps to HomePage when present
+                    if (!lv.settings_page.empty())
                     {
-                        bool have_home_tag = false;
-                        for (auto const& [t, p] : nav_pages) if (norm(t) == "home") { have_home_tag = true; break; }
-                        if (!have_home_tag)
+                        bool mapped = false;
+                        for (auto const& pj : view_jobs)
                         {
-                            for (auto const& pj : view_jobs)
+                            if (pj.view_name == lv.settings_page
+                                || pj.mod_ns + "." + pj.view_name == lv.settings_page)
                             {
-                                if (pj.view_name == main_window_class) continue;
-                                if (norm(pj.view_name) == "homepage")
-                                {
-                                    nav_pages.emplace_back("Home", pj.mod_ns + "." + pj.view_name);
-                                    break;
-                                }
+                                nav_pages.emplace_back("__settings__", pj.mod_ns + "." + pj.view_name);
+                                mapped = true;
+                                break;
                             }
                         }
-                    }
-                    // NavigationView's built-in settings item (IsSettingsVisible)
-                    // carries no Tag, so tag scanning can't see it. Wire the
-                    // synthesized "__settings__" tag to a project view named
-                    // SettingsPage when one exists.
-                    {
-                        bool have_settings_tag = false;
-                        for (auto const& [t, p] : nav_pages) if (t == "__settings__") { have_settings_tag = true; break; }
-                        if (!have_settings_tag)
-                        {
-                            for (auto const& pj : view_jobs)
-                            {
-                                if (pj.view_name == main_window_class) continue;
-                                if (norm(pj.view_name) == "settingspage")
-                                {
-                                    nav_pages.emplace_back("__settings__", pj.mod_ns + "." + pj.view_name);
-                                    break;
-                                }
-                            }
-                        }
+                        if (!mapped)
+                            std::printf("cppwinc : warning Settings route metadata references unknown view '%s'\n",
+                                lv.settings_page.c_str());
                     }
                     break;
                 }
@@ -3360,7 +3404,17 @@ export int run(int const, char**)
                     vj.extra_app_resources = app_extra_resources;
                 }
             }
-            if (!view_jobs.empty()) phase("view emission start");
+            if (!view_jobs.empty())
+            {
+                phase("view emission start");
+                std::string app_ns = main_window_ns.empty() ? view_jobs[0].mod_ns : main_window_ns;
+                std::string base_code = winuic::generate_winui_base_module(
+                    app_ns,
+                    catalog,
+                    metadata.namespaces().count("Windows.Foundation") > 0,
+                    projected_names);
+                write_output_file(output_folder / "winui_base.ixx", base_code);
+            }
             // Emit view modules in parallel on all cores
             if (view_jobs.size() > 1)
             {
@@ -3395,6 +3449,8 @@ export int run(int const, char**)
                             lv.has_main_window = vj.has_main_window;
                             lv.main_window_class = vj.main_window_class;
                             lv.main_window_ns = vj.main_window_ns;
+                            lv.application_class = vj.application_class;
+                            lv.main_window_controls = vj.main_window_controls;
                             lv.base_type = vj.base_type;
                             lv.shell_window = vj.shell_window;
                             lv.component_view_imports = vj.component_view_imports;
@@ -3436,6 +3492,8 @@ export int run(int const, char**)
                     lv.has_main_window = vj.has_main_window;
                 lv.main_window_class = vj.main_window_class;
                 lv.main_window_ns = vj.main_window_ns;
+                lv.application_class = vj.application_class;
+                lv.main_window_controls = vj.main_window_controls;
                 lv.base_type = vj.base_type;
                 lv.shell_window = vj.shell_window;
                 lv.component_view_imports = vj.component_view_imports;
@@ -3451,6 +3509,16 @@ export int run(int const, char**)
                 }
             }
             if (!view_jobs.empty()) phase("view modules emitted");
+            if (settings.winui)
+            {
+                std::vector<std::filesystem::path> view_modules;
+                view_modules.reserve(view_jobs.size() + 1);
+                view_modules.push_back(output_folder / "winui_base.ixx");
+                for (auto const& vj : view_jobs)
+                    view_modules.push_back(output_folder /
+                        (winuic::ident_ns(vj.mod_ns + "." + vj.view_name) + ".ixx"));
+                copy_winui_assets(view_modules);
+            }
             // main.ixx (only when WinUI views exist; re-emit on every -winui
             // run when the file already exists so the stale-module cleanup —
             // which lists "main" as generator-owned — can never delete the
@@ -3522,8 +3590,8 @@ export int run(int const, char**)
                 // register_local_factory_<View>() is callable from wWinMain.
                 for (auto const& vj : view_jobs)
                 {
-                    if (vj.view_name == "App" || vj.shell_window || vj.view_name.ends_with("Window"))
-                        continue; // App/window views emit launch_<X>, not create_<X>
+                    if (vj.base_type == "Application" || vj.shell_window || vj.base_type == "Window")
+                        continue; // Application/window views do not export page factories
                     entry << "import " << winuic::ident_ns(vj.mod_ns + "." + vj.view_name) << ";\n";
                 }
                 entry << "\n";
@@ -3559,7 +3627,7 @@ export int run(int const, char**)
                 entry << "    // entry and the exe exports nothing).\n";
                 for (auto const& vj : view_jobs)
                 {
-                    if (vj.view_name == "App" || vj.shell_window || vj.view_name.ends_with("Window"))
+                    if (vj.base_type == "Application" || vj.shell_window || vj.base_type == "Window")
                         continue;
                     entry << "    register_local_factory_" << vj.view_name << "();\n";
                 }
@@ -5707,17 +5775,6 @@ export int run(int const, char**)
         // when a DriverEntry source is present, via compile_project_folder.
         phase("module emission done");
 
-        // -winui copies the winuic-produced resources.pri (sits next to the
-        // app .winmd) into the output folder so the exe loads its UI layout,
-        // and puts the bootstrap DLL beside the exe so the unpackaged app
-        // can call MddBootstrapInitialize2 at startup.
-        if (settings.winui)
-        {
-        copy_winui_pri();
-        copy_winui_assets();
-        copy_winui_bootstrap_dll();
-        }
-
         // -compile: same compile+link pass as -winui, without WASDK discovery —
         // for winrt / win32 / wdk projections and any custom winmd input.
         bool do_compile = settings.winui
@@ -5995,93 +6052,315 @@ void copy_winui_pri()
     }
 }
 
-// copy_winui_assets — winuic emits the app's Assets folder next to the
-// app .winmd. The produced app resolves those files beside the exe
-// (ms-appx:///Assets/...), but mirroring the WHOLE tree ships every unused
-// payload and blows up the output folder. Only the assets the generated
-// views actually REFERENCE are copied: the emitted sources are scanned for
-// ms-appx: / "Assets/..." literals and just those files are mirrored
-// (subfolders preserved). A build whose views reference no asset file
-// copies nothing.
-void copy_winui_assets()
+void copy_winui_framework_pri()
+{
+    if (settings.winui_dll_path.empty()) return;
+
+    auto runtime_dir = std::filesystem::path(settings.winui_dll_path);
+    auto output_dir = std::filesystem::path(winui_runtime_dir());
+    std::error_code ec;
+    std::filesystem::directory_iterator entry(runtime_dir, ec), end;
+    if (ec)
+    {
+        std::printf("cppwinc : warning could not enumerate WinUI runtime resources: %s\n", ec.message().c_str());
+        return;
+    }
+    for (; entry != end; entry.increment(ec))
+    {
+        if (ec)
+        {
+            std::printf("cppwinc : warning could not enumerate WinUI runtime resources: %s\n", ec.message().c_str());
+            return;
+        }
+        if (!entry->is_regular_file(ec))
+        {
+            if (ec)
+            {
+                std::printf("cppwinc : warning could not inspect WinUI runtime resource: %s\n", ec.message().c_str());
+                ec.clear();
+            }
+            continue;
+        }
+        auto const& pri = entry->path();
+        if (pri.extension() != L".pri" || pri.filename() == L"resources.pri")
+            continue;
+        auto dst = output_dir / pri.filename();
+        std::filesystem::copy_file(pri, dst, std::filesystem::copy_options::overwrite_existing, ec);
+        if (!ec)
+            std::printf("-winui: %s copied from runtime resources\n", pri.filename().string().c_str());
+        else
+        {
+            std::printf("cppwinc : warning could not copy %s: %s\n", pri.filename().string().c_str(), ec.message().c_str());
+            ec.clear();
+        }
+    }
+}
+
+// Mirror only assets referenced by the view modules emitted in this run.
+void copy_winui_assets(std::vector<std::filesystem::path> const& view_modules)
 {
     // Collect the referenced asset paths from the generated modules.
     std::set<std::string, std::less<>> refs;
+    std::set<std::string, std::less<>> sample_refs;
     {
-        std::error_code ec;
-        std::filesystem::path outp(settings.output_folder);
-        if (std::filesystem::is_directory(outp, ec))
+        for (auto const& module : view_modules)
         {
-            for (auto const& e : std::filesystem::directory_iterator(outp, ec))
+            std::ifstream ifs(module);
+            if (!ifs) continue;
+            auto add_ref = [&](std::string path)
             {
-                if (!e.is_regular_file(ec) || e.path().extension() != ".ixx") continue;
-                std::ifstream ifs(e.path());
-                if (!ifs) continue;
-                auto add_ref = [&](std::string path)
+                for (auto& c : path) if (c == '\\') c = '/';
+                auto endp = path.find_first_of("\"' )};,<");
+                if (endp != std::string::npos) path.erase(endp);
+                while (!path.empty() && path.back() == '/') path.pop_back();
+                if (path.rfind("Assets/", 0) == 0
+                    && path.find('*') == std::string::npos
+                    && path.find('{') == std::string::npos)
+                    refs.insert(std::move(path));
+            };
+            std::string ln;
+            while (std::getline(ifs, ln))
+            {
+                std::size_t sample_pos = 0;
+                while ((sample_pos = ln.find("SampleDefinition(", sample_pos)) != std::string::npos)
                 {
-                    for (auto& c : path) if (c == '\\') c = '/';
-                    // strip a trailing quote fragment / qualifiers
-                    auto endp = path.find_first_of("\"' )};,");
-                    if (endp != std::string::npos) path.erase(endp);
-                    if (path.rfind("Assets/", 0) == 0
-                        && path.find('*') == std::string::npos
-                        && path.find('{') == std::string::npos)
-                        refs.insert(std::move(path));
-                };
-                std::string ln;
-                while (std::getline(ifs, ln))
+                    auto quote = ln.find("L\"", sample_pos + 17);
+                    if (quote == std::string::npos) break;
+                    auto end = ln.find('"', quote + 2);
+                    if (end == std::string::npos) break;
+                    std::string sample = ln.substr(quote + 2, end - quote - 2);
+                    for (auto& ch : sample) if (ch == '\\') ch = '/';
+                    std::filesystem::path relative(sample);
+                    bool unsafe = sample.empty() || sample.front() == '/'
+                        || (sample.size() > 1 && sample[1] == ':');
+                    for (std::size_t part = 0; !unsafe && part < sample.size();) {
+                        auto end_part = sample.find('/', part);
+                        if (end_part == std::string::npos) end_part = sample.size();
+                        if (sample.substr(part, end_part - part) == "..") unsafe = true;
+                        part = end_part + 1;
+                    }
+                    if (!unsafe && relative.extension() == ".txt")
+                        sample_refs.insert(relative.generic_string());
+                    sample_pos = end + 1;
+                }
+                // ms-appx:///Assets/... (also ms-appx:///<ns>/Assets/...)
+                std::size_t p = 0;
+                while ((p = ln.find("ms-appx:", p)) != std::string::npos)
                 {
-                    // ms-appx:///Assets/... (also ms-appx:///<ns>/Assets/...)
-                    std::size_t p = 0;
-                    while ((p = ln.find("ms-appx:", p)) != std::string::npos)
-                    {
-                        std::size_t q = p + 8;
-                        while (q < ln.size() && (ln[q] == '/' || ln[q] == '\\')) ++q;
-                        std::size_t s = q;
-                        while (q < ln.size() && ln[q] != '"' && ln[q] != '\'' && ln[q] != ')' && ln[q] != ';') ++q;
-                        add_ref(ln.substr(s, q - s));
-                        p = (q > p) ? q : p + 1;
-                    }
-                    // bare "Assets/..." literals (converter-reduced Sources etc.)
-                    p = 0;
-                    while ((p = ln.find("\"Assets/", p)) != std::string::npos)
-                    {
-                        std::size_t s = p + 1, q = s;
-                        while (q < ln.size() && ln[q] != '"') ++q;
-                        add_ref(ln.substr(s, q - s));
-                        p = (q > p) ? q : p + 1;
-                    }
+                    std::size_t q = p + 8;
+                    while (q < ln.size() && (ln[q] == '/' || ln[q] == '\\')) ++q;
+                    std::size_t s = q;
+                    while (q < ln.size() && ln[q] != '"' && ln[q] != '\'' &&
+                        ln[q] != ')' && ln[q] != ';' && ln[q] != '<') ++q;
+                    add_ref(ln.substr(s, q - s));
+                    p = (q > p) ? q : p + 1;
+                }
+                // bare "Assets/..." literals (converter-reduced Sources etc.)
+                p = 0;
+                while ((p = ln.find("\"Assets/", p)) != std::string::npos)
+                {
+                    std::size_t s = p + 1, q = s;
+                    while (q < ln.size() && ln[q] != '"') ++q;
+                    add_ref(ln.substr(s, q - s));
+                    p = (q > p) ? q : p + 1;
                 }
             }
         }
     }
+    std::vector<std::filesystem::path> asset_roots;
+    auto add_asset_root = [&](std::filesystem::path const& root)
+    {
+        std::error_code ec;
+        auto assets = root / L"Assets";
+        if (!std::filesystem::is_directory(assets, ec) || ec) return;
+        auto canonical = std::filesystem::weakly_canonical(assets, ec);
+        if (ec) return;
+        if (std::find(asset_roots.begin(), asset_roots.end(), canonical) == asset_roots.end())
+            asset_roots.push_back(std::move(canonical));
+    };
     for (auto const& in : settings.input)
     {
-        if (!std::filesystem::is_regular_file(in)) continue;
-        auto src_root = in.parent_path() / L"Assets";
-        if (!std::filesystem::is_directory(src_root)) continue;
-        auto dst_root = std::filesystem::path(winui_runtime_dir()) / L"Assets";
         std::error_code ec;
-        std::size_t copied = 0, missing = 0;
-        for (auto const& rel : refs)
+        auto input_path = std::filesystem::absolute(in, ec);
+        if (ec || !std::filesystem::is_regular_file(input_path, ec)) continue;
+        auto canonical = std::filesystem::weakly_canonical(input_path, ec).string();
+        if (ec || !settings.input_dbs.contains(canonical)) continue;
+
+        auto dir = input_path.parent_path();
+        for (int depth = 0; depth < 10 && !dir.empty(); ++depth)
         {
-            auto relp = std::filesystem::path(rel.substr(7)); // strip "Assets/"
-            if (relp.empty()) continue;
-            auto src = src_root / relp;
-            if (!std::filesystem::is_regular_file(src, ec)) { ++missing; continue; }
-            auto dst = dst_root / relp;
-            std::filesystem::create_directories(dst.parent_path(), ec);
-            std::filesystem::copy_file(src, dst,
-                std::filesystem::copy_options::overwrite_existing, ec);
-            if (!ec) ++copied;
+            add_asset_root(dir);
+            auto parent = dir.parent_path();
+            if (parent.empty() || parent == dir) break;
+            std::error_code entries_ec;
+            for (std::filesystem::directory_iterator sibling(parent, entries_ec), end;
+                 !entries_ec && sibling != end; sibling.increment(entries_ec))
+            {
+                std::error_code sibling_ec;
+                if (!sibling->is_directory(sibling_ec) || sibling_ec) continue;
+                add_asset_root(sibling->path());
+                std::error_code children_ec;
+                for (std::filesystem::directory_iterator child(sibling->path(), children_ec), child_end;
+                     !children_ec && child != child_end; child.increment(children_ec))
+                {
+                    std::error_code child_ec;
+                    if (child->is_directory(child_ec) && !child_ec)
+                        add_asset_root(child->path());
+                }
+            }
+            dir = std::move(parent);
         }
-        if (copied || missing)
-            std::printf("-winui: %zu referenced asset(s) copied, %zu referenced but missing%s\n",
-                copied, missing, refs.empty() ? "" : "");
-        else
-            std::printf("-winui: no referenced assets in generated views - Assets copy skipped\n");
-        break;
     }
+
+    auto dst_root = std::filesystem::path(winui_runtime_dir()) / L"Assets";
+    std::size_t copied = 0, missing = 0;
+    for (auto const& rel : refs)
+    {
+        auto relp = std::filesystem::path(rel.substr(7)); // strip "Assets/"
+        relp.make_preferred();
+        bool escapes_root = false;
+        for (auto const& component : relp)
+            if (component == L"..") escapes_root = true;
+        if (relp.empty() || relp.is_absolute() || escapes_root)
+            continue;
+        bool copied_reference = false;
+        for (auto const& src_root : asset_roots)
+        {
+            auto src = src_root / relp;
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(src, ec))
+            {
+                std::error_code copy_ec;
+                std::filesystem::create_directories((dst_root / relp).parent_path(), copy_ec);
+                if (!copy_ec)
+                    std::filesystem::copy_file(src, dst_root / relp,
+                        std::filesystem::copy_options::overwrite_existing, copy_ec);
+                if (copy_ec)
+                    std::printf("-winui: could not copy asset %s: %s\n",
+                        src.string().c_str(), copy_ec.message().c_str());
+                else
+                    copied_reference = true;
+            }
+            else if (ec && ec != std::errc::no_such_file_or_directory)
+                std::printf("-winui: could not inspect asset %s: %s\n",
+                    src.string().c_str(), ec.message().c_str());
+
+            auto scale_prefix = src.stem().wstring() + L".scale-";
+            std::error_code variant_ec;
+            std::filesystem::directory_iterator it(src.parent_path(), variant_ec), end;
+            for (; !variant_ec && it != end; it.increment(variant_ec))
+            {
+                std::error_code entry_ec;
+                if (!it->is_regular_file(entry_ec) || entry_ec) continue;
+                auto variant = it->path();
+                if (variant.extension() != src.extension()) continue;
+                auto variant_stem = variant.stem().wstring();
+                if (variant_stem.rfind(scale_prefix, 0) != 0) continue;
+                auto scale = variant_stem.substr(scale_prefix.size());
+                if (scale.empty() || !std::all_of(scale.begin(), scale.end(),
+                    [](wchar_t c) { return c >= L'0' && c <= L'9'; }))
+                    continue;
+                std::error_code copy_ec;
+                auto destination = dst_root / relp.parent_path() / variant.filename();
+                std::filesystem::create_directories(destination.parent_path(), copy_ec);
+                if (!copy_ec)
+                    std::filesystem::copy_file(variant, destination,
+                        std::filesystem::copy_options::overwrite_existing, copy_ec);
+                if (copy_ec)
+                    std::printf("-winui: could not copy asset %s: %s\n",
+                        variant.string().c_str(), copy_ec.message().c_str());
+                else
+                    copied_reference = true;
+            }
+            if (copied_reference) break;
+        }
+        if (copied_reference)
+            ++copied;
+        else
+        {
+            ++missing;
+            std::printf("-winui: referenced asset missing: %s\n", rel.c_str());
+        }
+    }
+    if (copied || missing)
+        std::printf("-winui: %zu referenced asset(s) copied, %zu referenced but missing\n",
+            copied, missing);
+    else
+        std::printf("-winui: no referenced assets in generated views - Assets copy skipped\n");
+    std::vector<std::filesystem::path> sample_roots;
+    auto add_sample_root = [&](std::filesystem::path const& root)
+    {
+        std::error_code ec;
+        if (!std::filesystem::is_directory(root / L"Samples", ec) || ec) return;
+        auto canonical = std::filesystem::weakly_canonical(root, ec);
+        if (ec) return;
+        if (std::find(sample_roots.begin(), sample_roots.end(), canonical) == sample_roots.end())
+            sample_roots.push_back(std::move(canonical));
+    };
+    for (auto const& in : settings.input)
+    {
+        std::error_code ec;
+        auto input_path = std::filesystem::absolute(in, ec);
+        if (ec || !std::filesystem::is_regular_file(input_path, ec)) continue;
+        auto dir = input_path.parent_path();
+        for (int depth = 0; depth < 10 && !dir.empty(); ++depth)
+        {
+            add_sample_root(dir);
+            auto parent = dir.parent_path();
+            if (parent.empty() || parent == dir) break;
+            dir = std::move(parent);
+        }
+    }
+    std::size_t samples_copied = 0, samples_missing = 0;
+    auto sample_destination = std::filesystem::path(winui_runtime_dir()) / L"Samples";
+    for (auto const& sample : sample_refs)
+    {
+        auto relative = std::filesystem::path(sample);
+        bool copied_reference = false;
+        for (auto const& root : sample_roots)
+        {
+            auto source = root / L"Samples" / relative;
+            std::error_code ec;
+            if (!std::filesystem::is_regular_file(source, ec)) continue;
+            auto destination = sample_destination / relative;
+            std::filesystem::create_directories(destination.parent_path(), ec);
+            if (!ec) std::filesystem::copy_file(source, destination,
+                std::filesystem::copy_options::overwrite_existing, ec);
+            if (ec)
+                std::printf("-winui: could not copy sample %s: %s\n",
+                    source.string().c_str(), ec.message().c_str());
+            else
+            {
+                copied_reference = true;
+                auto translated_source = root / L"Samples" / L"WinUI" / relative;
+                translated_source.replace_extension(L".winui");
+                std::error_code translated_ec;
+                if (std::filesystem::is_regular_file(translated_source, translated_ec))
+                {
+                    auto translated_destination = sample_destination / L"WinUI" / relative;
+                    translated_destination.replace_extension(L".winui");
+                    std::filesystem::create_directories(translated_destination.parent_path(), translated_ec);
+                    if (!translated_ec)
+                        std::filesystem::copy_file(translated_source, translated_destination,
+                            std::filesystem::copy_options::overwrite_existing, translated_ec);
+                    if (translated_ec)
+                        std::printf("-winui: could not copy translated sample %s: %s\n",
+                            translated_source.string().c_str(), translated_ec.message().c_str());
+                }
+            }
+            break;
+        }
+        if (copied_reference)
+            ++samples_copied;
+        else
+        {
+            ++samples_missing;
+            std::printf("-winui: referenced sample missing: %s\n", sample.c_str());
+        }
+    }
+    if (samples_copied || samples_missing)
+        std::printf("-winui: %zu external sample(s) copied, %zu referenced but missing\n",
+            samples_copied, samples_missing);
     // Copy LICENSE file to output directory if present next to any input winmd or parent
     for (auto const& inp : settings.input)
     {
@@ -6122,12 +6401,10 @@ externals_bundle scan_externals(std::filesystem::path const& proj_folder)
     externals_bundle out;
     std::error_code ec;
     std::filesystem::path root = proj_folder / "externals";
-    std::filesystem::create_directories(root / "include", ec);
     if (!std::filesystem::is_directory(root, ec)) return out;
 
     std::set<std::string, std::less<>> inc, libs, dlls;
-    // Headers dropped straight into externals/ resolve too.
-    inc.insert(root.lexically_normal().string());
+    auto root_normal = root.lexically_normal();
     std::filesystem::recursive_directory_iterator it(
         root, std::filesystem::directory_options::skip_permission_denied, ec), end;
     for (; !ec && it != end; it.increment(ec))
@@ -6142,6 +6419,10 @@ externals_bundle scan_externals(std::filesystem::path const& proj_folder)
         {
             auto ext_s = it->path().extension().string();
             for (auto& c : ext_s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (it->path().parent_path().lexically_normal() == root_normal &&
+                (ext_s == ".h" || ext_s == ".hh" || ext_s == ".hpp" || ext_s == ".hxx" ||
+                 ext_s == ".inl" || ext_s == ".inc" || ext_s == ".ipp" || ext_s == ".tpp"))
+                inc.insert(root_normal.string());
             if (ext_s == ".lib") libs.insert(it->path().lexically_normal().string());
             else if (ext_s == ".dll") dlls.insert(it->path().lexically_normal().string());
         }
@@ -6800,6 +7081,8 @@ int compile_project_folder(std::filesystem::path const& proj_folder, std::string
         // folder when one was given; build intermediates (objs, logs, ifc)
         // always stay in <project>/build/obj.
         std::filesystem::path final_dir = final_out.empty() ? proj_folder : std::filesystem::path(final_out);
+        if (final_dir.is_relative())
+            final_dir = std::filesystem::absolute(final_dir);
         std::filesystem::create_directories(final_dir);
         // Locate an import library on the same LIB directories the link
         // searches (MSVC toolchain lib + SDK um/ucrt/km x64). Every link

@@ -16,6 +16,7 @@
 2. [WinUI 3 Projection](#winui-3-projection)
    - [Manual Editing, Business Logic & Third-Party Control Integration](#manual-editing-business-logic--third-party-control-integration)
    - [Metadata-First WinUI 3 Architecture & Rebuild-Free Evolution](#metadata-first-winui-3-architecture--rebuild-free-evolution)
+   - [Shared WinUI 3 Base Module (`winui_base`)](#shared-winui-3-base-module-winui_base)
    - [Brush and Color Handling](#brush-and-color-handling)
    - [Geometry and SVG Path Handling](#geometry-and-svg-path-handling)
    - [Font and Icon Handling](#font-and-icon-handling)
@@ -77,7 +78,7 @@ It projects four API surfaces from a single compiler:
 
 | API Surface | Metadata Source | Namespaces | Runtime |
 |---|---|---|---|
-| **WinUI 3** | `.winui` XAML views (xaml2winuic / winuic), WASDK | `Microsoft.UI.*` | `winrt_base.ixx` |
+| **WinUI 3** | `.winui` XAML views (xaml2winuic / winuic), WASDK | `Microsoft.UI.*` | `winui_base.ixx` / `winrt_base.ixx` |
 | **WinRT** | System `WinMetadata`, Windows SDK, WASDK/WinUI3 | `Windows.*` | `winrt_base.ixx` |
 | **Win32** | `winversec`-generated `.winmd` | `Windows.Win32.*` | None (plain C++) |
 | **Driver (WDK)** | `winversec`-generated `.winmd` | `Windows.Wdk.*` (shared utilities, RPC, string, network) | None (plain C++) |
@@ -163,31 +164,46 @@ While `CppWinC` generates complete, turnkey view modules automatically from XAML
 
 #### 1. Inspecting & Manually Customizing Generated Views
 
-Every XAML view compiles into a cleanly formatted C++23 module (`<Namespace>.<ViewName>.ixx`) defining an exported class:
+Every XAML view compiles into a cleanly formatted C++23 module (`<Namespace>.<ViewName>.ixx`) that exports `winui_base` and defines an exported view class:
 
 ```cpp
 // Example: generated HomePageView in WinUIGallery.HomePage.ixx
+export module WinUIGallery.HomePage;
+
+import std;
+export import winui_base;
+import WinUIGallery.HomePageHeader;
+import WinUIGallery.HorizontalScrollContainer;
+
 export class HomePageView : public Microsoft::UI::Xaml::Controls::UserControl
 {
 public:
     HomePageView() { BuildUI(); }
 
+    // State variables (including x:Name controls promoted to state):
+    winrt::Microsoft::UI::Xaml::Controls::SelectorBar FilterBar;
+    // ...
+
     // Named XAML elements (x:Name="...") emitted as public, strongly-typed members:
     winrt::Microsoft::UI::Xaml::Controls::GridView FavoriteSamples;
-    winrt::Microsoft::UI::Xaml::Controls::SelectorBar FilterBar;
+    winrt::Microsoft::UI::Xaml::Controls::StackPanel FavoriteSamplesFallbackMessage;
+    winrt::Microsoft::UI::Xaml::Controls::StackPanel FavoriteSamplesPanel;
+    winrt::Microsoft::UI::Xaml::Controls::StackPanel RecentSamplesPanel;
     HorizontalScrollContainer RecentlyVisitedContainer;
     winrt::Microsoft::UI::Xaml::Controls::TextBlock RecentlyVisitedTitle;
 
     // Reactive bindings and child views:
     std::vector<std::function<void()>> m_bindings;
+    std::vector<std::shared_ptr<void>> m_child_views;
     void update_bindings() { for (auto const& fn : m_bindings) fn(); }
 
-    void BuildUI();
+    // Build the UI tree from the winuic layout (defined inline):
+    void BuildUI() { /* ... */ }
 };
 ```
 
 Because elements are strongly typed members:
-- **Direct Event Overrides & Handlers:** Hook events programmatically at runtime without touching generated XAML parser logic:
+- **Direct Event Overrides & Handlers:** Hook events programmatically at runtime without touching generated XAML parser logic (`SelectionChanged` forwards directly to `add_SelectionChanged`):
   ```cpp
   auto view = std::make_shared<HomePageView>();
   view->FilterBar.SelectionChanged([](auto const& sender, auto const& args) {
@@ -315,7 +331,7 @@ Consume third-party or in-house component suites (vendor controls, open-source l
 ##### Step-by-Step Integration Workflow:
 
 1. **Drop Binaries into `externals/`:**
-   `cppwinc` automatically creates and scans `externals/` for dependencies without requiring extra compiler flags:
+   `cppwinc` creates the top-level `externals/` directory only when it is absent. If it already exists, it scans it without changing its nested files or folders:
    ```
    externals/
    ├── include/                               <-- C++ headers (added to /I automatically)
@@ -379,6 +395,13 @@ Resource lookups dynamically search the WinUI 3 resource hierarchy:
 ### Untyped Item Property Access & DataTemplate Handling
 
 - **DataTemplate Property Access**: When data-binding untyped collection items (`item.Property` on `IInspectable`), the compiler guards property access to avoid type-mismatch crashes on heterogeneous collections.
+
+### Shared WinUI 3 Base Module (`winui_base`)
+
+For WinUI 3 builds, `CppWinC` emits a shared `winui_base.ixx` (`export module winui_base;`) that every generated view module re-exports (`export import winui_base;`). Instead of repeating platform imports, theme helpers, and component stubs in every view `.ixx`, `winui_base` centralizes:
+- **Platform & Runtime Re-exports:** `winrt_base`, `Microsoft.UI.Xaml.*`, `Microsoft.UI.Dispatching`, `Microsoft.UI.Windowing`, `Windows.Foundation.*`, `Windows.UI.*`, `Windows.Win32.UI.WindowsAndMessaging`, and the app's own component module.
+- **Shared Theme & Resource Runtime (`ThemeState`):** `theme_lookup_th`, `theme_brush_th`, `style_lookup_th`, `data_template_th`, `apply_xaml_resources`, `apply_visual_state_groups`, `symbol_from_name`, `parse_svg_path`, and recent-history persistence.
+- **Metadata-Driven Component Stubs & Helpers:** Emits projection-agnostic helper wrappers and fallback stubs discovered from `.winmd` metadata once in `winui_base` rather than duplicating them across individual view modules.
 
 Set `CPPWINC_DUMP_CTRL_MAPS=1` to print the derived maps at startup.
 
@@ -512,6 +535,10 @@ Everything an app needs beyond the metadata projection lives in `winrt_base.ixx`
   - `file_time` — `clock::time_point` representation.
   - `from_file_time(FILETIME)` / `to_file_time(time_point)` — conversions to/from Windows `FILETIME`.
   - `from_sys(time_point)` / `to_sys(time_point)` — conversions to/from `std::chrono::system_clock`.
+
+- **Nullability & Safe ABI Borrowing:**
+  - `explicit operator bool() const noexcept`, `bool operator!() const noexcept`, `operator==(std::nullptr_t)`, and `operator!=(std::nullptr_t)` on projected runtime classes, `IUnknown`, and `IInspectable` — allowing idiomatic `if (!ctrl)` and `if (ctrl == nullptr)` checks without implicit conversion ambiguity.
+  - `winrt::impl::borrow_arg_in<T>(raw)` — constructs a properly zero-initialized `wrap_borrowed` wrapper for runtime-class parameters inside generated delegate (`TypedEventHandler`) and component thunks, preventing uninitialized stack reads into `iface_cache`.
 
 - **Diagnostics & Process Lifecycle:**
   - `boot_log(msg)` / `boot_logf(fmt, ...)` — low-level trace logging.
@@ -1004,7 +1031,7 @@ externals/
 └── **/*.dll          copied next to the final linked binaries
 ```
 
-NuGet package folders can be dropped in verbatim — `build/native/include`, `lib/x64` and `runtimes/win-x64/native` all match the scan. No switches: the convention is discovered from the folder itself. `cppwinc` automatically creates the `externals/` and `externals/include/` directory structure in the target projection folder on every run, so it is always ready for use.
+NuGet package folders can be dropped in verbatim — `build/native/include`, `lib/x64` and `runtimes/win-x64/native` all match the scan. No switches: the convention is discovered from the folder itself. `cppwinc` creates only the top-level `externals/` directory when absent; it does not create nested package directories, and it leaves the contents of an existing tree untouched.
 
 What this gives you across all projection targets:
 
@@ -1055,7 +1082,7 @@ Options:
                          final linked binaries (+ link exe / sys / dll)
     -target <list>       Link targets for -compile (requires -compile):
                          comma-separated exe, sys, dll
-    -help                Show detailed help with examples
+    -help, -h, --help    Show detailed help with examples
     -module_include <list>
                          Only generate modules for the listed namespaces -
                          ONE comma-separated list or repeated switches
@@ -1395,6 +1422,12 @@ All generated modules compile with MSVC `/std:c++latest`. Key fixes:
 - **`/FS` flag** ensures concurrent `.pdb` writes during parallel compilation.
 - **Pruned projection** — only compile modules the app transitively imports,
   not the entire WinRT surface.
+- **Shared `winui_base` module** — avoids duplicate prelude parsing across
+  hundreds of view modules.
+- **Safe delegate & component ABI marshaling** — `borrow_arg_in<T>` ensures
+  borrowed runtime-class parameters (`sender`, `args`) initialize a clean
+  `iface_cache`, and `style_lookup_th` / `apply_xaml_resources` handle
+  `*Style` attributes and leading-whitespace XAML resource fragments cleanly.
 
 ## Long paths
 

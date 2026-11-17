@@ -24,29 +24,31 @@ namespace winrt
 {
     // single-threaded collection factories
     export template <typename T>
-    Windows::Foundation::Collections::IObservableVector<T> single_threaded_vector()
+    Windows::Foundation::Collections::IVector<T> single_threaded_vector()
     {
         void* abi = impl::make_single_threaded_vector<T>();
-        return Windows::Foundation::Collections::IObservableVector<T>::from_abi(abi);
+        return Windows::Foundation::Collections::IVector<T>::from_abi(abi);
     }
 
     export template <typename T>
     Windows::Foundation::Collections::IObservableVector<T> single_threaded_observable_vector()
     {
-        return single_threaded_vector<T>();
+        void* abi = impl::make_single_threaded_observable_vector<T>();
+        return Windows::Foundation::Collections::IObservableVector<T>::from_abi(abi);
     }
 
     export template <typename K, typename V>
-    Windows::Foundation::Collections::IObservableMap<K, V> single_threaded_map()
+    Windows::Foundation::Collections::IMap<K, V> single_threaded_map()
     {
         void* abi = impl::make_single_threaded_map<K, V>();
-        return Windows::Foundation::Collections::IObservableMap<K, V>::from_abi(abi);
+        return Windows::Foundation::Collections::IMap<K, V>::from_abi(abi);
     }
 
     export template <typename K, typename V>
     Windows::Foundation::Collections::IObservableMap<K, V> single_threaded_observable_map()
     {
-        return single_threaded_map<K, V>();
+        void* abi = impl::make_single_threaded_observable_map<K, V>();
+        return Windows::Foundation::Collections::IObservableMap<K, V>::from_abi(abi);
     }
 
     // read a boxed value out of an IMap (PropertySet-style) by key; the

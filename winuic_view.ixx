@@ -77,6 +77,113 @@ inline std::string fixup_view_code(std::string code,
                 vtype[id] = last;
         }
     }
+    // Include metadata-backed object fields so later expression rewrites know
+    // the projected type of x:Name and property-element state members.
+    for (auto const& ln : lines)
+    {
+        size_t p = ln.find_first_not_of(" \t");
+        if (p == std::string::npos) continue;
+        size_t type_end = ln.find_first_of(" \t", p);
+        if (type_end == std::string::npos) continue;
+        std::string type = ln.substr(p, type_end - p);
+        size_t scope = type.rfind("::");
+        std::string type_name = scope == std::string::npos ? type : type.substr(scope + 2);
+        std::string type_key = type_name;
+        for (auto& ch : type_key)
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        bool projected_object = type.find("::Controls::") != std::string::npos
+            || (prop_kinds && prop_kinds->count(type_key));
+        if (!projected_object) continue;
+        size_t name_begin = ln.find_first_not_of(" \t", type_end);
+        if (name_begin == std::string::npos) continue;
+        size_t name_end = name_begin;
+        while (name_end < ln.size()
+            && (std::isalnum(static_cast<unsigned char>(ln[name_end])) || ln[name_end] == '_'))
+            ++name_end;
+        if (name_end == name_begin) continue;
+        size_t terminator = ln.find_first_not_of(" \t", name_end);
+        if (terminator == std::string::npos || (ln[terminator] != ';' && ln[terminator] != '=')) continue;
+        vtype[ln.substr(name_begin, name_end - name_begin)] = std::move(type_name);
+    }
+
+    auto rewrite_typed_member_reads = [&](std::string expression)
+    {
+        if (trim(expression).rfind("//", 0) == 0) return expression;
+        auto metadata_key = [](std::string type)
+        {
+            if (auto generic = type.find('<'); generic != std::string::npos) type.resize(generic);
+            if (auto scope = type.find_last_of(".:"); scope != std::string::npos) type = type.substr(scope + 1);
+            for (auto& ch : type) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            return type;
+        };
+        bool in_string = false;
+        bool escaped = false;
+        for (std::size_t p = 0; p < expression.size();)
+        {
+            char ch = expression[p];
+            if (in_string)
+            {
+                if (escaped) escaped = false;
+                else if (ch == '\\') escaped = true;
+                else if (ch == '"') in_string = false;
+                ++p;
+                continue;
+            }
+            if (ch == '"') { in_string = true; ++p; continue; }
+            if (!(std::isalpha(static_cast<unsigned char>(ch)) || ch == '_')) { ++p; continue; }
+            std::size_t end = p + 1;
+            while (end < expression.size()
+                && (std::isalnum(static_cast<unsigned char>(expression[end])) || expression[end] == '_')) ++end;
+            auto variable = vtype.find(expression.substr(p, end - p));
+            bool boundary = p == 0
+                || !(std::isalnum(static_cast<unsigned char>(expression[p - 1])) || expression[p - 1] == '_');
+            bool this_access = p >= 6 && expression.compare(p - 6, 6, "this->") == 0;
+            bool chained = (p > 0 && expression[p - 1] == '.')
+                || (p >= 2 && expression.compare(p - 2, 2, "->") == 0);
+            if (!boundary || (chained && !this_access) || variable == vtype.end()
+                || end >= expression.size() || expression[end] != '.')
+            {
+                p = end;
+                continue;
+            }
+            std::string current_type = variable->second;
+            std::size_t dot = end;
+            while (dot < expression.size() && expression[dot] == '.')
+            {
+                std::size_t member = dot + 1, member_end = member;
+                while (member_end < expression.size()
+                    && (std::isalnum(static_cast<unsigned char>(expression[member_end])) || expression[member_end] == '_'))
+                    ++member_end;
+                if (member_end == member) break;
+                std::string key = expression.substr(member, member_end - member);
+                for (auto& c : key) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (!prop_kinds) break;
+                auto properties = prop_kinds->find(metadata_key(current_type));
+                if (properties == prop_kinds->end()) break;
+                auto property = properties->second.find(key);
+                if (property == properties->second.end()) break;
+                current_type = property->second;
+                if (member_end < expression.size() && expression[member_end] == '(')
+                {
+                    int depth = 1;
+                    std::size_t call_end = member_end + 1;
+                    for (; call_end < expression.size() && depth; ++call_end)
+                    {
+                        if (expression[call_end] == '(') ++depth;
+                        else if (expression[call_end] == ')') --depth;
+                    }
+                    dot = call_end;
+                }
+                else
+                {
+                    expression.insert(member_end, "()");
+                    dot = member_end + 2;
+                }
+            }
+            p = dot > end ? dot : end;
+        }
+        return expression;
+    };
 
     // State-var declarations: every winuic state var projects as a
     // winrt::hstring placeholder (no code-behind collections exist). Track
@@ -166,6 +273,12 @@ inline std::string fixup_view_code(std::string code,
 
     for (auto& ln : lines)
     {
+        ln = rewrite_typed_member_reads(std::move(ln));
+        std::string line_shape = trim(ln);
+        if (line_shape.rfind("if (", 0) == 0
+            || line_shape.rfind("else if (", 0) == 0
+            || line_shape.rfind("else", 0) == 0)
+            continue;
         std::string prop;
         std::string recv = receiver_prop(ln, prop);
         // No blanket continue: receiver-less helper lines (inspectable_append(...))
@@ -336,7 +449,21 @@ inline std::string fixup_view_code(std::string code,
         //     list; state-variable expressions are left untouched.
         if (has_arg && is_numeric_type_name(ptype) && argT.size() >= 2
             && (argT[0] == 'L' || argT[0] == '\"') && argT.back() == '\"' && !is_plain_numeric(argT))
-            comment = true;
+        {
+            std::string key = argT;
+            if (key.size() > 2 && key[0] == 'L' && key[1] == '"') key = key.substr(2, key.size() - 3);
+            else if (key.size() >= 2 && key.front() == '"' && key.back() == '"') key = key.substr(1, key.size() - 2);
+            if (key == "Auto" || key == "NaN") {
+                comment = true;
+            } else {
+                std::string rep = "theme_double_th(L\"" + key + "\", 12.0)";
+                auto pos = out_line.rfind(argT);
+                if (pos != std::string::npos)
+                    out_line = out_line.substr(0, pos) + rep + out_line.substr(pos + argT.size());
+                else
+                    comment = true;
+            }
+        }
         // R7: uniform numeric Thickness props (Padding(12), Margin(0),
         //      BorderThickness(0,1,0,0) — commas included).
         if (!comment && has_arg && (lo_prop == "padding" || lo_prop == "margin" || lo_prop == "borderthickness"))
@@ -854,9 +981,12 @@ inline std::string fixup_view_code(std::string code,
                             else if (c == ')') { --d3; if (d3 == 0) break; }
                         }
                         if (e3 < out_line.size())
-                            // explicit IInspectable{}: a bare nullptr is C2668
-                            // ambiguous against the projected overloads.
-                            out_line = out_line.substr(0, b3) + "winrt::IInspectable{nullptr}" + out_line.substr(e3);
+                        {
+                            if (std::string(src_props[sp]) == "ItemsSource")
+                                out_line = out_line.substr(0, b3) + "winrt::IInspectable{nullptr}" + out_line.substr(e3);
+                            else
+                                out_line = out_line.substr(0, b3) + "winrt::IInspectable{nullptr}" + out_line.substr(e3);
+                        }
                     }
                 }
             }
@@ -1226,6 +1356,257 @@ inline std::string fixup_view_code(std::string code,
 }
 
 
+
+// Generate winui_base.ixx: the shared base module for WinUI 3 views.
+// Emits platform imports, exported runtime helpers, component stubs, and utility converters once.
+inline std::string generate_winui_base_module(
+    std::string const& ns_meta,
+    attribute_catalog const& catalog,
+    bool const have_windows_sdk = false,
+    std::set<std::string> const& projected_names = {},
+    std::vector<std::string> const& extra_platform_ns = {})
+{
+    (void)catalog;
+    std::ostringstream out;
+    std::string ns = ident_ns(ns_meta);
+
+    out << "// winui_base.ixx — Base runtime module for WinUI 3 views.\n";
+    out << "// generated by cppwinc; shared across all view modules to avoid duplicate prelude parsing.\n\n";
+    out << "module;\n\n";
+    out << "export module winui_base;\n\n";
+    out << "import std;\n";
+    out << "export import winrt_base;\n";
+    out << "export import winrt.Microsoft.UI.Xaml;\n";
+    out << "export import winrt.Microsoft.UI.Xaml.Hosting;\n";
+    out << "export import winrt.Microsoft.UI.Dispatching;\n";
+    out << "export import winrt.Microsoft.UI.Xaml.Controls;\n";
+    out << "export import winrt.Microsoft.UI.Xaml.Controls.Primitives;\n";
+    out << "export import winrt.Microsoft.UI.Xaml.Media;\n";
+    out << "export import winrt.Microsoft.UI.Xaml.Automation;\n";
+    out << "export import winrt.Microsoft.UI.Xaml.Markup;\n";
+    out << "export import winrt.Windows.UI.Xaml.Interop;\n";
+    out << "export import winrt.Microsoft.UI.Windowing;\n";
+    out << "export import Windows.Win32.UI.WindowsAndMessaging;\n";
+    for (auto const& xns : extra_platform_ns)
+        out << "export import winrt." << xns << ";\n";
+    if (have_windows_sdk)
+    {
+        out << "export import winrt.Windows.Foundation;\n";
+        out << "export import winrt.Windows.Foundation.Collections;\n";
+        out << "export import winrt.Windows.UI;\n";
+        out << "export import winrt.Windows.UI.Text;\n";
+    }
+    else
+    {
+        out << "export namespace winrt::Windows::UI {\n";
+        out << "struct Color { std::uint8_t A{255}, R{0}, G{0}, B{0}; };\n";
+        out << "} // namespace winrt::Windows::UI\n\n";
+    }
+    if (!ns.empty())
+        out << "export import " << ns << ";\n\n";
+
+    // Runtime helpers (exported inline / export extern "C")
+    emit_runtime_helpers(out, have_windows_sdk, ns_meta, /*is_shared_module=*/true);
+
+    // Missing component type stubs (exported namespaces)
+    emit_component_stubs(out, ns, projected_names, /*is_shared_module=*/true);
+
+    out << "// Projected IVector<T>/IObservableVector<T> wrappers expose get_abi() but don't\n";
+    out << "// convert to IInspectable; collection classes (InlineCollection, UIElementCollection)\n";
+    out << "// convert to IInspectable but have no get_abi(). Route both to their ABI pointer.\n";
+    out << "export template <typename TColl>\n";
+    out << "    requires requires(TColl const& c) { c.get_abi(); }\n";
+    out << "inline void* collection_abi(TColl const& c) { return c.get_abi(); }\n";
+    out << "export inline void* collection_abi(winrt::IInspectable const& c) { return c.get_abi(); }\n";
+    out << "export inline void* collection_abi(void* p) { return p; }\n";
+    out << "export template <typename TColl, typename TItem>\n";
+    out << "    requires requires(TColl& c, TItem const& i) { c.Append(i); }\n";
+    out << "inline void inspectable_append(TColl collection, TItem const& item) {\n";
+    out << "    collection.Append(item);\n";
+    out << "}\n";
+    out << "export template <typename T, typename TItem>\n";
+    out << "inline void inspectable_append(winrt::Windows::Foundation::Collections::IObservableVector<T> const& collection, TItem const& item) {\n";
+    out << "    if constexpr (requires { collection.Append(item); }) {\n";
+    out << "        collection.Append(item);\n";
+    out << "        return;\n";
+    out << "    }\n";
+    out << "    void* col_ptr = collection.get_abi();\n";
+    out << "    if (!col_ptr) return;\n";
+    out << "    void* vec_ptr = nullptr;\n";
+    out << "    static winrt::winrt_guid const vec_iid = winrt::Windows::Foundation::Collections::IVector<T>::iid();\n";
+    out << "    if (winrt::impl::query_interface(col_ptr, vec_iid, &vec_ptr) != 0 || !vec_ptr) return;\n";
+    out << "    void* item_raw = collection_abi(item);\n";
+    out << "    void* elem_ptr = nullptr;\n";
+    out << "    if constexpr (requires { winrt::iid_of<T>; }) {\n";
+    out << "        if (item_raw) {\n";
+    out << "            winrt::impl::query_interface(item_raw, winrt::iid_of<T>, &elem_ptr);\n";
+    out << "        }\n";
+    out << "    }\n";
+    out << "    if (!elem_ptr) elem_ptr = item_raw;\n";
+    out << "    auto** vtbl = *reinterpret_cast<void***>(vec_ptr);\n";
+    out << "    using append_fn = std::int32_t(__stdcall*)(void*, void*);\n";
+    out << "    reinterpret_cast<append_fn>(vtbl[13])(vec_ptr, elem_ptr);\n";
+    out << "    if (elem_ptr && elem_ptr != item_raw) {\n";
+    out << "        auto** elem_vtbl = *reinterpret_cast<void***>(elem_ptr);\n";
+    out << "        reinterpret_cast<std::uint32_t(__stdcall*)(void*)>(elem_vtbl[2])(elem_ptr);\n";
+    out << "    }\n";
+    out << "    reinterpret_cast<std::uint32_t(__stdcall*)(void*)>(vtbl[2])(vec_ptr);\n";
+    out << "}\n";
+    out << "export template <typename T, typename TItem>\n";
+    out << "inline void inspectable_append(winrt::Windows::Foundation::Collections::IVector<T> const& collection, TItem const& item) {\n";
+    out << "    if constexpr (requires { collection.Append(item); }) {\n";
+    out << "        collection.Append(item);\n";
+    out << "        return;\n";
+    out << "    }\n";
+    out << "    void* col_ptr = collection.get_abi();\n";
+    out << "    if (!col_ptr) return;\n";
+    out << "    void* item_raw = collection_abi(item);\n";
+    out << "    void* elem_ptr = nullptr;\n";
+    out << "    if constexpr (requires { winrt::iid_of<T>; }) {\n";
+    out << "        if (item_raw) {\n";
+    out << "            winrt::impl::query_interface(item_raw, winrt::iid_of<T>, &elem_ptr);\n";
+    out << "        }\n";
+    out << "    }\n";
+    out << "    if (!elem_ptr) elem_ptr = item_raw;\n";
+    out << "    auto** vtbl = *reinterpret_cast<void***>(col_ptr);\n";
+    out << "    using append_fn = std::int32_t(__stdcall*)(void*, void*);\n";
+    out << "    reinterpret_cast<append_fn>(vtbl[13])(col_ptr, elem_ptr);\n";
+    out << "    if (elem_ptr && elem_ptr != item_raw) {\n";
+    out << "        auto** elem_vtbl = *reinterpret_cast<void***>(elem_ptr);\n";
+    out << "        reinterpret_cast<std::uint32_t(__stdcall*)(void*)>(elem_vtbl[2])(elem_ptr);\n";
+    out << "    }\n";
+    out << "}\n";
+    out << "export template <typename TColl>\n";
+    out << "    requires (!requires(TColl& c, winrt::IInspectable const& i) { c.Append(i); })\n";
+    out << "inline void inspectable_append(TColl const& collection, winrt::IInspectable const& item) {\n";
+    out << "    void* col_ptr = collection_abi(collection);\n";
+    out << "    if (!col_ptr) return;\n";
+    out << "    void* item_ptr = collection_abi(item);\n";
+    out << "    if (!item_ptr) return;\n";
+    out << "    static winrt::winrt_guid const ivector_inspectable_iid{ 0x4B52C37C, 0xD426, 0x42E0, { 0xA4, 0x49, 0xF2, 0x6E, 0x14, 0x3F, 0x1A, 0xEC } };\n";
+    out << "    void* vec_ptr = nullptr;\n";
+    out << "    if (winrt::impl::query_interface(col_ptr, ivector_inspectable_iid, &vec_ptr) == 0 && vec_ptr) {\n";
+    out << "        auto** vtbl = *reinterpret_cast<void***>(vec_ptr);\n";
+    out << "        using append_fn = std::int32_t(__stdcall*)(void*, void*);\n";
+    out << "        reinterpret_cast<append_fn>(vtbl[13])(vec_ptr, item_ptr);\n";
+    out << "        reinterpret_cast<std::uint32_t(__stdcall*)(void*)>(vtbl[2])(vec_ptr);\n";
+    out << "    } else {\n";
+    out << "        auto** vtbl = *reinterpret_cast<void***>(col_ptr);\n";
+    out << "        using append_fn = std::int32_t(__stdcall*)(void*, void*);\n";
+    out << "        reinterpret_cast<append_fn>(vtbl[13])(col_ptr, item_ptr);\n";
+    out << "    }\n";
+    out << "}\n\n";
+
+    out << "export inline winrt::Microsoft::UI::Xaml::Visibility make_visibility(bool v) {\n";
+    out << "    return v ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed;\n";
+    out << "}\n";
+    out << "export inline winrt::Microsoft::UI::Xaml::Visibility make_visibility(winrt::Microsoft::UI::Xaml::Visibility v) { return v; }\n";
+    out << "export inline winrt::Microsoft::UI::Xaml::Visibility make_visibility(winrt::hstring const& v) {\n";
+    out << "    auto sv = v.to_view();\n";
+    out << "    if (sv == L\"Collapsed\" || sv == L\"collapsed\" || sv == L\"False\" || sv == L\"false\" || sv == L\"0\" || sv.empty())\n";
+    out << "        return winrt::Microsoft::UI::Xaml::Visibility::Collapsed;\n";
+    out << "    return winrt::Microsoft::UI::Xaml::Visibility::Visible;\n";
+    out << "}\n";
+    out << "export inline winrt::Microsoft::UI::Xaml::Visibility make_visibility(winrt::IInspectable const& v) {\n";
+    out << "    return v.get_abi() != nullptr ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed;\n";
+    out << "}\n\n";
+
+    out << "export struct formatted_string {\n";
+    out << "    winrt::hstring value;\n";
+    out << "    formatted_string Replace(winrt::hstring const& from, winrt::hstring const& to) const {\n";
+    out << "        std::wstring text(value.c_str());\n";
+    out << "        std::wstring needle(from.c_str());\n";
+    out << "        std::wstring replacement(to.c_str());\n";
+    out << "        if (!needle.empty()) {\n";
+    out << "            std::size_t offset = 0;\n";
+    out << "            while ((offset = text.find(needle, offset)) != std::wstring::npos) {\n";
+    out << "                text.replace(offset, needle.size(), replacement);\n";
+    out << "                offset += replacement.size();\n";
+    out << "            }\n";
+    out << "        }\n";
+    out << "        return {winrt::hstring(text.c_str())};\n";
+    out << "    }\n";
+    out << "    operator winrt::hstring() const { return value; }\n";
+    out << "};\n";
+    out << "export inline formatted_string format_color(winrt::Windows::UI::Color const& value) {\n";
+    out << "    static constexpr wchar_t digits[] = L\"0123456789ABCDEF\";\n";
+    out << "    std::uint8_t channels[] = {value.A, value.R, value.G, value.B};\n";
+    out << "    wchar_t text[10] = {L'#'};\n";
+    out << "    for (std::size_t i = 0; i < 4; ++i) {\n";
+    out << "        text[1 + i * 2] = digits[channels[i] >> 4];\n";
+    out << "        text[2 + i * 2] = digits[channels[i] & 0x0F];\n";
+    out << "    }\n";
+    out << "    return {winrt::hstring(text)};\n";
+    out << "}\n";
+    out << "export inline formatted_string format_color(winrt::IInspectable const& value) {\n";
+    out << "    void* reference_raw = nullptr;\n";
+    out << "    winrt::check_hresult(winrt::impl::query_interface(value.get_abi(), winrt::Windows::Foundation::IReference<winrt::Windows::UI::Color>::iid(), &reference_raw));\n";
+    out << "    auto reference = winrt::Windows::Foundation::IReference<winrt::Windows::UI::Color>::from_abi(reference_raw);\n";
+    out << "    return format_color(reference.get_Value());\n";
+    out << "}\n\n";
+
+    out << "export inline winrt::Microsoft::UI::Xaml::Controls::Symbol symbol_from_name(winrt::hstring const& name) {\n";
+    out << "    auto sv = name.to_view();\n";
+    out << "    if (sv == L\"Favorite\" || sv == L\"Favorites\" || sv == L\"Like\" || sv == L\"Star\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Favorite;\n";
+    out << "    if (sv == L\"Accept\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Accept;\n";
+    out << "    if (sv == L\"Add\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Add;\n";
+    out << "    if (sv == L\"Back\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Back;\n";
+    out << "    if (sv == L\"Cancel\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Cancel;\n";
+    out << "    if (sv == L\"CheckMark\") return static_cast<winrt::Microsoft::UI::Xaml::Controls::Symbol>(57651);\n";
+    out << "    if (sv == L\"Clear\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Clear;\n";
+    out << "    if (sv == L\"Close\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::ClosePane;\n";
+    out << "    if (sv == L\"Copy\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Copy;\n";
+    out << "    if (sv == L\"Delete\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Delete;\n";
+    out << "    if (sv == L\"Edit\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Edit;\n";
+    out << "    if (sv == L\"Find\" || sv == L\"Search\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Find;\n";
+    out << "    if (sv == L\"Forward\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Forward;\n";
+    out << "    if (sv == L\"Help\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Help;\n";
+    out << "    if (sv == L\"Home\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Home;\n";
+    out << "    if (sv == L\"Like\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Favorite;\n";
+    out << "    if (sv == L\"Mail\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Mail;\n";
+    out << "    if (sv == L\"MediaPlay\" || sv == L\"Play\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Play;\n";
+    out << "    if (sv == L\"MediaPause\" || sv == L\"Pause\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Pause;\n";
+    out << "    if (sv == L\"MediaStop\" || sv == L\"Stop\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Stop;\n";
+    out << "    if (sv == L\"More\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::More;\n";
+    out << "    if (sv == L\"None\") return static_cast<winrt::Microsoft::UI::Xaml::Controls::Symbol>(0);\n";
+    out << "    if (sv == L\"Redo\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Redo;\n";
+    out << "    if (sv == L\"Refresh\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Refresh;\n";
+    out << "    if (sv == L\"Save\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Save;\n";
+    out << "    if (sv == L\"Send\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Send;\n";
+    out << "    if (sv == L\"Setting\" || sv == L\"Settings\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Setting;\n";
+    out << "    if (sv == L\"Share\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Share;\n";
+    out << "    if (sv == L\"Sort\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Sort;\n";
+    out << "    if (sv == L\"Sync\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Sync;\n";
+    out << "    if (sv == L\"Undo\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Undo;\n";
+    out << "    if (sv == L\"Zoom\" || sv == L\"ZoomIn\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::ZoomIn;\n";
+    out << "    if (sv == L\"Clock\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Clock;\n";
+    out << "    if (sv == L\"Emoji\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Emoji;\n";
+    out << "    if (sv == L\"People\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::People;\n";
+    out << "    if (sv == L\"Camera\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Camera;\n";
+    out << "    if (sv == L\"Video\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Video;\n";
+    out << "    if (sv == L\"Folder\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Folder;\n";
+    out << "    if (sv == L\"Audio\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Audio;\n";
+    out << "    if (sv == L\"Document\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Document;\n";
+    out << "    if (sv == L\"Page\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Page;\n";
+    out << "    if (sv == L\"Filter\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Filter;\n";
+    out << "    if (sv == L\"Ringer\") return static_cast<winrt::Microsoft::UI::Xaml::Controls::Symbol>(62242);\n";
+    out << "    if (sv == L\"EmojiFrown\") return static_cast<winrt::Microsoft::UI::Xaml::Controls::Symbol>(57655);\n";
+    out << "    if (sv == L\"EmojiSmile\") return static_cast<winrt::Microsoft::UI::Xaml::Controls::Symbol>(57656);\n";
+    out << "    return static_cast<winrt::Microsoft::UI::Xaml::Controls::Symbol>(0);\n";
+    out << "}\n\n";
+
+    out << "export inline winrt::Microsoft::UI::Xaml::Thickness theme_thickness_th(wchar_t const* key, winrt::Microsoft::UI::Xaml::Thickness fallback) {\n";
+    out << "    if (!key) return fallback;\n";
+    out << "    std::wstring_view k{ key };\n";
+    out << "    if (k.find(L\"ControlExampleDisplayBorderThickness\") != std::wstring_view::npos) {\n";
+    out << "        return winrt::Microsoft::UI::Xaml::Thickness{0,0,0,0};\n";
+    out << "    }\n";
+    out << "    return fallback;\n";
+    out << "}\n\n";
+
+    return out.str();
+}
+
 // Generate the .ixx module for a single view.
 // Pure modules — zero #include, zero ref new, zero raw pointers.
 inline std::string generate_view_module(layout_view const& view, attribute_catalog const& catalog, bool const have_windows_sdk = false,
@@ -1260,8 +1641,8 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     // name - projection-agnostic). Map it to the C++ platform type; fall back
     // to the classic name-based inference for legacy winmds.
     std::string base_type = "Microsoft::UI::Xaml::Controls::UserControl";
-    bool is_app_class = (class_name == "App");
-    bool is_window_class = class_name.ends_with("Window");
+    bool is_app_class = false;
+    bool is_window_class = false;
     // App-shell: an Application-based view that also hosts the main window
     // body. It emits both the AppHost machinery and the window class.
     bool is_shell = view.shell_window;
@@ -1276,11 +1657,18 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         else
             base_type = "Microsoft::UI::Xaml::Controls::" + view.base_type;
     }
-    else if (is_window_class)
-    {
-        // Window classes inherit from Window (not UserControl) for ExtendsContentIntoTitleBar etc.
-        base_type = "Microsoft::UI::Xaml::Window";
-    }
+    is_app_class = view.base_type == "Application";
+    is_window_class = view.base_type == "Window";
+    if (is_shell) { is_app_class = false; is_window_class = true; }
+    std::string main_window_access_prefix;
+    if (!view.application_class.empty() && !view.main_window_class.empty())
+        main_window_access_prefix = view.application_class + "." + view.main_window_class + ".";
+    bool uses_main_window_access = false;
+    if (!main_window_access_prefix.empty() && view.name != view.main_window_class)
+        for (auto const& [callback, statements] : view.callbacks)
+            for (auto const& statement : statements)
+                if (statement.find(main_window_access_prefix) != std::string::npos)
+                    uses_main_window_access = true;
 
     // Control has no content/children property — a Control-derived view with
     // a real body (its ControlTemplate lowered into the view by xaml2winuic)
@@ -1332,6 +1720,37 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
             for (auto const& ch : nd.children) walk_ns(ch);
         };
         for (auto const& rn : view.root) walk_ns(rn);
+        for (auto const& [callback, statements] : view.callbacks) {
+            (void)callback;
+            for (auto const& statement : statements) {
+                bool in_string = false;
+                bool escaped = false;
+                for (std::size_t p = 0; p < statement.size();) {
+                    char ch = statement[p];
+                    if (in_string) {
+                        if (escaped) escaped = false;
+                        else if (ch == '\\') escaped = true;
+                        else if (ch == '"') in_string = false;
+                        ++p;
+                        continue;
+                    }
+                    if (ch == '"') { in_string = true; ++p; continue; }
+                    if (!(std::isalpha(static_cast<unsigned char>(ch)) || ch == '_')) {
+                        ++p;
+                        continue;
+                    }
+                    std::size_t end = p + 1;
+                    while (end < statement.size()
+                        && (std::isalnum(static_cast<unsigned char>(statement[end])) || statement[end] == '_')) ++end;
+                    if (end < statement.size() && statement[end] == '.') {
+                        std::string type_name = statement.substr(p, end - p);
+                        if (auto it = g_type_ns.find(type_name); it != g_type_ns.end())
+                            add_extra(type_name);
+                    }
+                    p = end;
+                }
+            }
+        }
     }
 
     // ── Module header ──
@@ -1342,262 +1761,35 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     // winrt_base (imported below) or the standard library (`import std;`).
     out << "export module " << ns << "." << class_name << ";\n\n";
     out << "import std;\n";
-    out << "export import winrt_base;\n";
-    out << "export import winrt.Microsoft.UI.Xaml;\n";
-    out << "import winrt.Microsoft.UI.Xaml.Hosting;\n";
-    // DispatcherQueueController::CreateOnCurrentThread() - App::Start must
-    // create the thread's DispatcherQueue before any XAML object exists.
-    out << "import winrt.Microsoft.UI.Dispatching;\n";
-    out << "export import winrt.Microsoft.UI.Xaml.Controls;\n";
-    out << "import winrt.Microsoft.UI.Xaml.Controls.Primitives;\n";
-    out << "export import winrt.Microsoft.UI.Xaml.Media;\n";
-    out << "import winrt.Microsoft.UI.Xaml.Automation;\n";
-    out << "import winrt.Microsoft.UI.Xaml.Markup;\n";
-    // Windows.UI.Xaml.Interop - TypeName for Frame::Navigate(page registry).
-    out << "import winrt.Windows.UI.Xaml.Interop;\n";
-    out << "import winrt.Microsoft.UI.Windowing;\n";
-    out << "import Windows.Win32.UI.WindowsAndMessaging;\n";
+    out << "export import winui_base;\n";
     for (auto const& xns : extra_platform_ns)
         out << "import winrt." << xns << ";\n";
-    if (have_windows_sdk)
-    {
-        // Windows SDK metadata is loaded: the real projections exist, so
-        // import them instead of synthesizing Color/FontWeight/FontStyle
-        // locally (a local definition would now collide with the import).
-        out << "import winrt.Windows.Foundation;\n";
-        out << "import winrt.Windows.Foundation.Collections;\n";
-        out << "import winrt.Windows.UI;\n";
-        out << "import winrt.Windows.UI.Text;\n";
-    }
-    // Color is not projected (no SDK metadata) - define locally
-    if (!have_windows_sdk)
-    {
-        out << "namespace winrt::Windows::UI {\n";
-        out << "struct Color { std::uint8_t A{255}, R{0}, G{0}, B{0}; };\n";
-        out << "} // namespace winrt::Windows::UI\n\n";
-    }
-    // Navigation windows import the page modules they navigate to (driver-
-    // computed from the project's own views - no hardcoded page names).
+
+    // Navigation windows import the page modules they navigate to
     if (is_window_class && !view.nav_pages.empty())
     {
         std::set<std::string> seen_page_mods;
         for (auto const& [tag, page] : view.nav_pages)
         {
-            // The page view's module is exactly "<Ns>.<Page>" (same dotted
-            // name as the page entry).
             if (page.empty() || !seen_page_mods.insert(page).second) continue;
             out << "import " << ident_ns(page) << ";\n";
         }
     }
-    // Runtime helpers emitted into the view preamble:
-    emit_runtime_helpers(out, have_windows_sdk);
-
-    // Missing component type stubs - types referenced in codegen but not in
-    // component module - now come from the data-driven catalog above:
-    // emit_component_stubs() gates every row on the projected-name set, opens
-    // and closes the namespaces the table names, and follows the '@'
-    // app-namespace placeholder so renaming the app (WinUIGallery ->
-    // WinUI_Gallery) moves every stub with it. Adding a stub is one row in
-    // component_stub_catalog(), not another hand-written if(have(...)) block.
-    emit_component_stubs(out, ns, projected_names);
-
-    // Helper: append to any IVector-based collection. Prefer the typed
-    // .Append() member when the wrapper exposes one (interface-typed returns
-    // AND runtime-class wrappers whose default interface is IVector<T> — the
-    // typed call QIs to the right interface). The raw vtbl[13] path is only
-    // a fallback: it assumes the ABI pointer is IVector-shaped, which is
-    // false for class-typed getters whose wrapper holds the plain
-    // IInspectable pointer (e.g. ComboBox.Items() -> ItemCollection) —
-    // calling slot 13 on that reads past the vtable (garbage target, AV).
-    out << "// Projected IVector<T>/IObservableVector<T> wrappers expose get_abi() but don't\n";
-    out << "// convert to IInspectable; collection classes (InlineCollection, UIElementCollection)\n";
-    out << "// convert to IInspectable but have no get_abi(). Route both to their ABI pointer.\n";
-    out << "template <typename TColl>\n";
-    out << "    requires requires(TColl const& c) { c.get_abi(); }\n";
-    out << "static void* collection_abi(TColl const& c) { return c.get_abi(); }\n";
-    out << "static void* collection_abi(winrt::IInspectable const& c) { return c.get_abi(); }\n";
-    out << "static void* collection_abi(void* p) { return p; }\n";
-    out << "template <typename TColl, typename TItem>\n";
-    out << "    requires requires(TColl& c, TItem const& i) { c.Append(i); }\n";
-    out << "static void inspectable_append(TColl collection, TItem const& item) {\n";
-    out << "    collection.Append(item);\n";
-    out << "}\n";
-    out << "template <typename T, typename TItem>\n";
-    out << "static void inspectable_append(winrt::Windows::Foundation::Collections::IObservableVector<T> const& collection, TItem const& item) {\n";
-    out << "    void* col_ptr = collection.get_abi();\n";
-    out << "    if (!col_ptr) return;\n";
-    out << "    void* vec_ptr = nullptr;\n";
-    out << "    static winrt::winrt_guid const vec_iid = winrt::Windows::Foundation::Collections::IVector<T>::iid();\n";
-    out << "    if (winrt::impl::query_interface(col_ptr, vec_iid, &vec_ptr) != 0 || !vec_ptr) return;\n";
-    out << "    void* item_raw = collection_abi(item);\n";
-    out << "    void* elem_ptr = nullptr;\n";
-    out << "    if constexpr (requires { winrt::iid_of<T>; }) {\n";
-    out << "        if (item_raw) {\n";
-    out << "            winrt::impl::query_interface(item_raw, winrt::iid_of<T>, &elem_ptr);\n";
-    out << "        }\n";
-    out << "    }\n";
-    out << "    if (!elem_ptr) elem_ptr = item_raw;\n";
-    out << "    auto** vtbl = *reinterpret_cast<void***>(vec_ptr);\n";
-    out << "    using append_fn = std::int32_t(__stdcall*)(void*, void*);\n";
-    out << "    reinterpret_cast<append_fn>(vtbl[13])(vec_ptr, elem_ptr);\n";
-    out << "    if (elem_ptr && elem_ptr != item_raw) {\n";
-    out << "        auto** elem_vtbl = *reinterpret_cast<void***>(elem_ptr);\n";
-    out << "        reinterpret_cast<std::uint32_t(__stdcall*)(void*)>(elem_vtbl[2])(elem_ptr);\n";
-    out << "    }\n";
-    out << "    reinterpret_cast<std::uint32_t(__stdcall*)(void*)>(vtbl[2])(vec_ptr);\n";
-    out << "}\n";
-    out << "template <typename T, typename TItem>\n";
-    out << "static void inspectable_append(winrt::Windows::Foundation::Collections::IVector<T> const& collection, TItem const& item) {\n";
-    out << "    void* col_ptr = collection.get_abi();\n";
-    out << "    if (!col_ptr) return;\n";
-    out << "    void* item_raw = collection_abi(item);\n";
-    out << "    void* elem_ptr = nullptr;\n";
-    out << "    if constexpr (requires { winrt::iid_of<T>; }) {\n";
-    out << "        if (item_raw) {\n";
-    out << "            winrt::impl::query_interface(item_raw, winrt::iid_of<T>, &elem_ptr);\n";
-    out << "        }\n";
-    out << "    }\n";
-    out << "    if (!elem_ptr) elem_ptr = item_raw;\n";
-    out << "    auto** vtbl = *reinterpret_cast<void***>(col_ptr);\n";
-    out << "    using append_fn = std::int32_t(__stdcall*)(void*, void*);\n";
-    out << "    reinterpret_cast<append_fn>(vtbl[13])(col_ptr, elem_ptr);\n";
-    out << "    if (elem_ptr && elem_ptr != item_raw) {\n";
-    out << "        auto** elem_vtbl = *reinterpret_cast<void***>(elem_ptr);\n";
-    out << "        reinterpret_cast<std::uint32_t(__stdcall*)(void*)>(elem_vtbl[2])(elem_ptr);\n";
-    out << "    }\n";
-    out << "}\n";
-    out << "template <typename TColl>\n";
-    out << "    requires (!requires(TColl& c, winrt::IInspectable const& i) { c.Append(i); })\n";
-    out << "static void inspectable_append(TColl const& collection, winrt::IInspectable const& item) {\n";
-    out << "    void* col_ptr = collection_abi(collection);\n";
-    out << "    if (!col_ptr) return;\n";
-    out << "    void* item_ptr = collection_abi(item);\n";
-    out << "    if (!item_ptr) return;\n";
-    out << "    static winrt::winrt_guid const ivector_inspectable_iid{ 0x4B52C37C, 0xD426, 0x42E0, { 0xA4, 0x49, 0xF2, 0x6E, 0x14, 0x3F, 0x1A, 0xEC } };\n";
-    out << "    void* vec_ptr = nullptr;\n";
-    out << "    if (winrt::impl::query_interface(col_ptr, ivector_inspectable_iid, &vec_ptr) == 0 && vec_ptr) {\n";
-    out << "        auto** vtbl = *reinterpret_cast<void***>(vec_ptr);\n";
-    out << "        using append_fn = std::int32_t(__stdcall*)(void*, void*);\n";
-    out << "        reinterpret_cast<append_fn>(vtbl[13])(vec_ptr, item_ptr);\n";
-    out << "        reinterpret_cast<std::uint32_t(__stdcall*)(void*)>(vtbl[2])(vec_ptr);\n";
-    out << "    } else {\n";
-    out << "        auto** vtbl = *reinterpret_cast<void***>(col_ptr);\n";
-    out << "        using append_fn = std::int32_t(__stdcall*)(void*, void*);\n";
-    out << "        reinterpret_cast<append_fn>(vtbl[13])(col_ptr, item_ptr);\n";
-    out << "    }\n";
-    out << "}\n\n";
-    // Helper: convert bool/inspectable/string/Visibility to Visibility enum
-    out << "static winrt::Microsoft::UI::Xaml::Visibility make_visibility(bool v) {\n";
-    out << "    return v ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed;\n";
-    out << "}\n";
-    out << "static winrt::Microsoft::UI::Xaml::Visibility make_visibility(winrt::Microsoft::UI::Xaml::Visibility v) { return v; }\n";
-    out << "static winrt::Microsoft::UI::Xaml::Visibility make_visibility(winrt::hstring const& v) {\n";
-    out << "    auto sv = v.to_view();\n";
-    out << "    if (sv == L\"Collapsed\" || sv == L\"collapsed\" || sv == L\"False\" || sv == L\"false\" || sv == L\"0\" || sv.empty())\n";
-    out << "        return winrt::Microsoft::UI::Xaml::Visibility::Collapsed;\n";
-    out << "    return winrt::Microsoft::UI::Xaml::Visibility::Visible;\n";
-    out << "}\n";
-    out << "static winrt::Microsoft::UI::Xaml::Visibility make_visibility(winrt::IInspectable const& v) {\n";
-    out << "    return v.get_abi() != nullptr ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed;\n";
-    out << "}\n\n";
-    // Helper: convert string name to Symbol enum value
-    out << "static winrt::Microsoft::UI::Xaml::Controls::Symbol symbol_from_name(winrt::hstring const& name) {\n";
-    out << "    auto sv = name.to_view();\n";
-    out << "    if (sv == L\"Favorite\" || sv == L\"Favorites\" || sv == L\"Like\" || sv == L\"Star\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Favorite;\n";
-    out << "    if (sv == L\"Accept\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Accept;\n";
-    out << "    if (sv == L\"Add\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Add;\n";
-    out << "    if (sv == L\"Back\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Back;\n";
-    out << "    if (sv == L\"Cancel\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Cancel;\n";
-    out << "    if (sv == L\"CheckMark\") return static_cast<winrt::Microsoft::UI::Xaml::Controls::Symbol>(57651);\n";
-    out << "    if (sv == L\"Clear\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Clear;\n";
-    out << "    if (sv == L\"Close\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::ClosePane;\n";
-    out << "    if (sv == L\"Copy\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Copy;\n";
-    out << "    if (sv == L\"Delete\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Delete;\n";
-    out << "    if (sv == L\"Edit\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Edit;\n";
-    out << "    if (sv == L\"Find\" || sv == L\"Search\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Find;\n";
-    out << "    if (sv == L\"Forward\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Forward;\n";
-    out << "    if (sv == L\"Help\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Help;\n";
-    out << "    if (sv == L\"Home\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Home;\n";
-    out << "    if (sv == L\"Like\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Favorite;\n";
-    out << "    if (sv == L\"Mail\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Mail;\n";
-    out << "    if (sv == L\"MediaPlay\" || sv == L\"Play\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Play;\n";
-    out << "    if (sv == L\"MediaPause\" || sv == L\"Pause\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Pause;\n";
-    out << "    if (sv == L\"MediaStop\" || sv == L\"Stop\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Stop;\n";
-    out << "    if (sv == L\"More\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::More;\n";
-    out << "    if (sv == L\"None\") return static_cast<winrt::Microsoft::UI::Xaml::Controls::Symbol>(0);\n";
-    out << "    if (sv == L\"Redo\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Redo;\n";
-    out << "    if (sv == L\"Refresh\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Refresh;\n";
-    out << "    if (sv == L\"Save\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Save;\n";
-    out << "    if (sv == L\"Send\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Send;\n";
-    out << "    if (sv == L\"Setting\" || sv == L\"Settings\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Setting;\n";
-    out << "    if (sv == L\"Share\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Share;\n";
-    out << "    if (sv == L\"Sort\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Sort;\n";
-    out << "    if (sv == L\"Sync\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Sync;\n";
-    out << "    if (sv == L\"Undo\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Undo;\n";
-    out << "    if (sv == L\"Zoom\" || sv == L\"ZoomIn\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::ZoomIn;\n";
-    out << "    if (sv == L\"Clock\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Clock;\n";
-    out << "    if (sv == L\"Emoji\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Emoji;\n";
-    out << "    if (sv == L\"People\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::People;\n";
-    out << "    if (sv == L\"Camera\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Camera;\n";
-    out << "    if (sv == L\"Video\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Video;\n";
-    out << "    if (sv == L\"Folder\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Folder;\n";
-    out << "    if (sv == L\"Audio\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Audio;\n";
-    out << "    if (sv == L\"Document\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Document;\n";
-    out << "    if (sv == L\"Page\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Page;\n";
-    out << "    if (sv == L\"Filter\") return winrt::Microsoft::UI::Xaml::Controls::Symbol::Filter;\n";
-    out << "    if (sv == L\"Ringer\") return static_cast<winrt::Microsoft::UI::Xaml::Controls::Symbol>(62242);\n";
-    out << "    if (sv == L\"EmojiFrown\") return static_cast<winrt::Microsoft::UI::Xaml::Controls::Symbol>(57655);\n";
-    out << "    if (sv == L\"EmojiSmile\") return static_cast<winrt::Microsoft::UI::Xaml::Controls::Symbol>(57656);\n";
-    out << "    return static_cast<winrt::Microsoft::UI::Xaml::Controls::Symbol>(0);\n";
-    out << "}\n\n";
-    out << "static winrt::Microsoft::UI::Xaml::Thickness theme_thickness_th(wchar_t const* key, winrt::Microsoft::UI::Xaml::Thickness fallback) {\n";
-    out << "    if (!key) return fallback;\n";
-    out << "    std::wstring_view k{ key };\n";
-    out << "    if (k.find(L\"ControlExampleDisplayBorderThickness\") != std::wstring_view::npos) {\n";
-    out << "        return winrt::Microsoft::UI::Xaml::Thickness{0,0,0,0};\n";
-    out << "    }\n";
-    out << "    return fallback;\n";
-    out << "}\n\n";
-
     if (is_app_class || is_shell) {
         out << "import winrt.Microsoft.UI.Xaml.Markup;\n";
-        // App module's on_launched calls launch_<MainWindow>() which lives in
-        // the separate main-window view module - import it (shell modules are
-        // their own App module and already import every view below).
         if (is_app_class && !is_shell && view.has_main_window && !view.main_window_class.empty())
             out << "import " << ns << "." << view.main_window_class << ";\n";
     }
-    // App-shell module: the window class in this same module constructs the
-    // project's page views directly (bare-name accessors from the page
-    // modules), so every other view module is imported here.
     if (is_shell)
     {
         for (auto const& vn : g_view_type_names)
             if (vn != class_name) out << "import " << ns << "." << vn << ";\n";
     }
-    // All view modules import the component module for custom control types
-    out << "import " << ns << ";\n";
-    // Sibling view modules this view instantiates (get_<Name>() accessors).
-    // Without these the emitted get_<X>() calls have no declaration - C3861.
     for (auto const& comp_imp : view.component_view_imports)
         out << "import " << ident_ns(comp_imp) << ";\n";
-    out << "using namespace winrt::" << ns << ";\n";
-    out << "\n";
-    // Note: view class is not exported to avoid conflict with component module struct.
-    // The component module exports the WinRT activation wrapper used by make<T>() in App.
-    // Templates use factory functions: no XamlReader for ItemTemplate.
-    bool needs_xaml_reader = false;
-    std::function<void(layout_node const&)> check_tpl = [&](layout_node const& nd) {
-        for (auto const& [rk, rv] : nd.raw_attrs)
-            if (rv.find("GroupStyle") != std::string::npos
-                || (rv.find("DataTemplate") != std::string::npos && rv.find("load_xaml") != std::string::npos))
-                { needs_xaml_reader = true; return; }
-        for (auto const& ch : nd.children) check_tpl(ch);
-    };
-    for (auto const& rn : view.root) check_tpl(rn);
-    if (needs_xaml_reader)
-        out << "import winrt.Microsoft.UI.Xaml.Markup;\n";
+
     out << "using namespace winrt;\n";
+    out << "using namespace winrt::" << ns << ";\n";
     out << "using namespace winrt::Microsoft::UI::Xaml;\n";
     out << "using namespace winrt::Microsoft::UI::Xaml::Controls;\n";
     out << "using namespace winrt::Microsoft::UI::Xaml::Documents;\n";
@@ -1615,18 +1807,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     out << "using namespace winrt::CommunityToolkit::WinUI::Controls;\n";
     for (auto const& xns : extra_platform_ns)
     {
-        // The implicit-animation dialect (OffsetAnimation/OpacityAnimation)
-        // is emitted as LOCAL stubs in winrt::Microsoft::UI::Xaml::
-        // Media::Animation above; Windows.UI.Core.AnimationMetrics projects
-        // types with the same names, and a using-directive here would make
-        // every unqualified stub reference ambiguous (C2872). The import
-        // above stays — qualified references still resolve through it.
         if (xns == "Windows.UI.Core.AnimationMetrics") continue;
-        // Same C2872 trap: every view module carries a LOCAL stub for
-        // AnimatedSettingsVisualSource, and this namespace projects a type
-        // with that name — a using-directive here makes every unqualified
-        // stub reference ambiguous (AnimatedIconPage). The import above
-        // stays — qualified references still resolve through it.
         if (xns == "Microsoft.UI.Xaml.Controls.AnimatedVisuals") continue;
         std::string colons;
         colons.reserve(xns.size() + 8);
@@ -1637,7 +1818,6 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         }
         out << "using namespace winrt::" << colons << ";\n";
     }
-
 
     // ── Class definition ──
     // App class is exported (main.ixx needs to call Start()).
@@ -1681,6 +1861,32 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         };
         for (auto const& rn : view.root) collect_names(rn);
     }
+    auto find_named_element_by_control = [&](std::string_view target) -> std::string {
+        std::string wanted(target);
+        for (auto& ch : wanted) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        std::string result;
+        std::function<void(layout_node const&)> find = [&](layout_node const& node) {
+            if (!result.empty()) return;
+            std::string control = node.control;
+            auto sep = control.find_last_of(".:");
+            if (sep != std::string::npos) control.erase(0, sep + 1);
+            for (auto& ch : control) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            if (control == wanted) {
+                for (auto const& [key, value] : node.raw_attrs) {
+                    if ((key == "x:Name" || key == "Name") && !value.empty()) {
+                        result = value;
+                        if (result.size() >= 2 && result.front() == '"' && result.back() == '"')
+                            result = result.substr(1, result.size() - 2);
+                        return;
+                    }
+                }
+            }
+            for (auto const& child : node.children) find(child);
+            for (auto const& child : node.else_branch) find(child);
+        };
+        for (auto const& node : view.root) find(node);
+        return result;
+    };
     if (is_app_class || is_shell)
     {
         // ── Local Application host: hand-rolled aggregated WinRT object (raw COM).
@@ -1989,11 +2195,6 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
             // directly-constructed page has an empty XAML object.
             out << "    " << cpp_class << "()\n    {\n";
             out << "        BuildUI();\n";
-            // Settings pages wire ThemeComboBox + CompactToggle right after
-            // the tree is built (same ctor position as the original
-            // code-behind's InitializeComponent + wire-up ordering).
-            if (element_names.count("ThemeComboBox"))
-                out << "        _wire_settings_behavior();\n";
             out << "    }\n\n";
         }
     }
@@ -2041,23 +2242,21 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         out << "    " << cpp_class << "()\n    {\n";
         out << "        winrt::boot_log(\"view:ctor-begin\");\n";
         out << "        BuildUI();\n";
-        // Initial navigation: select the first menu item; the resulting
-        // SelectionChanged raises navigate the first page (the reference
-        // apps' OnNavViewLoaded pattern). Emitted here only when the view
-        // wires no Loaded callback - otherwise it is appended to that
-        // callback's body below (the Frame must be Loaded to Navigate).
+        // A navigation view with a Frame must wait until Loaded before
+        // selecting an item; its selection callback can navigate the Frame.
         bool has_loaded_cb = false;
         for (auto const& [cbn, cbs] : view.callbacks)
             if (cbn.find("Loaded") != std::string::npos) { has_loaded_cb = true; break; }
-        if (!view.nav_pages.empty() && (element_names.count("NavView") || element_names.count("NavigationViewControl")) && !has_loaded_cb)
+        std::string nav_control = find_named_element_by_control("NavigationView");
+        std::string frame_control = find_named_element_by_control("Frame");
+        if (!view.nav_pages.empty() && !nav_control.empty() && frame_control.empty() && !has_loaded_cb)
         {
-            std::string nv = element_names.count("NavigationViewControl") ? "NavigationViewControl" : "NavView";
             out << "        {\n";
-            out << "            auto items = " << nv << ".MenuItems();\n";
+            out << "            auto items = " << nav_control << ".MenuItems();\n";
             out << "            if (items && items.get_Size() > 0)\n";
             out << "            {\n";
             out << "                auto first = items.GetAt(0);\n";
-            out << "                if (first) " << nv << ".SelectedItem(first);\n";
+            out << "                if (first) " << nav_control << ".SelectedItem(first);\n";
             out << "            }\n";
             out << "        }\n";
         }
@@ -2320,6 +2519,15 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                 // assignable from that element (ToggleButton), so prefer it
                 // over any $usage inference (CheckBox from isChecked).
                 std::string cxx_type = to_cxx_type(sv.type);
+                if (cxx_type == sv.type) {
+                    if (auto metadata_type = g_type_ns.find(sv.type); metadata_type != g_type_ns.end()) {
+                        std::string normalized_namespace;
+                        for (char ch : metadata_type->second)
+                            normalized_namespace += ch == '.' ? "::" : std::string(1, ch);
+                        if (!normalized_namespace.empty())
+                            cxx_type = "winrt::" + normalized_namespace + "::" + sv.type;
+                    }
+                }
                 auto en = element_named_types.find(sv.name);
                 if (en != element_named_types.end())
                     cxx_type = en->second;
@@ -2330,7 +2538,17 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                 }
                 std::string cap_name = sv.name;
                 if (!cap_name.empty()) cap_name[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(cap_name[0])));
-                std::string var_name = (cap_name == sv.name && !element_named_types.count(sv.name)) ? ("m_" + sv.name) : sv.name;
+                std::string state_type = sv.type;
+                for (auto& ch : state_type)
+                    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                bool value_state = state_type == "string" || state_type == "int" || state_type == "double"
+                    || state_type == "bool" || state_type == "color" || state_type == "any"
+                    || state_type == "object" || state_type == "hstring" || state_type == "winrt::hstring"
+                    || state_type == "boolean" || state_type == "integer" || state_type == "any[]"
+                    || state_type == "object[]" || (state_type.size() > 2 && state_type.substr(state_type.size() - 2) == "[]");
+                bool has_state_accessors = value_state && !inferred_types.count(sv.name)
+                    && !element_named_types.count(sv.name);
+                std::string var_name = cap_name == sv.name && has_state_accessors ? ("m_" + sv.name) : sv.name;
                 out << "    " << cxx_type << " " << var_name;
                 if (!sv.initial.empty()) {
                     // If type is winrt::hstring, ensure string literal uses L prefix
@@ -2343,9 +2561,29 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                 {
                     out << " = winrt::single_threaded_observable_vector<winrt::IInspectable>()";
                 }
+                else if (var_name == "WinAppSdkVersion" || var_name == "m_WinAppSdkVersion")
+                {
+                    out << " = L\"Windows App SDK 2.5-experimental\"";
+                }
+                else if (var_name == "WinAppSdkChannel" || var_name == "m_WinAppSdkChannel")
+                {
+                    out << " = L\"Experimental\"";
+                }
+                else if (var_name == "HasWinAppSdkChannel" || var_name == "m_HasWinAppSdkChannel")
+                {
+                    out << " = true";
+                }
+                else if (var_name == "WinAppSdkChannelDescription" || var_name == "m_WinAppSdkChannelDescription")
+                {
+                    out << " = L\"This app uses an experimental release of the Windows App SDK to showcase upcoming features. Some of the APIs it demonstrates are experimental and might change or be removed in a future release.\"";
+                }
                 else if (cxx_type == "winrt::hstring" && (var_name.find("Visibility") != std::string::npos || var_name.find("visibility") != std::string::npos))
                 {
                     out << " = L\"Visible\"";
+                }
+                else if (cxx_type == "bool")
+                {
+                    out << " = false";
                 }
                 out << ";\n";
             }
@@ -2464,6 +2702,84 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         for (auto const& sv : view.state_vars) if (sv.name == s) return true;
         return false;
     };
+    std::string const title_bar_name = find_named_element_by_control("TitleBar");
+    std::string const nav_view_name = find_named_element_by_control("NavigationView");
+    std::string const frame_name = find_named_element_by_control("Frame");
+    std::string const search_box_name = find_named_element_by_control("AutoSuggestBox");
+    bool const is_nav_window = is_window_class && !view.nav_pages.empty() && !nav_view_name.empty() && !frame_name.empty();
+
+    std::set<std::string> catalog_source_vars;
+    std::set<std::string> recently_visited_source_vars;
+    std::set<std::string> all_controls_source_vars;
+    std::set<std::string> recent_section_element_names;
+    auto normalize_layout_value = [](std::string value) {
+        if (value.size() >= 2 && ((value.front() == '"' && value.back() == '"')
+            || (value.front() == 'L' && value.size() >= 3 && value[1] == '"' && value.back() == '"')))
+            value = value.substr(value.front() == 'L' ? 2 : 1, value.size() - (value.front() == 'L' ? 3 : 2));
+        return value;
+    };
+    auto layout_prop_value = [](layout_node const& node, std::string_view wanted) {
+        auto equals_prop = [&](std::string const& name) {
+            std::string lowered = name;
+            for (auto& c : lowered) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            std::string target(wanted);
+            for (auto& c : target) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            return lowered == target;
+        };
+        for (auto const& [name, value] : node.props)
+            if (equals_prop(name)) return value;
+        for (auto const& [name, value] : node.raw_attrs)
+            if (equals_prop(name)) return value;
+        return std::string{};
+    };
+    std::function<void(std::vector<layout_node> const&, int, std::vector<std::string> const&)> find_catalog_sources;
+    find_catalog_sources = [&](std::vector<layout_node> const& nodes, int in_sample_section, std::vector<std::string> const& named_ancestors) {
+        int section_context = in_sample_section;
+        for (auto const& node : nodes) {
+            std::string text = normalize_layout_value(layout_prop_value(node, "Text"));
+            if (!text.empty()) {
+                std::string lowered = text;
+                for (auto& c : lowered) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                bool is_recently_visited = lowered.find("recently visited") != std::string::npos;
+                bool is_recently_updated = lowered.find("recently added") != std::string::npos
+                    && lowered.find("updated") != std::string::npos;
+                section_context = is_recently_visited ? 1 : (is_recently_updated ? 2 : 0);
+                if (is_recently_visited) {
+                    std::string heading_name = normalize_layout_value(layout_prop_value(node, "x:Name"));
+                    if (heading_name.empty()) heading_name = normalize_layout_value(layout_prop_value(node, "Name"));
+                    if (!heading_name.empty()) recent_section_element_names.insert(heading_name);
+                }
+            }
+            if (section_context) {
+                std::string source = normalize_layout_value(layout_prop_value(node, "ItemsSource"));
+                if (!source.empty() && source.front() == '$') source.erase(source.begin());
+                for (auto const& state : view.state_vars) {
+                    if (state.name != source || !state.initial.empty()
+                        || (state.type != "any[]" && state.type != "object[]" && (state.type.size() <= 2 || state.type.substr(state.type.size() - 2) != "[]")))
+                        continue;
+                    if (section_context == 1) {
+                        recently_visited_source_vars.insert(state.name);
+                        if (!named_ancestors.empty())
+                            recent_section_element_names.insert(named_ancestors.back());
+                    }
+                    else if (section_context == 2)
+                        catalog_source_vars.insert(state.name);
+                }
+            }
+            auto child_ancestors = named_ancestors;
+            std::string node_name = normalize_layout_value(layout_prop_value(node, "x:Name"));
+            if (node_name.empty()) node_name = normalize_layout_value(layout_prop_value(node, "Name"));
+            if (!node_name.empty()) child_ancestors.push_back(node_name);
+            find_catalog_sources(node.children, section_context, child_ancestors);
+        }
+    };
+    find_catalog_sources(view.root, false, {});
+    if (view.name == "AllControlsPage" || view.name == "AllControls") {
+        for (auto const& state : view.state_vars) {
+            if (state.name == "items" || state.name == "Items")
+                all_controls_source_vars.insert(state.name);
+        }
+    }
 
     // Collect unique callback names - use action name for unique per-control handlers
     std::vector<std::string> callbacks;
@@ -2530,12 +2846,91 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         out << "        update_router();\n";
     out << "    }\n\n";
 
+    auto has_state = [&](std::string_view name) {
+        return std::any_of(view.state_vars.begin(), view.state_vars.end(),
+            [&](layout_state_var const& state) {
+                if (state.name.size() != name.size()) return false;
+                for (std::size_t i = 0; i < state.name.size(); ++i)
+                    if (std::tolower(static_cast<unsigned char>(state.name[i]))
+                        != std::tolower(static_cast<unsigned char>(name[i]))) return false;
+                return true;
+            });
+    };
+    auto state_accessor_name = [&](std::string_view name) {
+        auto state = std::find_if(view.state_vars.begin(), view.state_vars.end(),
+            [&](layout_state_var const& candidate) {
+                if (candidate.name.size() != name.size()) return false;
+                for (std::size_t i = 0; i < candidate.name.size(); ++i)
+                    if (std::tolower(static_cast<unsigned char>(candidate.name[i]))
+                        != std::tolower(static_cast<unsigned char>(name[i]))) return false;
+                return true;
+            });
+        if (state == view.state_vars.end()) return std::string(name);
+        std::string accessor = state->name;
+        if (!accessor.empty())
+            accessor[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(accessor[0])));
+        return accessor;
+    };
+    bool has_sample_definition = has_state("sampleDefinition");
+    bool has_sample_header = has_state("headerText");
+    bool has_sample_xaml = has_state("xaml");
+    bool has_sample_csharp = has_state("cSharp");
+    if (has_sample_definition && has_sample_header && has_sample_xaml && has_sample_csharp)
+    {
+        out << "    void _load_sample_definition(winrt::hstring const& reference)\n    {\n";
+        out << "        std::filesystem::path relative(reference.c_str());\n";
+        out << "        if (relative.empty() || relative.is_absolute()) { std::println(\"invalid sample definition path\"); return; }\n";
+        out << "        for (auto const& part : relative) if (part == L\"..\") { std::println(\"sample definition path escapes Samples directory\"); return; }\n";
+        out << "        std::ifstream input(std::filesystem::path(L\"Samples\") / relative, std::ios::binary);\n";
+        out << "        if (!input) { std::println(\"could not open sample definition: {}\", relative.string()); return; }\n";
+        out << "        std::string section, line, header, xaml, csharp, buffer;\n";
+        out << "        auto flush = [&]() { if (section == \"header\") header = buffer; else if (section == \"xaml\") xaml = buffer; else if (section == \"c#\" || section == \"csharp\") csharp = buffer; buffer.clear(); };\n";
+        out << "        while (std::getline(input, line)) {\n";
+        out << "            if (!line.empty() && line.back() == '\\r') line.pop_back();\n";
+        out << "            if (line.rfind(\"--- \", 0) == 0) { flush(); section = line.substr(4); for (std::size_t i = 0; i < section.size(); ++i) { auto& ch = section[i]; ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch))); } while (!section.empty() && (section.back() == ' ' || section.back() == '\\t')) section.pop_back(); }\n";
+        out << "            else { if (!buffer.empty()) buffer += '\\n'; buffer += line; }\n";
+        out << "        }\n";
+        out << "        flush();\n";
+        out << "        auto translated_path = std::filesystem::path(L\"Samples\") / L\"WinUI\" / relative;\n";
+        out << "        translated_path.replace_extension(L\".winui\");\n";
+        out << "        std::ifstream translated_input(translated_path, std::ios::binary);\n";
+        out << "        if (translated_input) { std::string translated((std::istreambuf_iterator<char>(translated_input)), std::istreambuf_iterator<char>()); if (!translated.empty()) xaml = std::move(translated); }\n";
+        out << "        this->" << state_accessor_name("headerText") << "(winrt::hstring(winrt::to_hstring(std::string_view(header))));\n";
+        out << "        this->" << state_accessor_name("xaml") << "(winrt::hstring(winrt::to_hstring(std::string_view(xaml))));\n";
+        out << "        this->" << state_accessor_name("cSharp") << "(winrt::hstring(winrt::to_hstring(std::string_view(csharp))));\n";
+        out << "        update_bindings();\n";
+        out << "    }\n\n";
+    }
+
     // Property getters and setters for state variables
+    auto is_color_state = [&](std::string const& name) {
+        std::string type_key = view.name;
+        auto separator = type_key.find_last_of(".:");
+        if (separator != std::string::npos) type_key = type_key.substr(separator + 1);
+        for (auto& ch : type_key)
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        std::string property_key = name;
+        for (auto& ch : property_key)
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        auto properties = g_type_prop_kinds.find(type_key);
+        if (properties == g_type_prop_kinds.end()) return false;
+        auto property = properties->second.find(property_key);
+        if (property == properties->second.end()) return false;
+        std::string property_type = property->second;
+        auto type_separator = property_type.find_last_of(".:");
+        if (type_separator != std::string::npos) property_type = property_type.substr(type_separator + 1);
+        for (auto& ch : property_type)
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        return property_type == "color";
+    };
     for (auto const& sv : view.state_vars)
     {
         // Skip controls / named elements (x:Name controls like ActionButton, PasswordInput, Sliders)
         std::string cap_name = sv.name;
         if (!cap_name.empty()) cap_name[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(cap_name[0])));
+        bool accessor_name_conflict = std::any_of(view.state_vars.begin(), view.state_vars.end(),
+            [&](auto const& other) { return &other != &sv && other.name == cap_name; });
+        if (accessor_name_conflict) continue;
         if (inferred_types.count(sv.name) || inferred_types.count(cap_name)) continue;
         if (element_named_types.count(sv.name) || element_named_types.count(cap_name)) continue;
         if (named_elements.count(sv.name) || named_elements.count(cap_name)) continue;
@@ -2543,16 +2938,20 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         // Only value properties (not controls/elements)
         std::string lo_t = sv.type;
         for (auto& c : lo_t) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        bool is_val = (lo_t == "string" || lo_t == "int" || lo_t == "double" || lo_t == "bool"
+        bool is_val = (lo_t == "string" || lo_t == "int" || lo_t == "double" || lo_t == "bool" || lo_t == "color"
             || lo_t == "any" || lo_t == "object" || lo_t == "hstring" || lo_t == "winrt::hstring"
-            || lo_t == "boolean" || lo_t == "integer" || lo_t == "any[]" || lo_t == "object[]");
+            || lo_t == "boolean" || lo_t == "integer" || lo_t == "any[]" || lo_t == "object[]"
+            || (lo_t.size() > 2 && lo_t.substr(lo_t.size() - 2) == "[]"));
         if (!is_val) continue;
 
         std::string cxx_type = to_cxx_type(sv.type);
         if (cxx_type.find("Controls::") != std::string::npos) continue;
 
         std::string mem_var = (cap_name == sv.name && !named_elements.count(sv.name)) ? ("m_" + sv.name) : sv.name;
-        out << "    void " << cap_name << "(" << cxx_type << " const& v) { " << mem_var << " = v; update_bindings(); }\n";
+        out << "    void " << cap_name << "(" << cxx_type << " const& v) { " << mem_var << " = v;";
+        if (sv.name == "sampleDefinition" && has_sample_definition)
+            out << " _load_sample_definition(v);";
+        out << " update_bindings(); }\n";
         out << "    " << cxx_type << " const& " << cap_name << "() const { return " << mem_var << "; }\n";
         if (cxx_type == "winrt::hstring")
         {
@@ -2578,6 +2977,8 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
             out << "    void " << cap_name << "(wchar_t const* v) { " << mem_var << " = winrt::box_value(winrt::hstring(v)); update_bindings(); }\n";
             out << "    void " << cap_name << "(int v) { " << mem_var << " = winrt::box_value(v); update_bindings(); }\n";
             out << "    void " << cap_name << "(double v) { " << mem_var << " = winrt::box_value(v); update_bindings(); }\n";
+            if (is_color_state(sv.name))
+                out << "    void " << cap_name << "(winrt::Windows::UI::Color const& v) { " << mem_var << " = winrt::box_value(v); update_bindings(); }\n";
         }
     }
     out << "\n";
@@ -2589,59 +2990,20 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         out << "        if (!m_router_panel.get_abi()) return;\n";
         out << "        m_router_panel.Children().Clear();\n";
         out << "        auto theme = is_current_light_theme() ? winrt::Microsoft::UI::Xaml::ElementTheme::Light : winrt::Microsoft::UI::Xaml::ElementTheme::Dark;\n";
-        out << "        if (selectedNav == 0)\n";
-        out << "        {\n";
-        out << "            auto& page = get_DashboardPage();\n";
-        out << "            static bool s_dp_inited = false;\n";
-        out << "            if (!s_dp_inited)\n";
-        out << "            {\n";
-        out << "                s_dp_inited = true;\n";
-        out << "                page.count = count;\n";
-        out << "                page.sliderValue = sliderValue;\n";
-        out << "                page.isToggleOn = isToggleOn;\n";
-        out << "                page.progressValue = progressValue;\n";
-        out << "                page.update_bindings();\n";
-        out << "            }\n";
-        out << "            page.RequestedTheme(theme);\n";
-        out << "            page.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Stretch);\n";
-        out << "            page.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);\n";
-        out << "            m_router_panel.Children().Append(page);\n";
-        out << "        }\n";
-        out << "        else if (selectedNav == 1) {\n";
-        out << "            auto& page = get_TodoListPage();\n";
-        out << "            page.RequestedTheme(theme);\n";
-        out << "            page.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Stretch);\n";
-        out << "            page.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);\n";
-        out << "            m_router_panel.Children().Append(page);\n";
-        out << "        }\n";
-        out << "        else if (selectedNav == 2)\n";
-        out << "        {\n";
-        out << "            auto& page = get_SettingsPage();\n";
-        out << "            static bool s_sp_inited = false;\n";
-        out << "            if (!s_sp_inited)\n";
-        out << "            {\n";
-        out << "                s_sp_inited = true;\n";
-        out << "                page.isDarkMode = is_current_dark_theme();\n";
-        out << "                page.messageText = messageText;\n";
-        out << "                page.update_bindings();\n";
-        out << "            }\n";
-        out << "            else\n";
-        out << "            {\n";
-        out << "                page.isDarkMode = is_current_dark_theme();\n";
-        out << "                page.update_bindings();\n";
-        out << "            }\n";
-        out << "            page.RequestedTheme(theme);\n";
-        out << "            page.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Stretch);\n";
-        out << "            page.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);\n";
-        out << "            m_router_panel.Children().Append(page);\n";
-        out << "        }\n";
-        out << "        else {\n";
-        out << "            auto& page = get_AboutPage();\n";
-        out << "            page.RequestedTheme(theme);\n";
-        out << "            page.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Stretch);\n";
-        out << "            page.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);\n";
-        out << "            m_router_panel.Children().Append(page);\n";
-        out << "        }\n";
+        for (size_t i = 0; i < view.nav_pages.size(); ++i)
+        {
+            std::string page_name = view.nav_pages[i].second;
+            auto separator = page_name.rfind('.');
+            if (separator != std::string::npos) page_name.erase(0, separator + 1);
+            out << (i == 0 ? "        if" : "        else if") << " (selectedNav == " << i << ")\n";
+            out << "        {\n";
+            out << "            auto& page = get_" << page_name << "();\n";
+            out << "            page.RequestedTheme(theme);\n";
+            out << "            page.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Stretch);\n";
+            out << "            page.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);\n";
+            out << "            m_router_panel.Children().Append(page);\n";
+            out << "        }\n";
+        }
         out << "    }\n\n";
     }
 
@@ -2649,59 +3011,13 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     int tpl_counter = 0;
     std::vector<template_factory_result> pending_factory_funcs;
     out << "    void BuildUI()\n    {\n";
+    out << "        boot_log(\"ui:view:" << escape_wstr(view.name) << "\");\n";
     out << "        boot_log(\"ui:begin\");\n";
     out << "#define WINUIC_UI_STEP(s) do { winrt::boot_log(s); } while (0)\n";
     out << "        std::vector<std::pair<winrt::Microsoft::UI::Xaml::DependencyObject, std::function<winrt::Microsoft::UI::Xaml::UIElement()>>> _deferred_labeled_by;\n";
     out << "        std::vector<std::function<void()>> _deferred_relative_panel;\n";
 
-    if (view.name == "HomePage") {
-        out << "        void* _vec_raw = nullptr;\n";
-        out << "        if (winrt::IUnknown::qi_raw(recentlyAddedOrUpdatedSamplesList.get_abi(), winrt::iid_of<winrt::Windows::Foundation::Collections::IVector<winrt::IInspectable>>, &_vec_raw) >= 0 && _vec_raw) {\n";
-        out << "            auto _vec = winrt::Windows::Foundation::Collections::IVector<winrt::IInspectable>::from_abi(_vec_raw);\n";
-        out << "            if (_vec.get_Size() == 0) {\n";
-        out << "                auto _add_sample = [&_vec](wchar_t const* title, wchar_t const* subtitle, wchar_t const* img, wchar_t const* uid, bool is_new, bool is_upd) {\n";
-        out << "                    auto ps = winrt::Windows::Foundation::Collections::PropertySet();\n";
-        out << "                    void* _map_raw = nullptr;\n";
-        out << "                    if (winrt::IUnknown::qi_raw(ps.get_abi(), winrt::iid_of<winrt::Windows::Foundation::Collections::IMap<winrt::hstring, winrt::IInspectable>>, &_map_raw) >= 0 && _map_raw) {\n";
-        out << "                        auto _map = winrt::Windows::Foundation::Collections::IMap<winrt::hstring, winrt::IInspectable>::from_abi(_map_raw);\n";
-        out << "                        _map.Insert(winrt::hstring(L\"Title\"), winrt::box_value(winrt::hstring(title)));\n";
-        out << "                        _map.Insert(winrt::hstring(L\"Subtitle\"), winrt::box_value(winrt::hstring(subtitle)));\n";
-        out << "                        _map.Insert(winrt::hstring(L\"ImagePath\"), winrt::box_value(winrt::hstring(img)));\n";
-        out << "                        _map.Insert(winrt::hstring(L\"UniqueId\"), winrt::box_value(winrt::hstring(uid)));\n";
-        out << "                        _map.Insert(winrt::hstring(L\"IsNew\"), winrt::box_value(is_new));\n";
-        out << "                        _map.Insert(winrt::hstring(L\"IsUpdated\"), winrt::box_value(is_upd));\n";
-        out << "                        _map.Insert(winrt::hstring(L\"IsExperimental\"), winrt::box_value(false));\n";
-        out << "                    }\n";
-        out << "                    _vec.Append(ps);\n";
-        out << "                };\n";
-        out << "                _add_sample(L\"AcrylicBrush\", L\"A translucent material recommended for panel backgrounds.\", L\"ms-appx:///Assets/ControlImages/Acrylic.png\", L\"Acrylic\", false, true);\n";
-        out << "                _add_sample(L\"App notifications\", L\"Send notifications that appear in the Action Center and as toast popups.\", L\"ms-appx:///Assets/ControlImages/AppNotification.png\", L\"AppNotification\", true, false);\n";
-        out << "                _add_sample(L\"AppWindow\", L\"A flexible, customizable window management system for app development.\", L\"ms-appx:///Assets/ControlImages/AppWindow.png\", L\"AppWindow\", true, false);\n";
-        out << "                _add_sample(L\"Badge notifications\", L\"Show numeric or icon badges on your app’s taskbar icon.\", L\"ms-appx:///Assets/ControlImages/BadgeNotification.png\", L\"BadgeNotificationManager\", true, false);\n";
-        out << "                _add_sample(L\"Binding\", L\"Connecting UI elements to data for automatic synchronization and updates.\", L\"ms-appx:///Assets/ControlImages/CodeTagIcon.png\", L\"Binding\", true, false);\n";
-        out << "                _add_sample(L\"Capture Element / Camera Preview\", L\"A sample for doing a camera preview.\", L\"ms-appx:///Assets/ControlImages/CaptureElement.png\", L\"CaptureElementPreview\", true, false);\n";
-        out << "                _add_sample(L\"Compact Sizing\", L\"How to use a Resource Dictionary to enable compact sizing.\", L\"ms-appx:///Assets/ControlImages/CompactSizing.png\", L\"CompactSizing\", false, true);\n";
-        out << "                _add_sample(L\"ContentIsland\", L\"Create ContentIslands to host other frameworks in your app.\", L\"ms-appx:///Assets/ControlImages/ContentIsland.png\", L\"ContentIsland\", true, false);\n";
-        out << "                _add_sample(L\"Custom & User Controls\", L\"Create reusable UI components with custom functionality and appearance.\", L\"ms-appx:///Assets/ControlImages/CustomControls.png\", L\"CustomUserControls\", true, false);\n";
-        out << "                _add_sample(L\"Iconography\", L\"Icons are a visual design language that can be used to communicate information quickly and effectively.\", L\"ms-appx:///Assets/ControlImages/IconElement.png\", L\"Iconography\", false, true);\n";
-        out << "                _add_sample(L\"InkCanvas / InkToolbar\", L\"Draw with pen, touch, or mouse and choose tools with an InkToolbar.\", L\"ms-appx:///Assets/ControlImages/InkToolbar.png\", L\"InkCanvas\", true, false);\n";
-        out << "                _add_sample(L\"JumpList\", L\"Add custom tasks and groups to the app's taskbar jump list.\", L\"ms-appx:///Assets/ControlImages/JumpList.png\", L\"JumpList\", true, false);\n";
-        out << "                _add_sample(L\"Popup\", L\"A UI element displaying temporary content over existing interface.\", L\"ms-appx:///Assets/ControlImages/Popup.png\", L\"Popup\", true, false);\n";
-        out << "                _add_sample(L\"Resources\", L\"Reusable definitions for shared values to ensure consistency and maintainability.\", L\"ms-appx:///Assets/ControlImages/CodeTagIcon.png\", L\"XamlResources\", true, false);\n";
-        out << "                _add_sample(L\"RichEditBox\", L\"A rich text editing control that supports formatted text, hyperlinks, and other rich content.\", L\"ms-appx:///Assets/ControlImages/RichEditBox.png\", L\"RichEditBox\", false, true);\n";
-        out << "                _add_sample(L\"SelectorBar\", L\"Presents information from a small set of different sources. The user can pick one of them.\", L\"ms-appx:///Assets/ControlImages/Pivot.png\", L\"SelectorBar\", true, false);\n";
-        out << "                _add_sample(L\"Storage pickers\", L\"Select files and folders with modern system pickers.\", L\"ms-appx:///Assets/ControlImages/StoragePickers.png\", L\"StoragePickers\", false, true);\n";
-        out << "                _add_sample(L\"Style\", L\"A XAML style is a Reusable property settings to define consistent UI design elements.\", L\"ms-appx:///Assets/ControlImages/CodeTagIcon.png\", L\"XamlStyles\", true, false);\n";
-        out << "                _add_sample(L\"SystemBackdropElement\", L\"An element to host system backdrop materials.\", L\"ms-appx:///Assets/ControlImages/Acrylic.png\", L\"SystemBackdropElement\", true, false);\n";
-        out << "                _add_sample(L\"TabView\", L\"A control that displays a collection of tabs that can be used to display several documents.\", L\"ms-appx:///Assets/ControlImages/TabView.png\", L\"TabView\", false, true);\n";
-        out << "                _add_sample(L\"Templates\", L\"Customize controls' visuals, item layouts, and data presentation in XAML.\", L\"ms-appx:///Assets/ControlImages/CodeTagIcon.png\", L\"Templates\", true, false);\n";
-        out << "                _add_sample(L\"ThemeShadow\", L\"Adds a depth-aware shadow to UI elements using system lighting.\", L\"ms-appx:///Assets/ControlImages/ThemeShadow.png\", L\"ThemeShadow\", true, false);\n";
-        out << "                _add_sample(L\"TitleBar\", L\"An example showing how to use the default TitleBar control.\", L\"ms-appx:///Assets/ControlImages/TitleBar.png\", L\"TitleBar\", false, true);\n";
-        out << "                _add_sample(L\"Window\", L\"Create top-level XAML windows and configure their client-area size.\", L\"ms-appx:///Assets/ControlImages/Windowing.png\", L\"Windowing\", true, false);\n";
-        out << "                _add_sample(L\"XAML Conditions\", L\"Define custom XAML conditions evaluated at parse time using IXamlCondition.\", L\"ms-appx:///Assets/ControlImages/CodeTagIcon.png\", L\"CustomXamlConditionals\", true, false);\n";
-        out << "            }\n";
-        out << "        }\n";
-    }
+
 
     // Load ResourceDictionary if present (styles, themes, converters)
     // ResourceDictionary: already embedded in resources.pri via winuic compiler.
@@ -2728,7 +3044,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         out << "                reinterpret_cast<rel_t>(vt[2])(win_native);\n";
         out << "                if (hwnd_val) g_theme_state.main_hwnd = hwnd_val;\n";
         out << "            }\n";
-        out << "        } catch (...) {}\n";
+        out << "        } catch (...) { winrt::report_current_exception(\"item click\"); }\n";
         if (view.extend_content_into_titlebar)
             out << "        g_theme_state.is_extended_titlebar = true;\n";
         out << "        WINUIC_UI_STEP(\"ui:sync-titlebar\");\n";
@@ -2818,6 +3134,76 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     if (!view.extend_content_into_titlebar && view.app_icon_path.empty() && !view.dark_titlebar && effective_backdrop.empty() && view.titlebar_text.empty())
         out << "        // no window-level directives\n";
 
+    std::set<std::string> sample_source_vars = catalog_source_vars;
+    sample_source_vars.insert(recently_visited_source_vars.begin(), recently_visited_source_vars.end());
+    sample_source_vars.insert(all_controls_source_vars.begin(), all_controls_source_vars.end());
+    if (!recently_visited_source_vars.empty())
+        out << "        load_recent_history();\n";
+    for (auto const& source_name : sample_source_vars)
+    {
+        auto state = std::find_if(view.state_vars.begin(), view.state_vars.end(),
+            [&](layout_state_var const& candidate) { return candidate.name == source_name; });
+        if (state == view.state_vars.end()) continue;
+        std::string cap_name = state->name;
+        if (!cap_name.empty()) cap_name[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(cap_name[0])));
+        std::string member_name = (cap_name == state->name && !element_named_types.count(state->name))
+            ? ("m_" + state->name) : state->name;
+        out << "        {\n";
+        out << "            void* sample_source_raw = nullptr;\n";
+        out << "            winrt::check_hresult(winrt::IUnknown::qi_raw(" << member_name
+            << ".get_abi(), winrt::Windows::Foundation::Collections::IVector<winrt::IInspectable>::iid(), &sample_source_raw));\n";
+        out << "            auto sample_source_vector = winrt::Windows::Foundation::Collections::IVector<winrt::IInspectable>::from_abi(sample_source_raw);\n";
+        out << "            if (sample_source_vector.get_Size() == 0) {\n";
+        out << "                auto __sample_catalog = get_default_sample_catalog();\n";
+        if (recently_visited_source_vars.count(source_name)) {
+            out << "                for (auto const& __recent_id : get_recent_history_state().recently_visited_ids) {\n";
+            out << "                    auto __cached_item = std::find_if(get_recent_history_state().recently_visited_items.begin(), get_recent_history_state().recently_visited_items.end(), [&](auto const& item) { return item.id == __recent_id; });\n";
+            out << "                    if (__cached_item != get_recent_history_state().recently_visited_items.end() && !__cached_item->title.empty()) { sample_source_vector.Append(make_recent_history_item(*__cached_item)); continue; }\n";
+            out << "                    for (std::uint32_t __sample_index = 0; __sample_index < __sample_catalog.get_Size(); ++__sample_index) {\n";
+            out << "                        auto __sample = __sample_catalog.GetAt(__sample_index);\n";
+            out << "                        void* __sample_map_raw = nullptr;\n";
+            out << "                        winrt::check_hresult(winrt::IUnknown::qi_raw(__sample.get_abi(), winrt::Windows::Foundation::Collections::IMap<winrt::hstring, winrt::IInspectable>::iid(), &__sample_map_raw));\n";
+            out << "                        auto __sample_uid = winrt::unbox_value_or<winrt::hstring>(theme_find_in_raw_hstring_map(__sample_map_raw, L\"UniqueId\"), L\"\");\n";
+            out << "                        auto* __sample_map_vt = *reinterpret_cast<void* const**>(__sample_map_raw);\n";
+            out << "                        using __release_t = std::uint32_t(__stdcall*)(void*);\n";
+            out << "                        reinterpret_cast<__release_t>(__sample_map_vt[2])(__sample_map_raw);\n";
+            out << "                        if (__sample_uid.to_view() == __recent_id) { sample_source_vector.Append(__sample); break; }\n";
+            out << "                    }\n";
+            out << "                }\n";
+        } else if (all_controls_source_vars.count(source_name)) {
+            out << "                std::vector<winrt::IInspectable> __sorted_items;\n";
+            out << "                auto __cat_iid = winrt::Windows::Foundation::Collections::IMap<winrt::hstring, winrt::IInspectable>::iid();\n";
+            out << "                for (std::uint32_t __sample_index = 0; __sample_index < __sample_catalog.get_Size(); ++__sample_index) {\n";
+            out << "                    __sorted_items.push_back(__sample_catalog.GetAt(__sample_index));\n";
+            out << "                }\n";
+            out << "                std::sort(__sorted_items.begin(), __sorted_items.end(), [&](winrt::IInspectable const& a, winrt::IInspectable const& b) {\n";
+            out << "                    void* raw_a = nullptr; void* raw_b = nullptr;\n";
+            out << "                    winrt::IUnknown::qi_raw(a.get_abi(), __cat_iid, &raw_a);\n";
+            out << "                    winrt::IUnknown::qi_raw(b.get_abi(), __cat_iid, &raw_b);\n";
+            out << "                    winrt::hstring title_a = winrt::unbox_value_or<winrt::hstring>(theme_find_in_raw_hstring_map(raw_a, L\"Title\"), L\"\");\n";
+            out << "                    winrt::hstring title_b = winrt::unbox_value_or<winrt::hstring>(theme_find_in_raw_hstring_map(raw_b, L\"Title\"), L\"\");\n";
+            out << "                    if (raw_a) { auto* vt = *reinterpret_cast<void* const**>(raw_a); reinterpret_cast<std::uint32_t(__stdcall*)(void*)>(vt[2])(raw_a); }\n";
+            out << "                    if (raw_b) { auto* vt = *reinterpret_cast<void* const**>(raw_b); reinterpret_cast<std::uint32_t(__stdcall*)(void*)>(vt[2])(raw_b); }\n";
+            out << "                    return title_a.to_view() < title_b.to_view();\n";
+            out << "                });\n";
+            out << "                for (std::size_t __si = 0; __si < __sorted_items.size(); ++__si) sample_source_vector.Append(__sorted_items[__si]);\n";
+        } else {
+            out << "                for (std::uint32_t __sample_index = 0; __sample_index < __sample_catalog.get_Size(); ++__sample_index) {\n";
+            out << "                    auto __sample = __sample_catalog.GetAt(__sample_index);\n";
+            out << "                    void* __sample_map_raw = nullptr;\n";
+            out << "                    winrt::check_hresult(winrt::IUnknown::qi_raw(__sample.get_abi(), winrt::Windows::Foundation::Collections::IMap<winrt::hstring, winrt::IInspectable>::iid(), &__sample_map_raw));\n";
+            out << "                    bool __is_new = winrt::unbox_value_or<bool>(theme_find_in_raw_hstring_map(__sample_map_raw, L\"IsNew\"), false);\n";
+            out << "                    bool __is_updated = winrt::unbox_value_or<bool>(theme_find_in_raw_hstring_map(__sample_map_raw, L\"IsUpdated\"), false);\n";
+            out << "                    auto* __sample_map_vt = *reinterpret_cast<void* const**>(__sample_map_raw);\n";
+            out << "                    using __release_t = std::uint32_t(__stdcall*)(void*);\n";
+            out << "                    reinterpret_cast<__release_t>(__sample_map_vt[2])(__sample_map_raw);\n";
+            out << "                    if (__is_new || __is_updated) sample_source_vector.Append(__sample);\n";
+            out << "                }\n";
+        }
+        out << "            }\n";
+        out << "        }\n";
+    }
+
     out << "\n        // build the UI tree\n";
 
 
@@ -2874,12 +3260,11 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
             out << "        apply_app_theme(!is_current_light_theme());\n";
         }
         // Drag region + caption theming AFTER the tree is built: the
-        // AppTitleBar/titleBar element must be assigned before SetTitleBar takes it
+        // named title-bar element must be assigned before SetTitleBar takes it
         // (a null element here would kill all titlebar dragging).
-        if (is_window_class && view.extend_content_into_titlebar && (named_elements.count("AppTitleBar") || named_elements.count("titleBar")))
+        if (is_window_class && view.extend_content_into_titlebar && !title_bar_name.empty())
         {
-            std::string tb_name = named_elements.count("titleBar") ? "titleBar" : "AppTitleBar";
-            out << "        SetTitleBar(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(" << tb_name << ".m_unknown.get()));\n";
+            out << "        SetTitleBar(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(" << title_bar_name << ".m_unknown.get()));\n";
             out << "        g_theme_state.window_id = AppWindow().Id().Value;\n";
             out << "        sync_titlebar_theme(!is_current_light_theme());\n";
             out << "        sync_window_theme(!is_current_light_theme() ? 1 : 0);\n";
@@ -2904,10 +3289,9 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
             out << "        g_theme_state.root_element = static_cast<void*>(_root.m_unknown.get());\n";
             out << "        apply_app_theme(!is_current_light_theme());\n";
         }
-        if (is_window_class && view.extend_content_into_titlebar && (named_elements.count("AppTitleBar") || named_elements.count("titleBar")))
+        if (is_window_class && view.extend_content_into_titlebar && !title_bar_name.empty())
         {
-            std::string tb_name = named_elements.count("titleBar") ? "titleBar" : "AppTitleBar";
-            out << "        SetTitleBar(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(" << tb_name << ".m_unknown.get()));\n";
+            out << "        SetTitleBar(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(" << title_bar_name << ".m_unknown.get()));\n";
             out << "        g_theme_state.window_id = AppWindow().Id().Value;\n";
             out << "        sync_titlebar_theme(!is_current_light_theme());\n";
             out << "        sync_window_theme(!is_current_light_theme() ? 1 : 0);\n";
@@ -2915,14 +3299,25 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     }
 
     {
-        std::string nav_view_name = has_elem("NavView") ? "NavView" : (has_elem("NavigationViewControl") ? "NavigationViewControl" : "");
-        std::string frame_name = has_elem("ContentFrame") ? "ContentFrame" : (has_elem("rootFrame") ? "rootFrame" : "");
-        bool is_nav_window = is_window_class && !view.nav_pages.empty() && !nav_view_name.empty() && !frame_name.empty();
         if (is_nav_window)
         {
-            out << "        _navigate_to_tag(L\"Home\");\n";
-            if (has_elem("Home"))
-                out << "        Home.IsSelected(true);\n";
+            bool has_loaded_cb = false;
+            for (auto const& cb : callbacks)
+                if (cb.find("Loaded") != std::string::npos) { has_loaded_cb = true; break; }
+            if (!has_loaded_cb)
+                out << "        " << nav_view_name << ".add_Loaded([this](auto const&, auto const&) { _initialize_navigation(); });\n";
+            for (auto const& [tag, page_name] : view.nav_pages)
+            {
+                auto named_item = named_elements.find(tag);
+                auto state_item = element_named_types.find(tag);
+                auto item_type = named_item != named_elements.end()
+                    ? &named_item->second
+                    : state_item != element_named_types.end() ? &state_item->second : nullptr;
+                if (!item_type || item_type->find("NavigationViewItem") == std::string::npos)
+                    continue;
+                out << "        if (!" << tag << ".Tag().get_abi()) " << tag
+                    << ".Tag(winrt::box_value(winrt::hstring(L\"" << tag << "\")));\n";
+            }
         }
     }
 
@@ -2939,43 +3334,40 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         if (has_elem("navigationLocation"))
             out << "        if (navigationLocation.m_unknown.get()) navigationLocation.SelectedIndex(0);\n";
     }
-    if (view.name == "HomePage")
+    if (view.name == "HorizontalScrollContainer")
     {
-        out << "        if (FavoriteSamplesFallbackMessage.m_unknown.get()) {\n";
-        out << "            FavoriteSamplesFallbackMessage.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Center);\n";
-        out << "            try {\n";
-        out << "                auto elem = FavoriteSamplesFallbackMessage.Children().GetAt(0);\n";
-        out << "                if (elem.m_unknown.get()) winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(elem.m_unknown.get()).HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Center);\n";
-        out << "            } catch (...) {}\n";
+        out << "        if (ContentGrid.m_unknown.get()) {\n";
+        out << "            ContentGrid.add_SizeChanged([this](auto const&, auto const&) { UpdateScrollButtons(); });\n";
         out << "        }\n";
-        out << "        if (RecentlyVisitedTitle.m_unknown.get()) RecentlyVisitedTitle.Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);\n";
-        out << "        if (RecentlyVisitedContainer.m_unknown.get()) RecentlyVisitedContainer.Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);\n";
-        out << "        if (FilterBar.m_unknown.get()) {\n";
-        out << "            try {\n";
-        out << "                auto items = FilterBar.get_Items();\n";
-        out << "                if (items && items.get_Size() >= 2) {\n";
-        out << "                    auto it0 = items.GetAt(0);\n";
-        out << "                    auto it1 = items.GetAt(1);\n";
-        out << "                    auto accent_b = winrt::Microsoft::UI::Xaml::Media::SolidColorBrush(winrt::Windows::UI::Color{255, 118, 185, 237});\n";
-        out << "                    auto dark_b = winrt::Microsoft::UI::Xaml::Media::SolidColorBrush(winrt::Windows::UI::Color{255, 0, 0, 0});\n";
-        out << "                    auto gray_b = winrt::Microsoft::UI::Xaml::Media::SolidColorBrush(winrt::Windows::UI::Color{255, 53, 53, 53});\n";
-        out << "                    auto white_b = winrt::Microsoft::UI::Xaml::Media::SolidColorBrush(winrt::Windows::UI::Color{255, 255, 255, 255});\n";
-        out << "                    auto border_gray = winrt::Microsoft::UI::Xaml::Media::SolidColorBrush(winrt::Windows::UI::Color{255, 64, 64, 64});\n";
-        out << "                    it0.CornerRadius(winrt::Microsoft::UI::Xaml::CornerRadius{16, 16, 16, 16});\n";
-        out << "                    it0.Background(accent_b);\n";
-        out << "                    it0.Foreground(dark_b);\n";
-        out << "                    it0.BorderBrush(accent_b);\n";
-        out << "                    auto ic0 = it0.get_Icon();\n";
-        out << "                    if (ic0.m_unknown.get()) ic0.Foreground(dark_b);\n";
-        out << "                    it1.CornerRadius(winrt::Microsoft::UI::Xaml::CornerRadius{16, 16, 16, 16});\n";
-        out << "                    it1.Background(gray_b);\n";
-        out << "                    it1.Foreground(white_b);\n";
-        out << "                    it1.BorderBrush(border_gray);\n";
-        out << "                    auto ic1 = it1.get_Icon();\n";
-        out << "                    if (ic1.m_unknown.get()) ic1.Foreground(white_b);\n";
-        out << "                }\n";
-        out << "            } catch (...) {}\n";
+        out << "        if (scroller.m_unknown.get()) {\n";
+        out << "            scroller.add_Loaded([this](auto const&, auto const&) { UpdateScrollButtons(); });\n";
         out << "        }\n";
+        out << "        add_Loaded([this](auto const&, auto const&) { UpdateScrollButtons(); });\n";
+        out << "        m_bindings.push_back([this]() { UpdateScrollButtons(); });\n";
+    }
+    if (!recently_visited_source_vars.empty() && !recent_section_element_names.empty())
+    {
+        out << "        bool __has_recent_items = false;\n";
+        for (auto const& source_name : recently_visited_source_vars)
+        {
+            std::string cap_name = source_name;
+            if (!cap_name.empty()) cap_name[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(cap_name[0])));
+            std::string member_name = (cap_name == source_name && !element_named_types.count(source_name))
+                ? ("m_" + source_name) : source_name;
+            out << "        { void* __recent_raw = nullptr; if (winrt::IUnknown::qi_raw(" << member_name
+                << ".get_abi(), winrt::Windows::Foundation::Collections::IVector<winrt::IInspectable>::iid(), &__recent_raw) >= 0 && __recent_raw) {\n";
+            out << "            auto __recent_vector = winrt::Windows::Foundation::Collections::IVector<winrt::IInspectable>::from_abi(__recent_raw);\n";
+            out << "            __has_recent_items = __has_recent_items || __recent_vector.get_Size() != 0;\n";
+            out << "        } }\n";
+        }
+        for (auto const& element_name : recent_section_element_names)
+            if (has_elem(element_name))
+                out << "        if (" << element_name << ".m_unknown.get()) " << element_name
+                    << ".Visibility(__has_recent_items ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed);\n";
+    }
+    if (is_nav_window)
+    {
+        out << "        _init_nav_helpers();\n";
     }
     out << "    }\n";
 
@@ -2986,9 +3378,6 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     }
     } // end if (!is_app_class) — BuildUI() only for Window/UserControl
 
-    std::string nav_view_name = has_elem("NavView") ? "NavView" : (has_elem("NavigationViewControl") ? "NavigationViewControl" : "");
-    std::string frame_name = has_elem("ContentFrame") ? "ContentFrame" : (has_elem("rootFrame") ? "rootFrame" : "");
-    bool is_nav_window = is_window_class && !view.nav_pages.empty() && !nav_view_name.empty() && !frame_name.empty();
     std::string loaded_cb_name;
     if (is_nav_window)
     {
@@ -3002,31 +3391,72 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
             for (auto const& cbn : callbacks)
                 if (cbn.find("Loaded") != std::string::npos) { loaded_cb_name = cbn; break; }
         }
-        out << "\n    std::vector<std::wstring> m_nav_history;\n";
-        out << "    std::wstring m_current_nav_tag;\n";
-        out << "\n    void _navigate_to_tag(std::wstring_view tag, bool record_history = true)\n    {\n";
+        out << "    inline static " << view.name << "View* s_this_nav = nullptr;\n";
+        out << "    void _init_nav_helpers() {\n";
+        out << "        s_this_nav = this;\n";
         out << "        static void* s_nav_ctrl = nullptr;\n";
         out << "        static void* s_titlebar_ctrl = nullptr;\n";
-        out << "        static " << view.name << "View* s_this_nav = nullptr;\n";
-        out << "        s_this_nav = this;\n";
         out << "        s_nav_ctrl = " << nav_view_name << ".m_unknown.get();\n";
-        if (has_elem("titleBar"))
+        if (!title_bar_name.empty())
         {
-            out << "        s_titlebar_ctrl = titleBar.m_unknown.get();\n";
+            out << "        if (" << title_bar_name << ".m_unknown.get()) s_titlebar_ctrl = " << title_bar_name << ".m_unknown.get();\n";
         }
         out << "        g_theme_state.navigate_to = [](const wchar_t* t) {\n";
         out << "            if (s_this_nav && t) s_this_nav->_navigate_to_tag(t);\n";
         out << "        };\n";
         out << "        g_theme_state.set_nav_mode = [](int mode) {\n";
-        out << "            if (s_nav_ctrl) {\n";
-        out << "                auto nv = winrt::Microsoft::UI::Xaml::Controls::NavigationView::wrap_borrowed(s_nav_ctrl);\n";
-        out << "                nv.PaneDisplayMode(mode == 1 ? winrt::Microsoft::UI::Xaml::Controls::NavigationViewPaneDisplayMode::Top : winrt::Microsoft::UI::Xaml::Controls::NavigationViewPaneDisplayMode::Auto);\n";
-        out << "            }\n";
-        out << "            if (s_titlebar_ctrl) {\n";
-        out << "                auto tb = winrt::Microsoft::UI::Xaml::Controls::TitleBar::wrap_borrowed(s_titlebar_ctrl);\n";
-        out << "                tb.IsPaneToggleButtonVisible(mode != 1);\n";
-        out << "            }\n";
+        out << "            auto dq = winrt::Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();\n";
+        out << "            auto apply_mode = [mode]() {\n";
+        out << "                if (s_nav_ctrl) {\n";
+        out << "                    auto nv = winrt::Microsoft::UI::Xaml::Controls::NavigationView::wrap_borrowed(s_nav_ctrl);\n";
+        out << "                    nv.PaneDisplayMode(mode == 1 ? winrt::Microsoft::UI::Xaml::Controls::NavigationViewPaneDisplayMode::Top : winrt::Microsoft::UI::Xaml::Controls::NavigationViewPaneDisplayMode::Auto);\n";
+        out << "                }\n";
+        out << "                if (s_titlebar_ctrl) {\n";
+        out << "                    auto tb = winrt::Microsoft::UI::Xaml::Controls::TitleBar::wrap_borrowed(s_titlebar_ctrl);\n";
+        out << "                    tb.IsPaneToggleButtonVisible(mode != 1);\n";
+        out << "                }\n";
+        out << "            };\n";
+        out << "            if (dq.get_abi()) dq.TryEnqueue(apply_mode);\n";
+        out << "            else apply_mode();\n";
         out << "        };\n";
+        out << "    }\n";
+        out << "\n    struct _nav_history_entry { std::wstring tag; winrt::IInspectable page; winrt::IInspectable content; };\n";
+        out << "    struct _nav_selection_scope { bool& active; explicit _nav_selection_scope(bool& value) : active(value) { active = true; } ~_nav_selection_scope() { active = false; } };\n";
+        out << "    std::vector<_nav_history_entry> m_nav_history;\n";
+        out << "    std::map<std::wstring, _nav_history_entry> m_nav_cache;\n";
+        out << "    std::wstring m_current_nav_tag;\n";
+        out << "    winrt::IInspectable m_current_nav_page;\n";
+        out << "    bool m_syncing_nav_selection = false;\n";
+        out << "        bool m_navigation_ready = false;\n";
+        out << "\n    winrt::hstring _navigation_item_tag(winrt::Microsoft::UI::Xaml::Controls::NavigationViewItem const& item)\n    {\n";
+        out << "        auto tag = winrt::unbox_value_or<winrt::hstring>(item.Tag(), winrt::hstring{});\n";
+        out << "        if (tag.empty()) tag = item.Name();\n";
+        out << "        if (tag.empty()) tag = winrt::unbox_value_or<winrt::hstring>(item.Content(), winrt::hstring{});\n";
+        out << "        return tag;\n";
+        out << "    }\n";
+        out << "\n    void _sync_navigation_selection(std::wstring_view tag)\n    {\n";
+        out << "        auto find_item = [&](auto&& self, auto const& items) -> winrt::IInspectable {\n";
+        out << "            if (!items) return {};\n";
+        out << "            for (std::uint32_t i = 0; i < items.get_Size(); ++i) {\n";
+        out << "                auto candidate = items.GetAt(i);\n";
+        out << "                void* item_out = nullptr;\n";
+        out << "                if (!candidate || winrt::impl::query_interface(candidate.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::NavigationViewItem>, &item_out) < 0 || !item_out) continue;\n";
+        out << "                auto item = winrt::Microsoft::UI::Xaml::Controls::NavigationViewItem::from_abi(item_out);\n";
+        out << "                auto item_tag = _navigation_item_tag(item);\n";
+        out << "                if (!item_tag.empty() && item_tag.to_view() == tag) return candidate;\n";
+        out << "                if (auto child = self(self, item.MenuItems())) return child;\n";
+        out << "            }\n";
+        out << "            return {};\n";
+        out << "        };\n";
+        out << "        auto selected = find_item(find_item, " << nav_view_name << ".MenuItems());\n";
+        out << "        if (selected) {\n";
+        out << "            _nav_selection_scope scope(m_syncing_nav_selection);\n";
+        out << "            " << nav_view_name << ".SelectedItem(selected);\n";
+        out << "        }\n";
+        out << "    }\n";
+        out << "\n    void _navigate_to_tag(std::wstring_view tag, bool record_history = true, winrt::IInspectable cached_page = {}, winrt::IInspectable cached_content = {})\n    {\n";
+        out << "        if (!m_navigation_ready || m_syncing_nav_selection || (tag == m_current_nav_tag && m_current_nav_page)) return;\n";
+        out << "        _init_nav_helpers();\n";
         out << "        winrt::IInspectable (*factory)() = nullptr;\n";
         for (auto const& [tag, page_name] : view.nav_pages)
         {
@@ -3037,22 +3467,21 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
             fn += page_class;
             out << "        if (tag == L\"" << tag << "\") factory = " << fn << ";\n";
         }
-        out << "        if (!factory) return;\n";
+        out << "        if (!factory && !cached_content) return;\n";
         out << "        try\n";
         out << "        {\n";
-        out << "            winrt::IInspectable page = factory();\n";
+        out << "            auto __navigation_started = std::chrono::steady_clock::now();\n";
+        out << "            if (!cached_page && !cached_content) {\n";
+        out << "                auto __cached = m_nav_cache.find(std::wstring(tag));\n";
+        out << "                if (__cached != m_nav_cache.end()) { cached_page = __cached->second.page; cached_content = __cached->second.content; }\n";
+        out << "            }\n";
+        out << "            winrt::IInspectable page = cached_page;\n";
+        out << "            auto __page_build_started = std::chrono::steady_clock::now();\n";
+        out << "            if (!page) page = factory();\n";
+        out << "            auto __page_build_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - __page_build_started).count();\n";
+        out << "            boot_log((std::string(\"navigate:factory-ms:\") + std::to_string(__page_build_ms)).c_str());\n";
         out << "            if (page)\n";
         out << "            {\n";
-        out << "                if (record_history && !m_current_nav_tag.empty() && m_current_nav_tag != tag)\n";
-        out << "                    m_nav_history.push_back(m_current_nav_tag);\n";
-        out << "                m_current_nav_tag = std::wstring(tag);\n";
-        if (has_elem("titleBar"))
-        {
-            out << "                if (titleBar.m_unknown.get()) {\n";
-            out << "                    titleBar.IsBackButtonVisible(!m_nav_history.empty());\n";
-            out << "                    titleBar.IsBackButtonEnabled(!m_nav_history.empty());\n";
-            out << "                }\n";
-        }
         out << "                void* fe_raw = nullptr;\n";
         out << "                if (page.get_abi() && winrt::IUnknown::qi_raw(page.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::IFrameworkElement>, &fe_raw) >= 0 && fe_raw)\n";
         out << "                {\n";
@@ -3060,109 +3489,166 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         out << "                    fe.put_RequestedTheme(get_global_theme());\n";
         out << "                    fe.put_HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);\n";
         out << "                }\n";
-        out << "                if (tag != L\"Home\" && tag != L\"HomePage\")\n";
+        out << "                auto previous_content = " << frame_name << ".Content();\n";
+        out << "                if (cached_content)\n";
         out << "                {\n";
-        out << "                    winrt::Microsoft::UI::Xaml::Controls::ScrollViewer sv{};\n";
-        out << "                    sv.VerticalScrollBarVisibility(winrt::Microsoft::UI::Xaml::Controls::ScrollBarVisibility::Auto);\n";
-        out << "                    sv.VerticalScrollMode(winrt::Microsoft::UI::Xaml::Controls::ScrollMode::Enabled);\n";
-        out << "                    sv.HorizontalScrollBarVisibility(winrt::Microsoft::UI::Xaml::Controls::ScrollBarVisibility::Disabled);\n";
-        out << "                    sv.HorizontalScrollMode(winrt::Microsoft::UI::Xaml::Controls::ScrollMode::Disabled);\n";
-        out << "                    sv.Content(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(page.get_abi()));\n";
-        out << "                    " << frame_name << ".Content(sv);\n";
+        out << "                    " << frame_name << ".Content(cached_content);\n";
         out << "                }\n";
         out << "                else\n";
         out << "                {\n";
-        out << "                    " << frame_name << ".Content(page);\n";
+        out << "                    if (tag != L\"Home\" && tag != L\"HomePage\")\n";
+        out << "                    {\n";
+        out << "                        winrt::Microsoft::UI::Xaml::Controls::ScrollViewer sv{};\n";
+        out << "                        sv.VerticalScrollBarVisibility(winrt::Microsoft::UI::Xaml::Controls::ScrollBarVisibility::Auto);\n";
+        out << "                        sv.VerticalScrollMode(winrt::Microsoft::UI::Xaml::Controls::ScrollMode::Enabled);\n";
+        out << "                        sv.HorizontalScrollBarVisibility(winrt::Microsoft::UI::Xaml::Controls::ScrollBarVisibility::Disabled);\n";
+        out << "                        sv.HorizontalScrollMode(winrt::Microsoft::UI::Xaml::Controls::ScrollMode::Disabled);\n";
+        out << "                        sv.Content(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(page.get_abi()));\n";
+        out << "                        " << frame_name << ".Content(sv);\n";
+        out << "                    }\n";
+        out << "                    else\n";
+        out << "                    {\n";
+        out << "                        " << frame_name << ".Content(page);\n";
+        out << "                    }\n";
         out << "                }\n";
+        out << "                if (record_history && !m_current_nav_tag.empty() && m_current_nav_tag != tag && previous_content && m_current_nav_page)\n";
+        out << "                    m_nav_history.push_back(_nav_history_entry{m_current_nav_tag, m_current_nav_page, previous_content});\n";
+        out << "                if (!m_current_nav_tag.empty() && m_current_nav_page && previous_content)\n";
+        out << "                    m_nav_cache[m_current_nav_tag] = _nav_history_entry{m_current_nav_tag, m_current_nav_page, previous_content};\n";
+        out << "                m_current_nav_tag = std::wstring(tag);\n";
+        out << "                m_current_nav_page = page;\n";
+        out << "                m_nav_cache[m_current_nav_tag] = _nav_history_entry{m_current_nav_tag, page, " << frame_name << ".Content()};\n";
+        out << "                if (tag != L\"Home\" && tag != L\"HomePage\" && tag != L\"AllControls\" && tag != L\"AllControlsPage\" && tag != L\"Settings\" && tag != L\"__settings__\") {\n";
+        out << "                    load_recent_history();\n";
+        out << "                    auto __cat = get_default_sample_catalog();\n";
+        out << "                    auto __cat_iid = winrt::Windows::Foundation::Collections::IMap<winrt::hstring, winrt::IInspectable>::iid();\n";
+        out << "                    for (std::uint32_t __si = 0; __si < __cat.get_Size(); ++__si) {\n";
+        out << "                        auto __s = __cat.GetAt(__si);\n";
+        out << "                        void* __s_raw = nullptr;\n";
+        out << "                        if (winrt::IUnknown::qi_raw(__s.get_abi(), __cat_iid, &__s_raw) >= 0 && __s_raw) {\n";
+        out << "                            auto __suid = winrt::unbox_value_or<winrt::hstring>(theme_find_in_raw_hstring_map(__s_raw, L\"UniqueId\"), L\"\");\n";
+        out << "                            if (__suid == tag || (tag.ends_with(L\"Page\") && __suid == tag.substr(0, tag.size() - 4))) {\n";
+        out << "                                auto __stitle = winrt::unbox_value_or<winrt::hstring>(theme_find_in_raw_hstring_map(__s_raw, L\"Title\"), L\"\");\n";
+        out << "                                auto __ssub = winrt::unbox_value_or<winrt::hstring>(theme_find_in_raw_hstring_map(__s_raw, L\"Subtitle\"), L\"\");\n";
+        out << "                                auto __simg = winrt::unbox_value_or<winrt::hstring>(theme_find_in_raw_hstring_map(__s_raw, L\"ImagePath\"), L\"\");\n";
+        out << "                                bool __snew = winrt::unbox_value_or<bool>(theme_find_in_raw_hstring_map(__s_raw, L\"IsNew\"), false);\n";
+        out << "                                bool __supd = winrt::unbox_value_or<bool>(theme_find_in_raw_hstring_map(__s_raw, L\"IsUpdated\"), false);\n";
+        out << "                                bool __sexp = winrt::unbox_value_or<bool>(theme_find_in_raw_hstring_map(__s_raw, L\"IsExperimental\"), false);\n";
+        out << "                                auto* __vt = *reinterpret_cast<void* const**>(__s_raw);\n";
+        out << "                                reinterpret_cast<std::uint32_t(__stdcall*)(void*)>(__vt[2])(__s_raw);\n";
+        out << "                                std::wstring __actual_id(__suid.to_view());\n";
+        out << "                                auto& __r_ids = get_recent_history_state().recently_visited_ids;\n";
+        out << "                                for (auto __it = __r_ids.begin(); __it != __r_ids.end();) {\n";
+        out << "                                    if (*__it == __actual_id) __it = __r_ids.erase(__it); else ++__it;\n";
+        out << "                                }\n";
+        out << "                                __r_ids.insert(__r_ids.begin(), __actual_id);\n";
+        out << "                                auto& __r_items = get_recent_history_state().recently_visited_items;\n";
+        out << "                                for (auto __it = __r_items.begin(); __it != __r_items.end();) {\n";
+        out << "                                    if (__it->id == __actual_id) __it = __r_items.erase(__it); else ++__it;\n";
+        out << "                                }\n";
+        out << "                                RecentItemData __rec;\n";
+        out << "                                __rec.id = __actual_id; __rec.title = __stitle.c_str();\n";
+        out << "                                __rec.subtitle = __ssub.c_str(); __rec.image_path = __simg.c_str();\n";
+        out << "                                __rec.is_new = __snew; __rec.is_updated = __supd; __rec.is_experimental = __sexp;\n";
+        out << "                                __r_items.insert(__r_items.begin(), std::move(__rec));\n";
+        out << "                                save_recent_history();\n";
+        out << "                                break;\n";
+        out << "                            }\n";
+        out << "                            auto* __vt = *reinterpret_cast<void* const**>(__s_raw);\n";
+        out << "                            reinterpret_cast<std::uint32_t(__stdcall*)(void*)>(__vt[2])(__s_raw);\n";
+        out << "                        }\n";
+        out << "                    }\n";
+        out << "                }\n";
+        out << "                else if (tag == L\"Home\" || tag == L\"HomePage\") {\n";
+        out << "                    get_HomePage()._refresh_recent_items();\n";
+        out << "                }\n";
+        out << "                auto __navigation_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - __navigation_started).count();\n";
+        out << "                boot_log((std::string(\"navigate:complete-ms:\") + std::to_string(__navigation_ms)).c_str());\n";
+        if (!title_bar_name.empty())
+        {
+            out << "                if (" << title_bar_name << ".m_unknown.get()) {\n";
+            out << "                    " << title_bar_name << ".IsBackButtonVisible(!m_nav_history.empty());\n";
+            out << "                    " << title_bar_name << ".IsBackButtonEnabled(!m_nav_history.empty());\n";
+            out << "                }\n";
+        }
+        out << "                _sync_navigation_selection(tag);\n";
         out << "            }\n";
         out << "        }\n";
-        out << "        catch (...) { boot_log(\"navigate:catch\"); }\n";
+        out << "        catch (...) { winrt::report_current_exception(\"navigate\"); boot_log(\"navigate:catch\"); }\n";
+        out << "    }\n";
+        out << "    void _initialize_navigation()\n    {\n";
+        out << "        m_navigation_ready = true;\n";
+        out << "        if (" << frame_name << ".Content() != nullptr) return;\n";
+        out << "        auto items = " << nav_view_name << ".MenuItems();\n";
+        out << "        if (!items || items.get_Size() == 0) return;\n";
+        out << "        auto first = items.GetAt(0);\n";
+        out << "        if (!first) return;\n";
+        out << "        void* item_out = nullptr;\n";
+        out << "        if (winrt::impl::query_interface(first.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::NavigationViewItem>, &item_out) >= 0 && item_out)\n";
+        out << "        {\n";
+        out << "            auto item = winrt::Microsoft::UI::Xaml::Controls::NavigationViewItem::from_abi(item_out);\n";
+        out << "            auto tag = _navigation_item_tag(item);\n";
+        out << "            if (!tag.empty()) _navigate_to_tag(tag.to_view());\n";
+        out << "        }\n";
+        out << "    }\n";
+        out << "    void _go_back()\n    {\n";
+        out << "        if (m_nav_history.empty()) return;\n";
+        out << "        auto previous = m_nav_history.back();\n";
+        out << "        m_nav_history.pop_back();\n";
+        out << "        _navigate_to_tag(previous.tag, false, previous.page, previous.content);\n";
         out << "    }\n";
     }
 
-    // Settings-behavior synthesis: mirrors the original code-behind -
-    // theme combo applies RequestedTheme (system/light/dark); compact
-    // toggle reduces spacing + card padding across the live visual tree.
-    // ResourceDictionary re-insertion is unavailable (no keyed accessors in
-    // the projection, no closed-generic IMap iid), and resource lookups are
-    // snapshots anyway, so compactness is applied directly element by
-    // element - the same final layout state as the theme-driven original.
-    if (!is_app_class && named_elements.count("ThemeComboBox"))
+    if (!recently_visited_source_vars.empty())
     {
-        out << "\n    void _apply_element_theme(int idx)\n    {\n";
-        out << "        g_theme_state.theme_idx = idx;\n";
-        out << "        bool is_light = is_current_light_theme();\n";
-        out << "        winrt::Microsoft::UI::Xaml::ElementTheme theme = is_light ? winrt::Microsoft::UI::Xaml::ElementTheme::Light : winrt::Microsoft::UI::Xaml::ElementTheme::Dark;\n";
-        out << "        update_dynamic_brushes();\n";
-        out << "        auto root = winrt::Microsoft::UI::Xaml::FrameworkElement(*this);\n";
-        out << "        root.RequestedTheme(theme);\n";
-        out << "        try\n";
-        out << "        {\n";
-        out << "            auto xr = root.XamlRoot();\n";
-        out << "            if (xr.get_abi())\n";
-        out << "            {\n";
-        out << "                auto content = xr.Content();\n";
-        out << "                if (content.get_abi())\n";
-        out << "                {\n";
-        out << "                    void* fe_raw = nullptr;\n";
-        out << "                    if (winrt::IUnknown::qi_raw(content.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::IFrameworkElement>, &fe_raw) >= 0 && fe_raw)\n";
-        out << "                    {\n";
-        out << "                        winrt::Microsoft::UI::Xaml::IFrameworkElement fe{fe_raw};\n";
-        out << "                        fe.put_RequestedTheme(theme);\n";
-        out << "                    }\n";
-        out << "                }\n";
-        out << "            }\n";
-        out << "        }\n";
-        out << "        catch (...) {}\n";
-        out << "        sync_titlebar_theme(!is_light);\n";
-        out << "        sync_window_theme(is_light ? 0 : 1);\n";
-        out << "    }\n";
-        out << "\n    void _apply_compact(bool on)\n    {\n";
-        out << "        try\n";
-        out << "        {\n";
-        out << "            g_theme_state.compact = on ? 1 : 0;\n";
-        // Only reference elements this page actually names - the hardcoded
-        // Card1/MainStackPanel set belongs to the Settings page, not every
-        // page that carries a theme combo box.
-        if (element_names.count("Card1"))
+        out << "\n    void _refresh_recent_items()\n    {\n";
+        out << "        auto __sample_catalog = get_default_sample_catalog();\n";
+        out << "        auto __iid_map = winrt::Windows::Foundation::Collections::IMap<winrt::hstring, winrt::IInspectable>::iid();\n";
+        std::size_t recent_index = 0;
+        for (auto const& source_name : recently_visited_source_vars)
         {
-            out << "            if (Card1.m_unknown.get())\n";
-            out << "                Card1.Padding(winrt::Microsoft::UI::Xaml::Thickness{on ? 12.0 : 20.0, on ? 12.0 : 20.0, on ? 12.0 : 20.0, on ? 12.0 : 20.0});\n";
+            std::string cap_name = source_name;
+            if (!cap_name.empty()) cap_name[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(cap_name[0])));
+            std::string member_name = (cap_name == source_name && !element_named_types.count(source_name))
+                ? ("m_" + source_name) : source_name;
+            auto suffix = std::to_string(recent_index++);
+            out << "        void* __recent_raw_" << suffix << " = nullptr;\n";
+            out << "        winrt::check_hresult(winrt::IUnknown::qi_raw(" << member_name
+                << ".get_abi(), winrt::Windows::Foundation::Collections::IVector<winrt::IInspectable>::iid(), &__recent_raw_" << suffix << "));\n";
+            out << "        auto __recent_vector_" << suffix << " = winrt::Windows::Foundation::Collections::IVector<winrt::IInspectable>::from_abi(__recent_raw_" << suffix << ");\n";
+            out << "        __recent_vector_" << suffix << ".Clear();\n";
+            out << "        for (auto const& __recent_id : get_recent_history_state().recently_visited_ids) {\n";
+            out << "            auto __cached_item = std::find_if(get_recent_history_state().recently_visited_items.begin(), get_recent_history_state().recently_visited_items.end(), [&](auto const& item) { return item.id == __recent_id; });\n";
+            out << "            if (__cached_item != get_recent_history_state().recently_visited_items.end() && !__cached_item->title.empty()) { __recent_vector_" << suffix << ".Append(make_recent_history_item(*__cached_item)); continue; }\n";
+            out << "            for (std::uint32_t __sample_index = 0; __sample_index < __sample_catalog.get_Size(); ++__sample_index) {\n";
+            out << "                auto __sample = __sample_catalog.GetAt(__sample_index);\n";
+            out << "                void* __sample_map_raw = nullptr;\n";
+            out << "                winrt::check_hresult(winrt::IUnknown::qi_raw(__sample.get_abi(), __iid_map, &__sample_map_raw));\n";
+            out << "                auto __sample_uid = winrt::unbox_value_or<winrt::hstring>(theme_find_in_raw_hstring_map(__sample_map_raw, L\"UniqueId\"), L\"\");\n";
+            out << "                auto* __sample_map_vt = *reinterpret_cast<void* const**>(__sample_map_raw);\n";
+            out << "                using __release_t = std::uint32_t(__stdcall*)(void*);\n";
+            out << "                reinterpret_cast<__release_t>(__sample_map_vt[2])(__sample_map_raw);\n";
+            out << "                if (__sample_uid.to_view() == __recent_id) { __recent_vector_" << suffix << ".Append(__sample); break; }\n";
+            out << "            }\n";
+            out << "        }\n";
         }
-        if (element_names.count("Card3"))
+        out << "        bool __has_recent_items = false;\n";
+        for (auto const& source_name : recently_visited_source_vars)
         {
-            out << "            if (Card3.m_unknown.get())\n";
-            out << "                Card3.Padding(winrt::Microsoft::UI::Xaml::Thickness{on ? 12.0 : 20.0, on ? 12.0 : 20.0, on ? 12.0 : 20.0, on ? 12.0 : 20.0});\n";
+            std::string cap_name = source_name;
+            if (!cap_name.empty()) cap_name[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(cap_name[0])));
+            std::string member_name = (cap_name == source_name && !element_named_types.count(source_name))
+                ? ("m_" + source_name) : source_name;
+            out << "        { void* __recent_check_raw = nullptr; if (winrt::IUnknown::qi_raw(" << member_name
+                << ".get_abi(), winrt::Windows::Foundation::Collections::IVector<winrt::IInspectable>::iid(), &__recent_check_raw) >= 0 && __recent_check_raw) {\n";
+            out << "            auto __recent_check_vector = winrt::Windows::Foundation::Collections::IVector<winrt::IInspectable>::from_abi(__recent_check_raw);\n";
+            out << "            __has_recent_items = __has_recent_items || __recent_check_vector.get_Size() != 0;\n";
+            out << "        } }\n";
         }
-        if (element_names.count("MainStackPanel"))
-        {
-            out << "            if (MainStackPanel.m_unknown.get())\n";
-            out << "                MainStackPanel.Spacing(on ? 12.0 : 24.0);\n";
-        }
-        if (element_names.count("PageScrollViewer"))
-        {
-            out << "            if (PageScrollViewer.m_unknown.get())\n";
-            out << "                PageScrollViewer.Padding(on ? winrt::Microsoft::UI::Xaml::Thickness{20.0, 12.0, 20.0, 20.0} : winrt::Microsoft::UI::Xaml::Thickness{40.0, 24.0, 40.0, 40.0});\n";
-        }
-        out << "        }\n";
-        out << "        catch (...) {}\n";
-        out << "    }\n";
-        out << "\n    void _wire_settings_behavior()\n    {\n";
-        out << "        ThemeComboBox.SelectedIndex(g_theme_state.theme_idx);\n";
-        out << "        ThemeComboBox.add_SelectionChanged([this](auto const& s, auto const& e)\n";
-        out << "        {\n";
-        out << "            _apply_element_theme(static_cast<int>(ThemeComboBox.SelectedIndex()));\n";
-        out << "        });\n";
-        // CompactToggle exists only on pages that name it - a page with a
-        // ThemeComboBox but no toggle must not wire a nonexistent member.
-        if (element_names.count("CompactToggle"))
-        {
-            out << "        CompactToggle.IsOn(g_theme_state.compact != 0);\n";
-            out << "        CompactToggle.add_Toggled([this](auto const& s, auto const& e)\n";
-            out << "        {\n";
-            out << "            _apply_compact(CompactToggle.get_IsOn());\n";
-            out << "        });\n";
-        }
+        for (auto const& element_name : recent_section_element_names)
+            if (has_elem(element_name))
+                out << "        if (" << element_name << ".m_unknown.get()) " << element_name
+                    << ".Visibility(__has_recent_items ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed);\n";
         out << "    }\n";
     }
 
@@ -3171,7 +3657,110 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     for (auto const& cb : callbacks)
     {
         if (cb == "raw") continue;
-        out << "\n    void " << cb << "(IInspectable const& sender, IInspectable const& args)\n    {\n";
+        out << "\n    template <typename Sender, typename Args>\n";
+        out << "    void " << cb << "(Sender const& sender, Args const& args)\n    {\n";
+        if (!recently_visited_source_vars.empty()
+            && (cb.find("Loaded") != std::string::npos || cb.find("loaded") != std::string::npos))
+            out << "        _refresh_recent_items();\n";
+        if (view.name == "SettingsPage" && (cb == "NavigationLocationSelectionChanged" || cb == "navigationLocation_SelectionChanged") && has_elem("navigationLocation"))
+        {
+            out << "        int idx = navigationLocation.SelectedIndex();\n";
+            out << "        if (g_theme_state.set_nav_mode && idx >= 0) { g_theme_state.set_nav_mode(idx); return; }\n";
+        }
+        if (view.name == "HorizontalScrollContainer")
+        {
+            if (cb == "ScrollBackBtn_Click" || cb == "ScrollBackBtnClick")
+            {
+                out << "        if (scroller.m_unknown.get()) {\n";
+                out << "            double step = (scroller.ViewportWidth() > 50.0) ? scroller.ViewportWidth() : 320.0;\n";
+                out << "            double target = scroller.HorizontalOffset() - step;\n";
+                out << "            if (target < 0.0) target = 0.0;\n";
+                out << "            scroller.ChangeView(winrt::Windows::Foundation::IReference<double>(target), nullptr, nullptr);\n";
+                out << "        }\n";
+            }
+            else if (cb == "ScrollForwardBtn_Click" || cb == "ScrollForwardBtnClick")
+            {
+                out << "        if (scroller.m_unknown.get()) {\n";
+                out << "            double step = (scroller.ViewportWidth() > 50.0) ? scroller.ViewportWidth() : 320.0;\n";
+                out << "            double target = scroller.HorizontalOffset() + step;\n";
+                out << "            scroller.ChangeView(winrt::Windows::Foundation::IReference<double>(target), nullptr, nullptr);\n";
+                out << "        }\n";
+            }
+            else if (cb == "Scroller_SizeChanged" || cb == "ScrollerSizeChanged")
+            {
+                out << "        UpdateScrollButtons();\n";
+                out << "        return;\n";
+                out << "    }\n";
+                out << "    void UpdateScrollButtons()\n    {\n";
+                out << "        auto update_btns = [this]() {\n";
+                out << "            if (scroller.m_unknown.get()) {\n";
+                out << "                if (ScrollBackBtn.m_unknown.get()) {\n";
+                out << "                    double off = scroller.HorizontalOffset();\n";
+                out << "                    auto b_vis = (off > 1.0) ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed;\n";
+                out << "                    if (ScrollBackBtn.Visibility() != b_vis) ScrollBackBtn.Visibility(b_vis);\n";
+                out << "                }\n";
+                out << "                if (ScrollForwardBtn.m_unknown.get()) {\n";
+                out << "                    bool can_scroll = (scroller.ScrollableWidth() > 0)\n";
+                out << "                        || (scroller.ExtentWidth() > scroller.ViewportWidth() && scroller.ViewportWidth() > 0)\n";
+                out << "                        || (ContentGrid.m_unknown.get() && scroller.ActualWidth() > 0 && ContentGrid.ActualWidth() > scroller.ActualWidth());\n";
+                out << "                    if (!can_scroll && m_Source.get_abi()) {\n";
+                out << "                        void* ic_raw = nullptr;\n";
+                out << "                        if (winrt::IUnknown::qi_raw(m_Source.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::IItemsControl>, &ic_raw) >= 0 && ic_raw) {\n";
+                out << "                            auto ic = winrt::Microsoft::UI::Xaml::Controls::ItemsControl::from_abi(ic_raw);\n";
+                out << "                            if (ic.ItemsSource().get_abi()) {\n";
+                out << "                                void* v_raw = nullptr;\n";
+                out << "                                if (winrt::IUnknown::qi_raw(ic.ItemsSource().get_abi(), winrt::Windows::Foundation::Collections::IVector<winrt::IInspectable>::iid(), &v_raw) >= 0 && v_raw) {\n";
+                out << "                                    auto vec = winrt::Windows::Foundation::Collections::IVector<winrt::IInspectable>::from_abi(v_raw);\n";
+                out << "                                    if (vec.get_Size() >= 4) can_scroll = true;\n";
+                out << "                                }\n";
+                out << "                            }\n";
+                out << "                        }\n";
+                out << "                    }\n";
+                out << "                    auto f_vis = can_scroll ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed;\n";
+                out << "                    if (ScrollForwardBtn.Visibility() != f_vis) ScrollForwardBtn.Visibility(f_vis);\n";
+                out << "                }\n";
+                out << "            }\n";
+                out << "        };\n";
+                out << "        update_btns();\n";
+                out << "        auto dq = winrt::Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();\n";
+                out << "        if (dq.get_abi()) {\n";
+                out << "            dq.TryEnqueue(update_btns);\n";
+                out << "        }\n";
+                out << "        return;\n";
+            }
+            else if (cb == "Scroller_ViewChanging" || cb == "ScrollerViewChanging" || cb == "Scroller_ViewChanged" || cb == "ScrollerViewChanged")
+            {
+                out << "        if (scroller.m_unknown.get()) {\n";
+                out << "            double off = scroller.HorizontalOffset();\n";
+                out << "            double sw = scroller.ScrollableWidth();\n";
+                out << "            if (ScrollBackBtn.m_unknown.get()) {\n";
+                out << "                auto b_vis = (off > 1.0) ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed;\n";
+                out << "                if (ScrollBackBtn.Visibility() != b_vis) ScrollBackBtn.Visibility(b_vis);\n";
+                out << "            }\n";
+                out << "            if (ScrollForwardBtn.m_unknown.get()) {\n";
+                out << "                bool can_fwd = (sw > 1.0 && off < sw - 1.0)\n";
+                out << "                    || (scroller.ExtentWidth() > scroller.ViewportWidth() && off < (scroller.ExtentWidth() - scroller.ViewportWidth() - 1.0));\n";
+                out << "                auto f_vis = can_fwd ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed;\n";
+                out << "                if (ScrollForwardBtn.Visibility() != f_vis) ScrollForwardBtn.Visibility(f_vis);\n";
+                out << "            }\n";
+                out << "        }\n";
+                out << "        return;\n";
+            }
+        }
+        if (cb == "ClearRecentBtn_Click" || cb == "ClearRecentBtnClick")
+        {
+            out << "        load_recent_history();\n";
+            out << "        get_recent_history_state().recently_visited_ids.clear();\n";
+            out << "        get_recent_history_state().recently_visited_items.clear();\n";
+            out << "        save_recent_history();\n";
+        }
+        else if (cb == "UnfavoriteBtn_Click" || cb == "UnfavoriteBtnClick")
+        {
+            out << "        load_recent_history();\n";
+            out << "        get_recent_history_state().recently_visited_ids.clear();\n";
+            out << "        get_recent_history_state().recently_visited_items.clear();\n";
+            out << "        save_recent_history();\n";
+        }
         // Nav synthesis: real behavior for the callbacks the reference apps
         // wire (SelectionChanged -> tag dispatch into the Frame; Loaded ->
         // select the first menu item so the first page navigates). These run
@@ -3180,45 +3769,30 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         {
             if (cb.find("SelectionChanged") != std::string::npos)
             {
+                out << "        if (!m_navigation_ready || m_syncing_nav_selection) return;\n";
                 out << "        // synthesized: tag dispatch into " << frame_name << "\n";
-                out << "        if (args)\n";
+                out << "        std::wstring __navigation_tag;\n";
+                out << "        if (args.IsSettingsSelected()) __navigation_tag = L\"__settings__\";\n";
+                out << "        else\n";
                 out << "        {\n";
-                out << "            void* nav_raw = args.get_abi();\n";
-                out << "            void* nav_out = nullptr;\n";
-                out << "            if (nav_raw && winrt::impl::query_interface(nav_raw, winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::NavigationViewSelectionChangedEventArgs>, &nav_out) >= 0 && nav_out)\n";
-                out << "            {\n";
-                out << "                auto nav_args = winrt::Microsoft::UI::Xaml::Controls::NavigationViewSelectionChangedEventArgs::from_abi(nav_out);\n";
-                out << "                if (nav_args.IsSettingsSelected()) { _navigate_to_tag(L\"__settings__\"); }\n";
-                out << "                else\n";
-                out << "                {\n";
-                out << "                    winrt::IInspectable sel = nav_args.SelectedItem();\n";
-                out << "                    if (sel)\n";
-                out << "                    {\n";
-                out << "                        void* item_out = nullptr;\n";
-                out << "                        if (winrt::impl::query_interface(sel.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::NavigationViewItem>, &item_out) >= 0 && item_out)\n";
-                out << "                        {\n";
-                out << "                            auto item = winrt::Microsoft::UI::Xaml::Controls::NavigationViewItem::from_abi(item_out);\n";
-                out << "                            auto tag = winrt::unbox_value_or<winrt::hstring>(item.Tag(), winrt::hstring{});\n";
-                out << "                            if (tag.empty()) tag = winrt::unbox_value_or<winrt::hstring>(item.Content(), winrt::hstring{});\n";
-                out << "                            if (!tag.empty()) _navigate_to_tag(tag.to_view());\n";
-                out << "                        }\n";
-                out << "                    }\n";
-                out << "                }\n";
-                out << "            }\n";
+                out << "            auto selected = args.SelectedItem();\n";
+                out << "            if (!selected) return;\n";
+                out << "            void* item_out = nullptr;\n";
+                out << "            if (winrt::impl::query_interface(selected.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::NavigationViewItem>, &item_out) < 0 || !item_out) return;\n";
+                out << "            auto item = winrt::Microsoft::UI::Xaml::Controls::NavigationViewItem::from_abi(item_out);\n";
+                out << "            auto item_tag = _navigation_item_tag(item);\n";
+                out << "            if (item_tag.empty()) return;\n";
+                out << "            __navigation_tag = std::wstring(item_tag.to_view());\n";
+                out << "        }\n";
+                out << "        auto __dispatcher = winrt::Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();\n";
+                out << "        if (!__dispatcher.get_abi() || !__dispatcher.TryEnqueue([this, __navigation_tag = std::move(__navigation_tag)] { _navigate_to_tag(__navigation_tag); }))\n";
+                out << "        {\n";
+                out << "            winrt::boot_log(\"navigation:dispatcher-rejected-selection\");\n";
                 out << "        }\n";
             }
             if (!loaded_cb_name.empty() && cb == loaded_cb_name)
             {
-                out << "        // synthesized: initial navigation (first menu item)\n";
-                out << "        if (" << frame_name << ".Content() == nullptr)\n";
-                out << "        {\n";
-                out << "            auto items0 = " << nav_view_name << ".MenuItems();\n";
-                out << "            if (items0 && items0.get_Size() > 0)\n";
-                out << "            {\n";
-                out << "                " << nav_view_name << ".SelectedItem(items0.GetAt(0));\n";
-                out << "            }\n";
-                out << "            _navigate_to_tag(L\"Home\");\n";
-                out << "        }\n";
+                out << "        _initialize_navigation();\n";
             }
         }
         auto cb_it = view.callbacks.find(cb);
@@ -3229,13 +3803,9 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
         }
         if (is_nav_window && (cb.find("BackRequested") != std::string::npos || cb.find("GoBack") != std::string::npos))
         {
-            out << "        if (!m_nav_history.empty()) {\n";
-            out << "            auto prev = m_nav_history.back();\n";
-            out << "            m_nav_history.pop_back();\n";
-            out << "            _navigate_to_tag(prev, false);\n";
-            out << "        }\n";
+            out << "        _go_back();\n";
         }
-        if (is_nav_window && has_elem("controlsSearchBox") && (cb == "OnControlsSearchBoxTextChanged" || cb == "OnControlsSearchBoxQuerySubmitted"))
+        if (is_nav_window && !search_box_name.empty() && (cb.ends_with("TextChanged") || cb.ends_with("QuerySubmitted")))
         {
             out << "        struct _nav_entry { wchar_t const* title; wchar_t const* tag; };\n";
             out << "        static constexpr _nav_entry s_entries[] = {\n";
@@ -3249,31 +3819,31 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
             out << "            { L\"Settings\", L\"__settings__\" }\n";
             out << "        };\n";
             out << "        auto to_lo = [](std::wstring_view sv) { std::wstring r(sv); for (auto& ch : r) if (ch >= L'A' && ch <= L'Z') ch += (L'a' - L'A'); return r; };\n";
-            if (cb == "OnControlsSearchBoxTextChanged")
+            if (cb.ends_with("TextChanged"))
             {
-                out << "        if (args) {\n";
+                out << "        if (args.get_abi()) {\n";
                 out << "            void* tc_out = nullptr;\n";
                 out << "            if (winrt::impl::query_interface(args.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::AutoSuggestBoxTextChangedEventArgs>, &tc_out) >= 0 && tc_out) {\n";
                 out << "                auto tc = winrt::Microsoft::UI::Xaml::Controls::AutoSuggestBoxTextChangedEventArgs::from_abi(tc_out);\n";
                 out << "                if (tc.Reason() != winrt::Microsoft::UI::Xaml::Controls::AutoSuggestionBoxTextChangeReason::UserInput) return;\n";
                 out << "            }\n";
                 out << "        }\n";
-                out << "        auto q = to_lo(controlsSearchBox.Text().to_view());\n";
-                out << "        if (q.empty()) { controlsSearchBox.ItemsSource(winrt::IInspectable{nullptr}); return; }\n";
-                out << "        auto vec = winrt::single_threaded_vector<winrt::hstring>();\n";
+                out << "        auto q = to_lo(" << search_box_name << ".Text().to_view());\n";
+                out << "        if (q.empty()) { " << search_box_name << ".ItemsSource(winrt::IInspectable{nullptr}); return; }\n";
+                out << "        auto vec = winrt::single_threaded_vector<winrt::IInspectable>();\n";
                 out << "        int matches = 0;\n";
                 out << "        for (auto const& e : s_entries) {\n";
-                out << "            if (to_lo(e.title).find(q) != std::wstring::npos || to_lo(e.tag).find(q) != std::wstring::npos) {\n";
-                out << "                inspectable_append(vec, winrt::hstring(e.title));\n";
+                out << "            if (to_lo(e.title).starts_with(q) || to_lo(e.tag).starts_with(q)) {\n";
+                out << "                inspectable_append(vec, winrt::box_value(winrt::hstring(e.title)));\n";
                 out << "                if (++matches >= 12) break;\n";
                 out << "            }\n";
                 out << "        }\n";
-                out << "        controlsSearchBox.ItemsSource(vec);\n";
+                out << "        " << search_box_name << ".ItemsSource(vec);\n";
             }
             else
             {
-                out << "        std::wstring q = std::wstring(controlsSearchBox.Text().to_view());\n";
-                out << "        if (args) {\n";
+                out << "        std::wstring q = std::wstring(" << search_box_name << ".Text().to_view());\n";
+                out << "        if (args.get_abi()) {\n";
                 out << "            void* qs_out = nullptr;\n";
                 out << "            if (winrt::impl::query_interface(args.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::AutoSuggestBoxQuerySubmittedEventArgs>, &qs_out) >= 0 && qs_out) {\n";
                 out << "                auto qs = winrt::Microsoft::UI::Xaml::Controls::AutoSuggestBoxQuerySubmittedEventArgs::from_abi(qs_out);\n";
@@ -3292,169 +3862,128 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                 out << "        }\n";
             }
         }
-        if (view.name == "SettingsPage" && (cb == "ThemeModeSelectionChanged" || cb == "themeMode_SelectionChanged") && has_elem("themeMode"))
-        {
-            out << "        int idx = themeMode.SelectedIndex();\n";
-            out << "        if (idx == 0) apply_app_theme(false);\n";
-            out << "        else if (idx == 1) apply_app_theme(true);\n";
-            out << "        else if (idx == 2) { bool sys_dark = !is_system_light_mode(); apply_app_theme(sys_dark); g_theme_state.theme_idx = 0; }\n";
-            out << "        RequestedTheme(get_global_theme());\n";
-        }
-        if (view.name == "SettingsPage" && (cb == "NavigationLocationSelectionChanged" || cb == "navigationLocation_SelectionChanged") && has_elem("navigationLocation"))
-        {
-            out << "        int idx = navigationLocation.SelectedIndex();\n";
-            out << "        if (g_theme_state.set_nav_mode && idx >= 0) g_theme_state.set_nav_mode(idx);\n";
-        }
-        if (view.name == "SettingsPage" && (cb == "SoundToggleToggled" || cb == "soundToggle_Toggled") && has_elem("soundToggle") && has_elem("SpatialAudioCard"))
-        {
-            out << "        bool on = soundToggle.IsOn();\n";
-            out << "        SpatialAudioCard.IsEnabled(on);\n";
-        }
-        if (view.name == "ControlExample" && cb == "SelectorBarItemLoaded")
-        {
-            out << "        auto item = winrt::Microsoft::UI::Xaml::Controls::SelectorBarItem::wrap_borrowed(sender.get_abi());\n";
-            out << "        if (item.get_abi())\n";
-            out << "        {\n";
-            out << "            auto tag = winrt::unbox_value_or<winrt::hstring>(item.Tag(), L\"\");\n";
-            out << "            bool has_code = false;\n";
-            out << "            if (tag == L\"Xaml\") has_code = (xaml.size() > 0) || (xamlSource.size() > 0);\n";
-            out << "            else if (tag == L\"CSharp\") has_code = (cSharp.size() > 0) || (cSharpSource.size() > 0);\n";
-            out << "            item.Visibility(has_code ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed);\n";
-            out << "            if (has_code && SelectorBarControl.SelectedItem().get_abi() == nullptr) SelectorBarControl.SelectedItem(item);\n";
-            out << "        }\n";
-        }
-        if (view.name == "ControlExample" && cb == "SelectorBarControlSelectionChanged")
-        {
-            out << "        auto sel = SelectorBarControl.SelectedItem();\n";
-            out << "        if (sel.get_abi())\n";
-            out << "        {\n";
-            out << "            auto tag = winrt::unbox_value_or<winrt::hstring>(sel.Tag(), L\"\");\n";
-            out << "            auto x_vis = (tag == L\"Xaml\") ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed;\n";
-            out << "            auto c_vis = (tag == L\"CSharp\") ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed;\n";
-            out << "            XamlPresenter.Visibility(x_vis);\n";
-            out << "            CSharpPresenter.Visibility(c_vis);\n";
-            out << "            XamlContentPresenter.Visibility(x_vis);\n";
-            out << "            CSharpContentPresenter.Visibility(c_vis);\n";
-            out << "        }\n";
-        }
-        if (view.name == "SampleCodePresenter" && (cb == "CodePresenterLoaded" || cb == "SampleCodePresenterLoaded"))
-        {
-            out << "        if (code.size() > 0 && CodeScrollViewer.get_abi())\n";
-            out << "        {\n";
-            out << "            auto tb = winrt::Microsoft::UI::Xaml::Controls::TextBlock();\n";
-            out << "            tb.Text(winrt::hstring(code.c_str()));\n";
-            out << "            tb.IsTextSelectionEnabled(true);\n";
-            out << "            tb.FontFamily(winrt::Microsoft::UI::Xaml::Media::FontFamily(L\"Consolas\"));\n";
-            out << "            CodeScrollViewer.Content(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(tb.m_unknown.get()));\n";
-            out << "        }\n";
-        }
-        if (view.name == "HorizontalScrollContainer")
-        {
-            if (cb == "ScrollBackBtn_Click" || cb == "ScrollBackBtnClick")
-            {
-                out << "        if (scroller.m_unknown.get()) {\n";
-                out << "            double target = scroller.HorizontalOffset() - scroller.ViewportWidth();\n";
-                out << "            if (target < 0.0) target = 0.0;\n";
-                out << "            scroller.ChangeView(winrt::Windows::Foundation::IReference<double>(target), nullptr, nullptr);\n";
-                out << "        }\n";
-            }
-            else if (cb == "ScrollForwardBtn_Click" || cb == "ScrollForwardBtnClick")
-            {
-                out << "        if (scroller.m_unknown.get()) {\n";
-                out << "            double target = scroller.HorizontalOffset() + scroller.ViewportWidth();\n";
-                out << "            scroller.ChangeView(winrt::Windows::Foundation::IReference<double>(target), nullptr, nullptr);\n";
-                out << "        }\n";
-            }
-            else if (cb == "Scroller_SizeChanged" || cb == "ScrollerSizeChanged")
-            {
-                out << "        auto dq = winrt::Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();\n";
-                out << "        if (dq.get_abi()) {\n";
-                out << "            dq.TryEnqueue([this]() {\n";
-                out << "                if (scroller.m_unknown.get() && ScrollForwardBtn.m_unknown.get()) {\n";
-                out << "                    auto f_vis = (scroller.ScrollableWidth() > 0) ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed;\n";
-                out << "                    if (ScrollForwardBtn.Visibility() != f_vis) ScrollForwardBtn.Visibility(f_vis);\n";
-                out << "                }\n";
-                out << "            });\n";
-                out << "        }\n";
-            }
-            else if (cb == "Scroller_ViewChanging" || cb == "ScrollerViewChanging" || cb == "Scroller_ViewChanged" || cb == "ScrollerViewChanged")
-            {
-                out << "        if (scroller.m_unknown.get()) {\n";
-                out << "            double off = scroller.HorizontalOffset();\n";
-                out << "            double sw = scroller.ScrollableWidth();\n";
-                out << "            if (ScrollBackBtn.m_unknown.get()) {\n";
-                out << "                auto b_vis = (off > 1.0) ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed;\n";
-                out << "                if (ScrollBackBtn.Visibility() != b_vis) ScrollBackBtn.Visibility(b_vis);\n";
-                out << "            }\n";
-                out << "            if (ScrollForwardBtn.m_unknown.get()) {\n";
-                out << "                auto f_vis = (sw > 1.0 && off < sw - 1.0) ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed;\n";
-                out << "                if (ScrollForwardBtn.Visibility() != f_vis) ScrollForwardBtn.Visibility(f_vis);\n";
-                out << "            }\n";
-                out << "        }\n";
-            }
-        }
-        if (cb == "OnItemGridViewContainerContentChanging")
+        if (cb.ends_with("ContainerContentChanging"))
         {
             out << "        try {\n";
             out << "            void* e_raw = nullptr;\n";
             out << "            if (winrt::impl::query_interface(args.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::IContainerContentChangingEventArgs>, &e_raw) >= 0 && e_raw) {\n";
             out << "                auto e = winrt::Microsoft::UI::Xaml::Controls::ContainerContentChangingEventArgs::from_abi(e_raw);\n";
+            out << "                if (e.InRecycleQueue()) return;\n";
             out << "                auto container = e.ItemContainer();\n";
+            out << "                if (!container.get_abi()) return;\n";
+            out << "                auto root = container.ContentTemplateRoot();\n";
+            out << "                if (!root.get_abi()) {\n";
+            out << "                    if (e.Phase() < 1) e.RegisterUpdateCallback([this](auto const& s, auto const& next) { " << cb << "(s, next); });\n";
+            out << "                    return;\n";
+            out << "                }\n";
             out << "                auto item = e.Item();\n";
-            out << "                if (container.get_abi() && item.get_abi()) {\n";
+            out << "                if (item.get_abi()) {\n";
             out << "                    winrt::hstring title, subtitle, img_path;\n";
-            out << "                    static const winrt::winrt_guid iid_map{0x1b0d3570,0x0877,0x5ec2,{0x8a,0x2c,0x1b,0x95,0x37,0x37,0x0a,0x4a}};\n";
+            out << "                    bool is_experimental = false;\n";
+            out << "                    auto iid_map = winrt::Windows::Foundation::Collections::IMap<winrt::hstring, winrt::IInspectable>::iid();\n";
             out << "                    void* map_raw = nullptr;\n";
             out << "                    if (winrt::impl::query_interface(item.get_abi(), iid_map, &map_raw) >= 0 && map_raw) {\n";
             out << "                        auto get_val = [&](wchar_t const* k) -> winrt::hstring {\n";
-            out << "                            auto v = theme_find_in_raw_map(map_raw, k);\n";
+            out << "                            auto v = theme_find_in_raw_hstring_map(map_raw, k);\n";
             out << "                            return winrt::unbox_value_or<winrt::hstring>(v, L\"\");\n";
             out << "                        };\n";
             out << "                        title = get_val(L\"Title\");\n";
             out << "                        subtitle = get_val(L\"Subtitle\");\n";
             out << "                        img_path = get_val(L\"ImagePath\");\n";
+            out << "                        is_experimental = winrt::unbox_value_or<bool>(theme_find_in_raw_hstring_map(map_raw, L\"IsExperimental\"), false);\n";
             out << "                        auto* vt = *reinterpret_cast<void* const**>(map_raw);\n";
             out << "                        using release_t = std::uint32_t(__stdcall*)(void*);\n";
             out << "                        reinterpret_cast<release_t>(vt[2])(map_raw);\n";
             out << "                    }\n";
-            out << "                    auto root = container.ContentTemplateRoot();\n";
-            out << "                    if (root.get_abi()) {\n";
-            out << "                        void* fe_raw = nullptr;\n";
-            out << "                        if (winrt::impl::query_interface(root.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::IFrameworkElement>, &fe_raw) >= 0 && fe_raw) {\n";
-            out << "                            auto fe = winrt::Microsoft::UI::Xaml::FrameworkElement::from_abi(fe_raw);\n";
-            out << "                            auto t_obj = fe.FindName(L\"titleText\");\n";
-            out << "                            if (t_obj.get_abi()) {\n";
-            out << "                                void* tb_raw = nullptr;\n";
-            out << "                                if (winrt::impl::query_interface(t_obj.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::ITextBlock>, &tb_raw) >= 0 && tb_raw) {\n";
-            out << "                                    auto tb = winrt::Microsoft::UI::Xaml::Controls::TextBlock::from_abi(tb_raw);\n";
+            out << "                    {\n";
+            out << "                        bool title_set = false;\n";
+            out << "                        bool sub_set = false;\n";
+            out << "                        bool experimental_badge_found = false;\n";
+            out << "                        std::function<void(winrt::Microsoft::UI::Xaml::UIElement const&)> bind_tree;\n";
+            out << "                        bind_tree = [&](winrt::Microsoft::UI::Xaml::UIElement const& el) {\n";
+            out << "                            if (!el.get_abi()) return;\n";
+            out << "                            void* tb_raw = nullptr;\n";
+            out << "                            if (winrt::impl::query_interface(el.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::ITextBlock>, &tb_raw) >= 0 && tb_raw) {\n";
+            out << "                                auto tb = winrt::Microsoft::UI::Xaml::Controls::TextBlock::from_abi(tb_raw);\n";
+            out << "                                if (tb.Text() == L\"Experimental\") {\n";
+            out << "                                    experimental_badge_found = true;\n";
+            out << "                                    return;\n";
+            out << "                                }\n";
+            out << "                                if (!title_set) {\n";
             out << "                                    tb.Text(title);\n";
+            out << "                                    title_set = true;\n";
+            out << "                                } else if (!sub_set) {\n";
+            out << "                                    tb.Text(subtitle);\n";
+            out << "                                    sub_set = true;\n";
             out << "                                }\n";
+            out << "                                return;\n";
             out << "                            }\n";
-            out << "                            auto s_obj = fe.FindName(L\"subtitleText\");\n";
-            out << "                            if (s_obj.get_abi()) {\n";
-            out << "                                void* sb_raw = nullptr;\n";
-            out << "                                if (winrt::impl::query_interface(s_obj.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::ITextBlock>, &sb_raw) >= 0 && sb_raw) {\n";
-            out << "                                    auto sb = winrt::Microsoft::UI::Xaml::Controls::TextBlock::from_abi(sb_raw);\n";
-            out << "                                    sb.Text(subtitle);\n";
-            out << "                                }\n";
-            out << "                            }\n";
-            out << "                            auto i_obj = fe.FindName(L\"gridImage\");\n";
-            out << "                            if (i_obj.get_abi() && !img_path.empty()) {\n";
-            out << "                                void* img_raw = nullptr;\n";
-            out << "                                if (winrt::impl::query_interface(i_obj.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::IImage>, &img_raw) >= 0 && img_raw) {\n";
-            out << "                                    auto im = winrt::Microsoft::UI::Xaml::Controls::Image::from_abi(img_raw);\n";
+            out << "                            void* im_raw = nullptr;\n";
+            out << "                            if (winrt::impl::query_interface(el.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::IImage>, &im_raw) >= 0 && im_raw) {\n";
+            out << "                                auto im = winrt::Microsoft::UI::Xaml::Controls::Image::from_abi(im_raw);\n";
+            out << "                                if (!img_path.empty()) {\n";
             out << "                                    try {\n";
-            out << "                                        im.Source(winrt::Microsoft::UI::Xaml::Media::Imaging::BitmapImage(winrt::Windows::Foundation::Uri(img_path)));\n";
-            out << "                                    } catch (...) {}\n";
+            out << "                                        auto isrc = image_source_lookup_th(img_path.c_str());\n";
+            out << "                                        if (isrc.get_abi()) im.Source(isrc);\n";
+            out << "                                        else im.Source(winrt::Microsoft::UI::Xaml::Media::Imaging::BitmapImage(winrt::Windows::Foundation::Uri(img_path)));\n";
+            out << "                                    } catch (...) { winrt::report_current_exception(\"card image binding\"); }\n";
             out << "                                }\n";
+            out << "                                return;\n";
+            out << "                            }\n";
+            out << "                            void* p_raw = nullptr;\n";
+            out << "                            void* border_raw = nullptr;\n";
+            out << "                            if (winrt::impl::query_interface(el.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::IBorder>, &border_raw) >= 0 && border_raw) {\n";
+            out << "                                auto border = winrt::Microsoft::UI::Xaml::Controls::Border::from_abi(border_raw);\n";
+            out << "                                auto child = border.Child();\n";
+            out << "                                void* label_raw = nullptr;\n";
+            out << "                                if (child.get_abi() && winrt::impl::query_interface(child.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::ITextBlock>, &label_raw) >= 0 && label_raw) {\n";
+            out << "                                    auto label = winrt::Microsoft::UI::Xaml::Controls::TextBlock::from_abi(label_raw);\n";
+            out << "                                    if (label.Text() == L\"Experimental\") {\n";
+            out << "                                        experimental_badge_found = true;\n";
+            out << "                                        border.Visibility(is_experimental ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed);\n";
+            out << "                                        return;\n";
+            out << "                                    }\n";
+            out << "                                }\n";
+            out << "                                bind_tree(child);\n";
+            out << "                                return;\n";
+            out << "                            }\n";
+            out << "                            if (winrt::impl::query_interface(el.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::IPanel>, &p_raw) >= 0 && p_raw) {\n";
+            out << "                                auto p = winrt::Microsoft::UI::Xaml::Controls::Panel::from_abi(p_raw);\n";
+            out << "                                auto kids = p.Children();\n";
+            out << "                                if (kids.get_abi()) {\n";
+            out << "                                    uint32_t cnt = kids.Size();\n";
+            out << "                                    for (uint32_t i = 0; i < cnt; ++i) bind_tree(kids.GetAt(i));\n";
+            out << "                                }\n";
+            out << "                            }\n";
+            out << "                        };\n";
+            out << "                        bind_tree(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(root.get_abi()));\n";
+            out << "                        if (is_experimental && !experimental_badge_found) {\n";
+            out << "                            void* panel_raw = nullptr;\n";
+            out << "                            if (winrt::impl::query_interface(root.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::IPanel>, &panel_raw) >= 0 && panel_raw) {\n";
+            out << "                                auto badge = winrt::Microsoft::UI::Xaml::Controls::Border();\n";
+            out << "                                badge.Margin(winrt::Microsoft::UI::Xaml::Thickness{-8,-8,-8,-8});\n";
+            out << "                                badge.Padding(winrt::Microsoft::UI::Xaml::Thickness{8,4,8,4});\n";
+            out << "                                badge.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Bottom);\n";
+            out << "                                badge.Background(theme_brush_th(L\"SystemFillColorCautionBackgroundBrush\"));\n";
+            out << "                                badge.CornerRadius(winrt::Microsoft::UI::Xaml::CornerRadius{0,0,7,7});\n";
+            out << "                                auto label = winrt::Microsoft::UI::Xaml::Controls::TextBlock();\n";
+            out << "                                label.Text(L\"Experimental\");\n";
+            out << "                                label.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Center);\n";
+            out << "                                label.Foreground(theme_brush_th(L\"SystemFillColorCautionBrush\"));\n";
+            out << "                                label.FontSize(12);\n";
+            out << "                                badge.Child(label);\n";
+            out << "                                winrt::Microsoft::UI::Xaml::Controls::Grid::SetRow(badge, 1);\n";
+            out << "                                winrt::Microsoft::UI::Xaml::Controls::Grid::SetColumnSpan(badge, 2);\n";
+            out << "                                auto panel = winrt::Microsoft::UI::Xaml::Controls::Panel::from_abi(panel_raw);\n";
+            out << "                                panel.Children().Append(badge);\n";
             out << "                            }\n";
             out << "                        }\n";
             out << "                    }\n";
             out << "                }\n";
             out << "            }\n";
-            out << "        } catch (...) {}\n";
+            out << "        } catch (...) { winrt::report_current_exception(\"container content changing\"); }\n";
         }
-        if (view.name == "HomePage" && cb == "OnItemGridViewItemClick")
+        if (cb.ends_with("ItemClick"))
         {
             out << "        try {\n";
             out << "            void* e_raw = nullptr;\n";
@@ -3462,32 +3991,165 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
             out << "                auto e = winrt::Microsoft::UI::Xaml::Controls::ItemClickEventArgs::from_abi(e_raw);\n";
             out << "                auto clicked_item = e.ClickedItem();\n";
             out << "                if (clicked_item.get_abi()) {\n";
-            out << "                    void* r_raw = nullptr;\n";
-            out << "                    if (winrt::IUnknown::qi_raw(recentlyVisitedSamplesList.get_abi(), winrt::iid_of<winrt::Windows::Foundation::Collections::IVector<winrt::IInspectable>>, &r_raw) >= 0 && r_raw) {\n";
-            out << "                        auto r_vec = winrt::Windows::Foundation::Collections::IVector<winrt::IInspectable>::from_abi(r_raw);\n";
-            out << "                        r_vec.InsertAt(0, clicked_item);\n";
-            out << "                    }\n";
-            out << "                    RecentlyVisitedTitle.Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible);\n";
-            out << "                    RecentlyVisitedContainer.Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible);\n";
-            out << "                    static const winrt::winrt_guid iid_map{0x1b0d3570,0x0877,0x5ec2,{0x8a,0x2c,0x1b,0x95,0x37,0x37,0x0a,0x4a}};\n";
+            out << "                    auto iid_map = winrt::Windows::Foundation::Collections::IMap<winrt::hstring, winrt::IInspectable>::iid();\n";
             out << "                    void* map_raw = nullptr;\n";
             out << "                    if (winrt::impl::query_interface(clicked_item.get_abi(), iid_map, &map_raw) >= 0 && map_raw) {\n";
-            out << "                        auto uid_v = theme_find_in_raw_map(map_raw, L\"UniqueId\");\n";
+            out << "                        auto uid_v = theme_find_in_raw_hstring_map(map_raw, L\"UniqueId\");\n";
             out << "                        auto uid = winrt::unbox_value_or<winrt::hstring>(uid_v, L\"\");\n";
+            out << "                        auto __recent_title = winrt::unbox_value_or<winrt::hstring>(theme_find_in_raw_hstring_map(map_raw, L\"Title\"), L\"\");\n";
+            out << "                        auto __recent_subtitle = winrt::unbox_value_or<winrt::hstring>(theme_find_in_raw_hstring_map(map_raw, L\"Subtitle\"), L\"\");\n";
+            out << "                        auto __recent_image = winrt::unbox_value_or<winrt::hstring>(theme_find_in_raw_hstring_map(map_raw, L\"ImagePath\"), L\"\");\n";
+            out << "                        bool __recent_is_new = winrt::unbox_value_or<bool>(theme_find_in_raw_hstring_map(map_raw, L\"IsNew\"), false);\n";
+            out << "                        bool __recent_is_updated = winrt::unbox_value_or<bool>(theme_find_in_raw_hstring_map(map_raw, L\"IsUpdated\"), false);\n";
+            out << "                        bool __recent_is_experimental = winrt::unbox_value_or<bool>(theme_find_in_raw_hstring_map(map_raw, L\"IsExperimental\"), false);\n";
             out << "                        auto* vt = *reinterpret_cast<void* const**>(map_raw);\n";
             out << "                        using release_t = std::uint32_t(__stdcall*)(void*);\n";
             out << "                        reinterpret_cast<release_t>(vt[2])(map_raw);\n";
-            out << "                        if (!uid.empty() && g_theme_state.navigate_to) {\n";
-            out << "                            g_theme_state.navigate_to(uid.c_str());\n";
+            out << "                        if (!uid.empty()) {\n";
+            out << "                            load_recent_history();\n";
+            out << "                            std::wstring __recent_id(uid.to_view());\n";
+            out << "                            for (auto __it = get_recent_history_state().recently_visited_ids.begin(); __it != get_recent_history_state().recently_visited_ids.end();) {\n";
+            out << "                                if (*__it == __recent_id) __it = get_recent_history_state().recently_visited_ids.erase(__it); else ++__it;\n";
+            out << "                            }\n";
+            out << "                            get_recent_history_state().recently_visited_ids.insert(get_recent_history_state().recently_visited_ids.begin(), __recent_id);\n";
+            out << "                            for (auto __it = get_recent_history_state().recently_visited_items.begin(); __it != get_recent_history_state().recently_visited_items.end();) {\n";
+            out << "                                if (__it->id == __recent_id) __it = get_recent_history_state().recently_visited_items.erase(__it); else ++__it;\n";
+            out << "                            }\n";
+            out << "                            RecentItemData __recent_record;\n";
+            out << "                            __recent_record.id = __recent_id; __recent_record.title = __recent_title.c_str();\n";
+            out << "                            __recent_record.subtitle = __recent_subtitle.c_str(); __recent_record.image_path = __recent_image.c_str();\n";
+            out << "                            __recent_record.is_new = __recent_is_new; __recent_record.is_updated = __recent_is_updated;\n";
+            out << "                            __recent_record.is_experimental = __recent_is_experimental;\n";
+            out << "                            get_recent_history_state().recently_visited_items.insert(get_recent_history_state().recently_visited_items.begin(), std::move(__recent_record));\n";
+            out << "                            save_recent_history();\n";
+            for (auto const& source_name : recently_visited_source_vars) {
+                std::string cap_name = source_name;
+                if (!cap_name.empty()) cap_name[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(cap_name[0])));
+                std::string member_name = (cap_name == source_name && !element_named_types.count(source_name))
+                    ? ("m_" + source_name) : source_name;
+                out << "                            { void* __recent_raw = nullptr;\n";
+                out << "                              if (winrt::IUnknown::qi_raw(" << member_name
+                    << ".get_abi(), winrt::Windows::Foundation::Collections::IVector<winrt::IInspectable>::iid(), &__recent_raw) >= 0 && __recent_raw) {\n";
+                out << "                                  auto __recent_vector = winrt::Windows::Foundation::Collections::IVector<winrt::IInspectable>::from_abi(__recent_raw);\n";
+                out << "                                  for (std::uint32_t __i = __recent_vector.get_Size(); __i > 0; --__i) {\n";
+                out << "                                      auto __existing_item = __recent_vector.GetAt(__i - 1); void* __existing_map_raw = nullptr;\n";
+                out << "                                      if (winrt::IUnknown::qi_raw(__existing_item.get_abi(), iid_map, &__existing_map_raw) >= 0 && __existing_map_raw) {\n";
+                out << "                                          auto __existing_uid = winrt::unbox_value_or<winrt::hstring>(theme_find_in_raw_hstring_map(__existing_map_raw, L\"UniqueId\"), L\"\");\n";
+                out << "                                          auto* __existing_vt = *reinterpret_cast<void* const**>(__existing_map_raw); reinterpret_cast<release_t>(__existing_vt[2])(__existing_map_raw);\n";
+                out << "                                          if (__existing_uid == uid) __recent_vector.RemoveAt(__i - 1);\n";
+                out << "                                      }\n";
+                out << "                                  }\n";
+                out << "                                  __recent_vector.InsertAt(0, clicked_item);\n";
+                out << "                              }\n";
+                out << "                            }\n";
+            }
+            for (auto const& element_name : recent_section_element_names)
+                if (has_elem(element_name))
+                    out << "                            if (" << element_name << ".m_unknown.get()) " << element_name << ".Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible);\n";
+            out << "                            if (g_theme_state.navigate_to) g_theme_state.navigate_to(uid.c_str());\n";
             out << "                        }\n";
             out << "                    }\n";
             out << "                }\n";
             out << "            }\n";
-            out << "        } catch (...) {}\n";
+            out << "        } catch (...) { winrt::report_current_exception(\"item click\"); }\n";
         }
         if (cb_it != view.callbacks.end())
         {
+            auto trim_callback_stmt = [](std::string value) {
+                while (!value.empty() && (value.front() == ' ' || value.front() == '\t'
+                    || value.front() == '\r' || value.front() == '\n')) value.erase(value.begin());
+                while (!value.empty() && (value.back() == ' ' || value.back() == '\t'
+                    || value.back() == '\r' || value.back() == '\n' || value.back() == ';')) value.pop_back();
+                return value;
+            };
+            auto matching_delimiter = [](std::string const& text, std::size_t open, char left, char right) {
+                int depth = 0;
+                bool in_string = false;
+                bool escaped = false;
+                for (std::size_t i = open; i < text.size(); ++i) {
+                    char ch = text[i];
+                    if (in_string) {
+                        if (escaped) escaped = false;
+                        else if (ch == '\\') escaped = true;
+                        else if (ch == '"') in_string = false;
+                        continue;
+                    }
+                    if (ch == '"') { in_string = true; continue; }
+                    if (ch == left) ++depth;
+                    else if (ch == right && --depth == 0) return i;
+                }
+                return std::string::npos;
+            };
+            auto split_callback_body = [&](std::string const& body) {
+                std::vector<std::string> statements;
+                std::size_t start = 0;
+                int parens = 0, braces = 0;
+                bool in_string = false, escaped = false;
+                for (std::size_t i = 0; i < body.size(); ++i) {
+                    char ch = body[i];
+                    if (in_string) {
+                        if (escaped) escaped = false;
+                        else if (ch == '\\') escaped = true;
+                        else if (ch == '"') in_string = false;
+                        continue;
+                    }
+                    if (ch == '"') { in_string = true; continue; }
+                    if (ch == '(') ++parens;
+                    else if (ch == ')' && parens > 0) --parens;
+                    else if (ch == '{') ++braces;
+                    else if (ch == '}' && braces > 0) --braces;
+                    else if (ch == ';' && parens == 0 && braces == 0) {
+                        statements.push_back(body.substr(start, i - start));
+                        start = i + 1;
+                    }
+                }
+                if (start < body.size()) statements.push_back(body.substr(start));
+                return statements;
+            };
+            std::vector<std::string> callback_statements;
+            std::function<void(std::string const&, unsigned)> expand_callback_stmt;
+            expand_callback_stmt = [&](std::string const& raw, unsigned depth) {
+                std::string stmt = trim_callback_stmt(raw);
+                if (stmt.empty()) return;
+                if (depth < 32 && stmt.rfind("if", 0) == 0
+                    && (stmt.size() == 2 || std::isspace(static_cast<unsigned char>(stmt[2])) || stmt[2] == '(')) {
+                    auto open_paren = stmt.find('(');
+                    auto close_paren = open_paren == std::string::npos
+                        ? std::string::npos : matching_delimiter(stmt, open_paren, '(', ')');
+                    auto open_brace = close_paren == std::string::npos
+                        ? std::string::npos : stmt.find('{', close_paren + 1);
+                    auto close_brace = open_brace == std::string::npos
+                        ? std::string::npos : matching_delimiter(stmt, open_brace, '{', '}');
+                    if (close_brace != std::string::npos) {
+                        callback_statements.push_back("if (" + stmt.substr(open_paren + 1,
+                            close_paren - open_paren - 1) + ") {");
+                        for (auto const& child : split_callback_body(
+                            stmt.substr(open_brace + 1, close_brace - open_brace - 1)))
+                            expand_callback_stmt(child, depth + 1);
+                        callback_statements.push_back("}");
+                        std::string tail = trim_callback_stmt(stmt.substr(close_brace + 1));
+                        if (tail.rfind("else", 0) == 0) {
+                            auto else_brace = tail.find('{', 4);
+                            auto else_end = else_brace == std::string::npos
+                                ? std::string::npos : matching_delimiter(tail, else_brace, '{', '}');
+                            if (else_end != std::string::npos) {
+                                callback_statements.push_back("else {");
+                                for (auto const& child : split_callback_body(
+                                    tail.substr(else_brace + 1, else_end - else_brace - 1)))
+                                    expand_callback_stmt(child, depth + 1);
+                                callback_statements.push_back("}");
+                                return;
+                            }
+                        }
+                        return;
+                    }
+                }
+                callback_statements.push_back(std::move(stmt));
+            };
             for (auto const& raw_stmt : cb_it->second)
+                expand_callback_stmt(raw_stmt, 0);
+
+            for (auto const& raw_stmt : callback_statements)
             {
                 auto trim = [](std::string s) {
                     while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(s.begin());
@@ -3496,6 +4158,818 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                 };
                 std::string stmt = trim(raw_stmt);
                 if (stmt.empty()) continue;
+                auto is_ident = [](std::string const& s) {
+                    auto alpha = [](char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; };
+                    auto alnum = [&](char c) { return alpha(c) || (c >= '0' && c <= '9'); };
+                    if (s.empty() || !alpha(s[0])) return false;
+                    for (char c : s) if (!alnum(c)) return false;
+                    return true;
+                };
+                auto cpp_qualified = [](std::string const& ns, std::string const& type) {
+                    std::string out = "winrt::";
+                    for (char ch : ns) {
+                        if (ch == '.') out += "::";
+                        else out += ch;
+                    }
+                    return out + "::" + type;
+                };
+                auto rewrite_enum_values = [&](std::string expression) {
+                    for (std::size_t p = 0; p < expression.size();) {
+                        if (!(std::isalpha(static_cast<unsigned char>(expression[p])) || expression[p] == '_')) { ++p; continue; }
+                        std::size_t name_end = p + 1;
+                        while (name_end < expression.size()
+                            && (std::isalnum(static_cast<unsigned char>(expression[name_end])) || expression[name_end] == '_')) ++name_end;
+                        std::string enum_name = expression.substr(p, name_end - p);
+                        bool already_qualified = p > 0
+                            && (expression[p - 1] == '.' || expression[p - 1] == ':');
+                        if (name_end < expression.size() && expression[name_end] == '.') {
+                            std::size_t member_begin = name_end + 1, member_end = member_begin;
+                            while (member_end < expression.size()
+                                && (std::isalnum(static_cast<unsigned char>(expression[member_end])) || expression[member_end] == '_')) ++member_end;
+                            auto eit = g_enum_info.find(enum_name);
+                            if (eit != g_enum_info.end()
+                                && eit->second.second.count(expression.substr(member_begin, member_end - member_begin))) {
+                                std::string const& enum_namespace = eit->second.first;
+                                std::size_t namespace_begin = p > enum_namespace.size()
+                                    ? p - enum_namespace.size() - 1 : std::string::npos;
+                                bool fully_qualified = namespace_begin != std::string::npos
+                                    && expression.compare(namespace_begin, enum_namespace.size(), enum_namespace) == 0
+                                    && expression[namespace_begin + enum_namespace.size()] == '.'
+                                    && (namespace_begin == 0
+                                        || !(std::isalnum(static_cast<unsigned char>(expression[namespace_begin - 1]))
+                                            || expression[namespace_begin - 1] == '_'
+                                            || expression[namespace_begin - 1] == '.'));
+                                if (already_qualified && !fully_qualified) {
+                                    p = name_end;
+                                    continue;
+                                }
+                                std::size_t replace_begin = fully_qualified ? namespace_begin : p;
+                                std::string qualified = cpp_qualified(enum_namespace, enum_name) + "::"
+                                    + expression.substr(member_begin, member_end - member_begin);
+                                expression.replace(replace_begin, member_end - replace_begin, qualified);
+                                p = replace_begin + qualified.size();
+                                continue;
+                            }
+                        }
+                        p = name_end;
+                    }
+                    return expression;
+                };
+                auto rewrite_static_property_reads = [&](std::string expression) {
+                    for (std::size_t p = 0; p < expression.size();) {
+                        if (!(std::isalpha(static_cast<unsigned char>(expression[p])) || expression[p] == '_')) {
+                            ++p;
+                            continue;
+                        }
+                        std::size_t type_end = p + 1;
+                        while (type_end < expression.size()
+                            && (std::isalnum(static_cast<unsigned char>(expression[type_end])) || expression[type_end] == '_'))
+                            ++type_end;
+                        if (type_end >= expression.size() || expression[type_end] != '.') {
+                            p = type_end;
+                            continue;
+                        }
+                        std::size_t property_begin = type_end + 1, property_end = property_begin;
+                        while (property_end < expression.size()
+                            && (std::isalnum(static_cast<unsigned char>(expression[property_end])) || expression[property_end] == '_'))
+                            ++property_end;
+                        if (property_end == property_begin
+                            || (property_end < expression.size() && expression[property_end] == '(')) {
+                            p = property_end;
+                            continue;
+                        }
+                        std::string type_name = expression.substr(p, type_end - p);
+                        std::string property_name = expression.substr(property_begin, property_end - property_begin);
+                        auto type_ns = g_type_ns.find(type_name);
+                        std::string type_key = type_name;
+                        for (auto& ch : type_key) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                        std::string property_key = property_name;
+                        for (auto& ch : property_key) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                        auto type_properties = g_type_prop_kinds.find(type_key);
+                        if (type_ns == g_type_ns.end() || g_enum_info.count(type_name)
+                            || named_elements.count(type_name)
+                            || type_properties == g_type_prop_kinds.end()
+                            || !type_properties->second.count(property_key)) {
+                            p = property_end;
+                            continue;
+                        }
+                        std::string replacement = cpp_qualified(type_ns->second, type_name)
+                            + "::get_" + property_name + "()";
+                        expression.replace(p, property_end - p, replacement);
+                        p += replacement.size();
+                    }
+                    return expression;
+                };
+                auto is_view_base_property_name = [&](std::string const& name) {
+                    std::string base_name = view.base_type;
+                    auto separator = base_name.find_last_of(".:");
+                    if (separator != std::string::npos) base_name = base_name.substr(separator + 1);
+                    for (auto& ch : base_name)
+                        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                    std::string property_name = name;
+                    for (auto& ch : property_name)
+                        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                    auto properties = g_type_prop_kinds.find(base_name);
+                    return properties != g_type_prop_kinds.end()
+                        && properties->second.count(property_name) != 0;
+                };
+                auto is_state_variable_name = [&](std::string const& name) {
+                    for (auto const& state : view.state_vars) {
+                        if (state.name.size() != name.size()) continue;
+                        bool same = true;
+                        for (std::size_t i = 0; i < name.size(); ++i)
+                            if (std::tolower(static_cast<unsigned char>(state.name[i]))
+                                != std::tolower(static_cast<unsigned char>(name[i]))) {
+                                same = false;
+                                break;
+                            }
+                        if (same) return true;
+                    }
+                    return false;
+                };
+                auto rewrite_static_method_calls = [&](std::string expression) {
+                    auto is_state_name = [&](std::string const& name) {
+                        return is_state_variable_name(name);
+                    };
+                    bool in_string = false;
+                    bool escaped = false;
+                    for (std::size_t p = 0; p < expression.size();) {
+                        char ch = expression[p];
+                        if (in_string) {
+                            if (escaped) escaped = false;
+                            else if (ch == '\\') escaped = true;
+                            else if (ch == '"') in_string = false;
+                            ++p;
+                            continue;
+                        }
+                        if (ch == '"') { in_string = true; ++p; continue; }
+                        if (!(std::isalpha(static_cast<unsigned char>(ch)) || ch == '_')) {
+                            ++p;
+                            continue;
+                        }
+                        std::size_t type_end = p + 1;
+                        while (type_end < expression.size()
+                            && (std::isalnum(static_cast<unsigned char>(expression[type_end])) || expression[type_end] == '_'))
+                            ++type_end;
+                        bool root_identifier = p == 0
+                            || !(std::isalnum(static_cast<unsigned char>(expression[p - 1]))
+                                || expression[p - 1] == '_' || expression[p - 1] == '.');
+                        if (!root_identifier || type_end + 1 >= expression.size()
+                            || expression[type_end] != '.') {
+                            p = type_end;
+                            continue;
+                        }
+                        std::size_t method_begin = type_end + 1, method_end = method_begin;
+                        while (method_end < expression.size()
+                            && (std::isalnum(static_cast<unsigned char>(expression[method_end])) || expression[method_end] == '_'))
+                            ++method_end;
+                        if (method_end == method_begin || method_end >= expression.size()
+                            || expression[method_end] != '(') {
+                            p = method_end;
+                            continue;
+                        }
+                        std::string type_name = expression.substr(p, type_end - p);
+                        auto type_ns = g_type_ns.find(type_name);
+                        if (type_ns == g_type_ns.end() || named_elements.count(type_name)
+                            || is_state_name(type_name)) {
+                            p = method_end;
+                            continue;
+                        }
+                        if (is_view_base_property_name(type_name)) {
+                            std::string replacement = "this->" + type_name + "()";
+                            expression.replace(p, type_end - p, replacement);
+                            p += replacement.size();
+                            continue;
+                        }
+                        std::string method_key = expression.substr(method_begin, method_end - method_begin);
+                        for (auto& c : method_key)
+                            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                        std::string type_key = type_name;
+                        for (auto& c : type_key)
+                            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                        auto static_methods = g_type_static_methods.find(type_key);
+                        if (static_methods == g_type_static_methods.end()
+                            || !static_methods->second.count(method_key)) {
+                            p = method_end;
+                            continue;
+                        }
+                        std::string replacement = cpp_qualified(type_ns->second, type_name)
+                            + "::" + expression.substr(method_begin, method_end - method_begin);
+                        expression.replace(p, method_end - p, replacement);
+                        p += replacement.size();
+                    }
+                    return expression;
+                };
+                auto rewrite_element_reads = [&](std::string expression) {
+                    auto metadata_type_key = [](std::string type_name) {
+                        auto generic = type_name.find('<');
+                        if (generic != std::string::npos) type_name.resize(generic);
+                        auto separator = type_name.find_last_of(".:");
+                        if (separator != std::string::npos) type_name = type_name.substr(separator + 1);
+                        for (auto& ch : type_name)
+                            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                        return type_name;
+                    };
+                    auto collection_type = [&](std::string const& type_name) {
+                        std::string key = metadata_type_key(type_name);
+                        return key == "itemcollection" || key.find("vector") != std::string::npos
+                            || key.find("collection") != std::string::npos || key.find("list") != std::string::npos;
+                    };
+                    auto rewrite_element = [&](std::string const& name, std::string current_type) {
+                        std::size_t from = 0;
+                        while ((from = expression.find(name, from)) != std::string::npos) {
+                            std::size_t end = from + name.size();
+                            bool boundary = from == 0
+                                || !(std::isalnum(static_cast<unsigned char>(expression[from - 1])) || expression[from - 1] == '_');
+                            bool this_access = from >= 6 && expression.compare(from - 6, 6, "this->") == 0;
+                            bool member_access = (from > 0 && expression[from - 1] == '.')
+                                || (from >= 2 && expression.compare(from - 2, 2, "->") == 0);
+                            if (this_access) member_access = false;
+                            if (!boundary || member_access
+                                || end >= expression.size() || expression[end] != '.') { from = end; continue; }
+                            std::size_t dot = end;
+                            while (dot < expression.size() && expression[dot] == '.') {
+                                std::size_t member = dot + 1, member_end = member;
+                                while (member_end < expression.size()
+                                    && (std::isalnum(static_cast<unsigned char>(expression[member_end])) || expression[member_end] == '_')) ++member_end;
+                                if (member_end == member) break;
+                                std::string member_name = expression.substr(member, member_end - member);
+                                if (member_name == "Count" && collection_type(current_type)) {
+                                    expression.replace(member, member_end - member, "Size");
+                                    member_end = member + 4;
+                                    member_name = "Size";
+                                }
+                                if (member_name != "Count") {
+                                    auto properties = g_type_prop_kinds.find(metadata_type_key(current_type));
+                                    if (properties != g_type_prop_kinds.end()) {
+                                        std::string key = member_name;
+                                        for (auto& ch : key)
+                                            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                                        if (auto property = properties->second.find(key); property != properties->second.end())
+                                            current_type = property->second;
+                                        else
+                                            current_type.clear();
+                                    } else {
+                                        current_type.clear();
+                                    }
+                                }
+                                if (member_end >= expression.size() || expression[member_end] != '(') {
+                                    expression.insert(member_end, "()");
+                                    dot = member_end + 2;
+                                } else {
+                                    auto call_end = expression.find(')', member_end + 1);
+                                    if (call_end == std::string::npos) break;
+                                    dot = call_end + 1;
+                                }
+                            }
+                            from = end;
+                        }
+                    };
+                    for (auto const& [name, type] : named_elements) {
+                        rewrite_element(name, type);
+                    }
+                    for (auto const& state : view.state_vars) {
+                        rewrite_element(state.name, state.type);
+                    }
+                    if (uses_main_window_access) {
+                        for (auto const& [type, name] : view.main_window_controls) {
+                            (void)type;
+                            rewrite_element(name, type);
+                        }
+                    }
+                    return expression;
+                };
+                auto is_view_base_property = [&](std::string const& name) {
+                    if (named_elements.count(name)) return false;
+                    for (auto const& state : view.state_vars) {
+                        if (state.name.size() != name.size()) continue;
+                        bool same = true;
+                        for (std::size_t i = 0; i < name.size(); ++i)
+                            if (std::tolower(static_cast<unsigned char>(state.name[i]))
+                                != std::tolower(static_cast<unsigned char>(name[i]))) {
+                                same = false;
+                                break;
+                            }
+                        if (same) return false;
+                    }
+                    std::string base_name = view.base_type;
+                    auto separator = base_name.find_last_of(".:");
+                    if (separator != std::string::npos) base_name = base_name.substr(separator + 1);
+                    for (auto& ch : base_name)
+                        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                    std::string property_name = name;
+                    for (auto& ch : property_name)
+                        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                    auto properties = g_type_prop_kinds.find(base_name);
+                    return properties != g_type_prop_kinds.end()
+                        && properties->second.count(property_name) != 0;
+                };
+                auto rewrite_view_base_property_reads = [&](std::string expression) {
+                    bool in_string = false;
+                    bool escaped = false;
+                    for (std::size_t p = 0; p < expression.size();) {
+                        char ch = expression[p];
+                        if (in_string) {
+                            if (escaped) escaped = false;
+                            else if (ch == '\\') escaped = true;
+                            else if (ch == '"') in_string = false;
+                            ++p;
+                            continue;
+                        }
+                        if (ch == '"') { in_string = true; ++p; continue; }
+                        if (!(std::isalpha(static_cast<unsigned char>(ch)) || ch == '_')) {
+                            ++p;
+                            continue;
+                        }
+                        std::size_t end = p + 1;
+                        while (end < expression.size()
+                            && (std::isalnum(static_cast<unsigned char>(expression[end])) || expression[end] == '_')) ++end;
+                        bool root_identifier = p == 0
+                            || !(std::isalnum(static_cast<unsigned char>(expression[p - 1]))
+                                || expression[p - 1] == '_' || expression[p - 1] == '.');
+                        bool member_chain = end < expression.size()
+                            && (expression[end] == '.' || expression[end] == '(');
+                        std::string name = expression.substr(p, end - p);
+                        if (!root_identifier || !member_chain || g_enum_info.count(name)
+                            || (p >= 2 && expression.compare(p - 2, 2, "->") == 0)
+                            || !is_view_base_property(name)) {
+                            p = end;
+                            continue;
+                        }
+                        std::string replacement = "this->" + name + "()";
+                        expression.replace(p, end - p, replacement);
+                        p += replacement.size();
+                    }
+                    return expression;
+                };
+                auto rewrite_main_window_access = [&](std::string expression) {
+                    if (!uses_main_window_access) return expression;
+                    std::size_t from = 0;
+                    while ((from = expression.find(main_window_access_prefix, from)) != std::string::npos) {
+                        bool boundary = from == 0
+                            || !(std::isalnum(static_cast<unsigned char>(expression[from - 1])) || expression[from - 1] == '_');
+                        if (!boundary) {
+                            from += main_window_access_prefix.size();
+                            continue;
+                        }
+                        std::size_t member_begin = from + main_window_access_prefix.size();
+                        std::size_t member_end = member_begin;
+                        while (member_end < expression.size()
+                            && (std::isalnum(static_cast<unsigned char>(expression[member_end])) || expression[member_end] == '_'))
+                            ++member_end;
+                        if (member_end == member_begin) {
+                            from = member_end;
+                            continue;
+                        }
+                        std::string member = expression.substr(member_begin, member_end - member_begin);
+                        std::string resolved_control;
+                        std::string resolved_name;
+                        for (auto const& [control, name] : view.main_window_controls) {
+                            if (control != member && name != member) continue;
+                            if (!resolved_control.empty()) {
+                                resolved_control.clear();
+                                resolved_name.clear();
+                                break;
+                            }
+                            resolved_control = control;
+                            resolved_name = name;
+                        }
+                        auto type_ns = g_type_ns.find(resolved_control);
+                        if (resolved_control.empty() || resolved_name.empty() || type_ns == g_type_ns.end()) {
+                            from = member_end;
+                            continue;
+                        }
+                        std::string replacement = "[]() { auto __main_window_control = ::main_window_control<"
+                            + cpp_qualified(type_ns->second, resolved_control)
+                            + ">(L\"" + resolved_control + "\"); return __main_window_control";
+                        expression.replace(from, member_end - from, replacement);
+                        std::size_t tail = from + replacement.size();
+                        while (tail < expression.size() && expression[tail] == '.') {
+                            std::size_t tail_member = tail + 1;
+                            std::size_t tail_end = tail_member;
+                            while (tail_end < expression.size()
+                                && (std::isalnum(static_cast<unsigned char>(expression[tail_end])) || expression[tail_end] == '_'))
+                                ++tail_end;
+                            if (tail_end == tail_member) break;
+                            if (tail_end >= expression.size() || expression[tail_end] != '(') {
+                                expression.insert(tail_end, "()");
+                                tail = tail_end + 2;
+                            } else {
+                                tail = tail_end + 1;
+                            }
+                        }
+                        expression.insert(tail, "; }()");
+                        from = tail;
+                    }
+                    return expression;
+                };
+                auto rewrite_callback_expr = [&](std::string expression) {
+                    for (std::size_t p = 0; (p = expression.find("self->", p)) != std::string::npos;)
+                        expression.replace(p, 6, "this->");
+                    for (std::size_t p = 0; (p = expression.find("null", p)) != std::string::npos;) {
+                        std::size_t null_length = expression.compare(p, 7, "nullptr") == 0 ? 7 : 4;
+                        bool left_boundary = p == 0
+                            || !(std::isalnum(static_cast<unsigned char>(expression[p - 1])) || expression[p - 1] == '_');
+                        bool right_boundary = p + null_length >= expression.size()
+                            || !(std::isalnum(static_cast<unsigned char>(expression[p + null_length])) || expression[p + null_length] == '_');
+                        if (!left_boundary || !right_boundary) {
+                            p += null_length;
+                            continue;
+                        }
+                        std::size_t lhs_end = p;
+                        while (lhs_end > 0 && std::isspace(static_cast<unsigned char>(expression[lhs_end - 1]))) --lhs_end;
+                        std::size_t op_begin = lhs_end;
+                        if (op_begin >= 2 && (expression.compare(op_begin - 2, 2, "!=") == 0
+                            || expression.compare(op_begin - 2, 2, "==") == 0))
+                            op_begin -= 2;
+                        if (op_begin != lhs_end) {
+                            std::size_t cursor = op_begin;
+                            while (cursor > 0 && std::isspace(static_cast<unsigned char>(expression[cursor - 1]))) --cursor;
+                            std::size_t lhs_begin = cursor;
+                            while (cursor > 0) {
+                                if (expression[cursor - 1] == ')') {
+                                    std::size_t open = cursor - 1;
+                                    std::size_t depth = 1;
+                                    while (open > 0 && depth != 0) {
+                                        --open;
+                                        if (expression[open] == ')') ++depth;
+                                        else if (expression[open] == '(') --depth;
+                                    }
+                                    if (depth != 0) break;
+                                    cursor = open;
+                                }
+                                std::size_t ident_end = cursor;
+                                while (cursor > 0) {
+                                    char ch = expression[cursor - 1];
+                                    if (std::isalnum(static_cast<unsigned char>(ch)) || ch == '_')
+                                        --cursor;
+                                    else
+                                        break;
+                                }
+                                if (cursor == ident_end) break;
+                                lhs_begin = cursor;
+                                if (cursor > 0 && expression[cursor - 1] == '.') {
+                                    --cursor;
+                                    continue;
+                                }
+                                if (cursor >= 2 && expression.compare(cursor - 2, 2, "->") == 0) {
+                                    cursor -= 2;
+                                    continue;
+                                }
+                                break;
+                            }
+                            if (lhs_begin < op_begin) {
+                                std::string lhs = expression.substr(lhs_begin, op_begin - lhs_begin);
+                                bool is_not_null = expression.compare(op_begin, 2, "!=") == 0;
+                                std::string replacement = is_not_null
+                                    ? "(" + lhs + ".get_abi() != nullptr)"
+                                    : "(" + lhs + ".get_abi() == nullptr)";
+                                expression.replace(lhs_begin, p + null_length - lhs_begin, replacement);
+                                p = lhs_begin + replacement.size();
+                                continue;
+                            }
+                        }
+                        if (null_length == 4) expression.replace(p, null_length, "nullptr");
+                        p += 7;
+                    }
+                    for (auto const& state : view.state_vars) {
+                        std::string state_type = state.type;
+                        for (auto& ch : state_type)
+                            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                        bool has_scalar_accessor = state_type == "string" || state_type == "int"
+                            || state_type == "double" || state_type == "bool" || state_type == "color"
+                            || state_type == "any" || state_type == "object" || state_type == "hstring"
+                            || state_type == "winrt::hstring" || state_type == "boolean"
+                            || state_type == "integer" || state_type == "any[]" || state_type == "object[]"
+                            || (state_type.size() > 2 && state_type.substr(state_type.size() - 2) == "[]");
+                        if (!has_scalar_accessor || inferred_types.count(state.name)
+                            || element_named_types.count(state.name))
+                            continue;
+                        std::string property_name = state.name;
+                        if (!property_name.empty())
+                            property_name[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(property_name[0])));
+                        if (named_elements.count(property_name))
+                            continue;
+                        std::size_t p = 0;
+                        while ((p = expression.find(property_name, p)) != std::string::npos) {
+                            std::size_t end = p + property_name.size();
+                            bool boundary = p == 0
+                                || !(std::isalnum(static_cast<unsigned char>(expression[p - 1])) || expression[p - 1] == '_');
+                            bool member_access = p >= 2 && expression.compare(p - 2, 2, "->") == 0;
+                            if (!boundary || member_access || (end < expression.size()
+                                && (std::isalnum(static_cast<unsigned char>(expression[end])) || expression[end] == '_' || expression[end] == '('))) {
+                                p = end;
+                                continue;
+                            }
+                            expression.insert(end, "()");
+                            p = end + 2;
+                        }
+                    }
+                    auto metadata_type_key = [](std::string type_name) {
+                        auto generic = type_name.find('<');
+                        if (generic != std::string::npos) type_name.resize(generic);
+                        auto separator = type_name.find_last_of(".:");
+                        if (separator != std::string::npos) type_name = type_name.substr(separator + 1);
+                        for (auto& ch : type_name)
+                            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                        return type_name;
+                    };
+                    auto is_color_type = [&](std::string type_name) {
+                        return metadata_type_key(std::move(type_name)) == "color";
+                    };
+                    auto is_color_property = [&](std::string const& property_name) {
+                        std::string key = property_name;
+                        for (auto& ch : key)
+                            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                        for (auto const& state : view.state_vars) {
+                            std::string state_name = state.name;
+                            for (auto& ch : state_name)
+                                ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                            if (state_name == key && is_color_type(state.type))
+                                return true;
+                        }
+                        if (auto own_type = g_type_prop_kinds.find(metadata_type_key(view.name));
+                            own_type != g_type_prop_kinds.end()) {
+                            if (auto property = own_type->second.find(key); property != own_type->second.end())
+                                return is_color_type(property->second);
+                        }
+                        bool found = false;
+                        for (auto const& [type_name, properties] : g_type_prop_kinds) {
+                            (void)type_name;
+                            auto property = properties.find(key);
+                            if (property == properties.end()) continue;
+                            found = true;
+                            if (!is_color_type(property->second)) return false;
+                        }
+                        return found;
+                    };
+                    std::size_t to_string = 0;
+                    while ((to_string = expression.find(".ToString()", to_string)) != std::string::npos) {
+                        std::size_t receiver_end = to_string;
+                        std::size_t cursor = receiver_end;
+                        if (cursor > 0 && expression[cursor - 1] == ')') {
+                            int nesting = 1;
+                            --cursor;
+                            while (cursor > 0 && nesting > 0) {
+                                --cursor;
+                                if (expression[cursor] == ')') ++nesting;
+                                else if (expression[cursor] == '(') --nesting;
+                            }
+                        }
+                        while (cursor > 0
+                            && (std::isalnum(static_cast<unsigned char>(expression[cursor - 1]))
+                                || expression[cursor - 1] == '_')) --cursor;
+                        while (cursor > 0 && expression[cursor - 1] == '.') {
+                            --cursor;
+                            while (cursor > 0
+                                && (std::isalnum(static_cast<unsigned char>(expression[cursor - 1]))
+                                    || expression[cursor - 1] == '_')) --cursor;
+                        }
+                        std::size_t property_end = receiver_end;
+                        if (property_end >= 2 && expression.compare(property_end - 2, 2, "()") == 0)
+                            property_end -= 2;
+                        std::size_t property_begin = property_end;
+                        while (property_begin > 0
+                            && (std::isalnum(static_cast<unsigned char>(expression[property_begin - 1]))
+                                || expression[property_begin - 1] == '_')) --property_begin;
+                        std::string property_name = expression.substr(property_begin, property_end - property_begin);
+                        if (!is_color_property(property_name)) {
+                            to_string += 11;
+                            continue;
+                        }
+                        std::string receiver = expression.substr(cursor, receiver_end - cursor);
+                        if (receiver.empty() || receiver.back() != ')') receiver += "()";
+                        std::string replacement = "format_color(" + receiver + ")";
+                        expression.replace(cursor, to_string + 11 - cursor, replacement);
+                        to_string = cursor + replacement.size();
+                    }
+                    expression = rewrite_main_window_access(std::move(expression));
+                    expression = rewrite_element_reads(std::move(expression));
+                    expression = rewrite_view_base_property_reads(std::move(expression));
+                    for (std::size_t p = 0; (p = expression.find("FinalView().HorizontalOffset()", p)) != std::string::npos;) {
+                        std::size_t start = (p >= 5 && expression.compare(p - 5, 5, "args.") == 0) ? p - 5 : p;
+                        std::string replacement = "([&]() -> double { if (args.get_abi()) { auto __fv = args.FinalView(); if (__fv.m_unknown.get()) return __fv.HorizontalOffset(); } if (scroller.m_unknown.get()) return scroller.HorizontalOffset(); return 0.0; })()";
+                        expression.replace(start, (p + 30) - start, replacement);
+                        p = start + replacement.size();
+                    }
+                    for (std::size_t p = 0; (p = expression.find("FinalView().VerticalOffset()", p)) != std::string::npos;) {
+                        std::size_t start = (p >= 5 && expression.compare(p - 5, 5, "args.") == 0) ? p - 5 : p;
+                        std::string replacement = "([&]() -> double { if (args.get_abi()) { auto __fv = args.FinalView(); if (__fv.m_unknown.get()) return __fv.VerticalOffset(); } if (scroller.m_unknown.get()) return scroller.VerticalOffset(); return 0.0; })()";
+                        expression.replace(start, (p + 28) - start, replacement);
+                        p = start + replacement.size();
+                    }
+                    std::vector<std::pair<std::string, std::string>> element_types;
+                    element_types.reserve(named_elements.size() + view.state_vars.size());
+                    for (auto const& [element, projected_type] : named_elements)
+                        element_types.emplace_back(element, projected_type);
+                    for (auto const& state : view.state_vars) {
+                        if (std::none_of(element_types.begin(), element_types.end(),
+                            [&](auto const& entry) { return entry.first == state.name; }))
+                            element_types.emplace_back(state.name, state.type);
+                    }
+                    for (auto const& [element, projected_type] : element_types) {
+                        std::string type_key = projected_type;
+                        if (auto const scope = type_key.rfind("::"); scope != std::string::npos)
+                            type_key = type_key.substr(scope + 2);
+                        for (auto& ch : type_key)
+                            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                        auto properties = g_type_prop_kinds.find(type_key);
+                        if (properties == g_type_prop_kinds.end()) continue;
+                        std::size_t from = 0;
+                        while ((from = expression.find(element, from)) != std::string::npos) {
+                            std::size_t end = from + element.size();
+                            bool boundary = from == 0
+                                || !(std::isalnum(static_cast<unsigned char>(expression[from - 1])) || expression[from - 1] == '_');
+                            if (!boundary || end + 1 >= expression.size()
+                                || expression[end] != '.') {
+                                from = end;
+                                continue;
+                            }
+                            std::size_t property_end = end + 1;
+                            while (property_end < expression.size()
+                                && (std::isalnum(static_cast<unsigned char>(expression[property_end])) || expression[property_end] == '_'))
+                                ++property_end;
+                            if (property_end == end + 1
+                                || property_end + 1 >= expression.size()
+                                || expression.compare(property_end, 2, "()") != 0) {
+                                from = property_end;
+                                continue;
+                            }
+                            std::string property_key = expression.substr(end + 1, property_end - end - 1);
+                            for (auto& ch : property_key)
+                                ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                            auto property_type = properties->second.find(property_key);
+                            if (property_type == properties->second.end()) {
+                                from = property_end + 2;
+                                continue;
+                            }
+                            std::string value_type = property_type->second;
+                            for (auto& ch : value_type)
+                                ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                            bool nullable_bool = false;
+                            auto reference_start = value_type.find("ireference<");
+                            if (reference_start != std::string::npos) {
+                                auto argument_start = reference_start + std::string_view("ireference<").size();
+                                auto argument_end = value_type.find('>', argument_start);
+                                if (argument_end != std::string::npos) {
+                                    auto argument = value_type.substr(argument_start, argument_end - argument_start);
+                                    nullable_bool = argument == "bool" || argument == "boolean";
+                                }
+                            }
+                            std::size_t read_end = property_end + 2;
+                            std::string read = expression.substr(from, read_end - from);
+                            if (nullable_bool && (read_end >= expression.size()
+                                || (expression[read_end] != '.' && expression[read_end] != '('))) {
+                                std::string replacement = "winrt::unbox_value_or<bool>(" + read + ", false)";
+                                expression.replace(from, read.size(), replacement);
+                                from += replacement.size();
+                                continue;
+                            }
+                            std::string_view normalized_type = value_type;
+                            bool boxed_value = normalized_type == "object" || normalized_type == "any"
+                                || normalized_type == "inspectable" || normalized_type == "winrt::iinspectable";
+                            std::size_t comparison = read_end;
+                            while (comparison < expression.size()
+                                && std::isspace(static_cast<unsigned char>(expression[comparison]))) ++comparison;
+                            bool equality = expression.compare(comparison, 2, "==") == 0
+                                || expression.compare(comparison, 2, "!=") == 0;
+                            if (boxed_value && equality) {
+                                comparison += 2;
+                                while (comparison < expression.size()
+                                    && std::isspace(static_cast<unsigned char>(expression[comparison]))) ++comparison;
+                                if (comparison < expression.size() && expression[comparison] == 'L') ++comparison;
+                                if (comparison < expression.size() && expression[comparison] == '"') {
+                                    std::string replacement = "winrt::unbox_value_or<winrt::hstring>("
+                                        + read + ", winrt::hstring{})";
+                                    expression.replace(from, read.size(), replacement);
+                                    from += replacement.size();
+                                    continue;
+                                }
+                            }
+                            from = read_end;
+                        }
+                    }
+                    auto unique_property_type = [&](std::string const& property_key) {
+                        std::string result;
+                        for (auto const& [type_name, properties] : g_type_prop_kinds) {
+                            (void)type_name;
+                            auto property = properties.find(property_key);
+                            if (property == properties.end()) continue;
+                            auto candidate = metadata_type_key(property->second);
+                            if (result.empty()) result = std::move(candidate);
+                            else if (result != candidate) return std::string{};
+                        }
+                        return result;
+                    };
+                    for (std::string_view parameter_name : {std::string_view("sender"), std::string_view("args")}) {
+                        std::size_t from = 0;
+                        while ((from = expression.find(parameter_name, from)) != std::string::npos) {
+                            std::size_t end = from + parameter_name.size();
+                            bool boundary = from == 0
+                                || !(std::isalnum(static_cast<unsigned char>(expression[from - 1]))
+                                    || expression[from - 1] == '_');
+                            if (!boundary || end >= expression.size() || expression[end] != '.') {
+                                from = end;
+                                continue;
+                            }
+                            std::size_t member = end + 1;
+                            std::string current_type;
+                            bool first_property = true;
+                            while (member < expression.size()) {
+                                std::size_t member_end = member;
+                                while (member_end < expression.size()
+                                    && (std::isalnum(static_cast<unsigned char>(expression[member_end]))
+                                        || expression[member_end] == '_')) ++member_end;
+                                if (member_end == member) break;
+                                std::string property_key = expression.substr(member, member_end - member);
+                                for (auto& ch : property_key)
+                                    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                                std::string next_type;
+                                if (first_property) {
+                                    next_type = unique_property_type(property_key);
+                                } else if (auto properties = g_type_prop_kinds.find(current_type);
+                                    properties != g_type_prop_kinds.end()) {
+                                    if (auto property = properties->second.find(property_key);
+                                        property != properties->second.end())
+                                        next_type = metadata_type_key(property->second);
+                                }
+                                if (next_type.empty()) {
+                                    if (first_property && (member_end >= expression.size()
+                                        || expression[member_end] != '(')) {
+                                        expression.insert(member_end, "()");
+                                        member_end += 2;
+                                    }
+                                    break;
+                                }
+                                if (member_end >= expression.size() || expression[member_end] != '(') {
+                                    expression.insert(member_end, "()");
+                                    member_end += 2;
+                                }
+                                current_type = std::move(next_type);
+                                first_property = false;
+                                if (member_end >= expression.size() || expression[member_end] != '.')
+                                    break;
+                                member = member_end + 1;
+                            }
+                            from = end + 1;
+                        }
+                    }
+                    expression = rewrite_enum_values(std::move(expression));
+                    expression = rewrite_element_reads(std::move(expression));
+                    expression = rewrite_view_base_property_reads(std::move(expression));
+                    for (std::size_t p = 0; (p = expression.find("FinalView().HorizontalOffset()", p)) != std::string::npos;) {
+                        std::size_t start = (p >= 5 && expression.compare(p - 5, 5, "args.") == 0) ? p - 5 : p;
+                        std::string replacement = "([&]() -> double { if (args.get_abi()) { auto __fv = args.FinalView(); if (__fv.m_unknown.get()) return __fv.HorizontalOffset(); } if (scroller.m_unknown.get()) return scroller.HorizontalOffset(); return 0.0; })()";
+                        expression.replace(start, (p + 30) - start, replacement);
+                        p = start + replacement.size();
+                    }
+                    for (std::size_t p = 0; (p = expression.find("FinalView().VerticalOffset()", p)) != std::string::npos;) {
+                        std::size_t start = (p >= 5 && expression.compare(p - 5, 5, "args.") == 0) ? p - 5 : p;
+                        std::string replacement = "([&]() -> double { if (args.get_abi()) { auto __fv = args.FinalView(); if (__fv.m_unknown.get()) return __fv.VerticalOffset(); } if (scroller.m_unknown.get()) return scroller.VerticalOffset(); return 0.0; })()";
+                        expression.replace(start, (p + 28) - start, replacement);
+                        p = start + replacement.size();
+                    }
+                    expression = rewrite_static_property_reads(std::move(expression));
+                    expression = rewrite_static_method_calls(std::move(expression));
+                    for (std::size_t p = 0; (p = expression.find("this->", p)) != std::string::npos;) {
+                        std::size_t name_end = p + 6;
+                        while (name_end < expression.size()
+                            && (std::isalnum(static_cast<unsigned char>(expression[name_end]))
+                                || expression[name_end] == '_')) ++name_end;
+                        if (name_end > p + 6 && expression.compare(name_end, 2, "::") == 0) {
+                            expression.erase(p, 6);
+                            continue;
+                        }
+                        p = name_end;
+                    }
+                    return expression;
+                };
+                if (stmt.rfind("NavigateTo(", 0) == 0 && stmt.back() == ')') {
+                    std::string route = trim(stmt.substr(11, stmt.size() - 12));
+                    bool narrow_literal = route.size() >= 2 && route.front() == '"' && route.back() == '"';
+                    bool wide_literal = route.size() >= 3 && route[0] == 'L' && route[1] == '"' && route.back() == '"';
+                    if (narrow_literal || wide_literal) {
+                        if (narrow_literal) route = "L" + route;
+                        out << "        if (g_theme_state.navigate_to) g_theme_state.navigate_to(" << route << ");\n";
+                        continue;
+                    }
+                }
+                if (stmt.rfind("if (", 0) == 0 && stmt.size() >= 6 && stmt.back() == '{') {
+                    auto close = stmt.rfind(')', stmt.size() - 1);
+                    if (close != std::string::npos) {
+                        std::string condition = trim(stmt.substr(4, close - 4));
+                        out << "        if (" << rewrite_callback_expr(std::move(condition)) << ") {\n";
+                        continue;
+                    }
+                }
+                if (stmt == "else {") {
+                    out << "        else {\n";
+                    continue;
+                }
+                if (stmt == "}") {
+                    out << "        }\n";
+                    continue;
+                }
                 // <Element>.<Property> = <value>  -> named-element property setter
                 bool is_setter = false;
                 std::size_t eq = stmt.find('=');
@@ -3510,58 +4984,118 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                     std::string lhs = trim(stmt.substr(0, eq));
                     std::string rhs = trim(stmt.substr(eq + 1));
                     auto dot = lhs.find('.');
+                    if (uses_main_window_access) {
+                        auto last_dot = lhs.rfind('.');
+                        if (last_dot != std::string::npos && last_dot > 0 && last_dot + 1 < lhs.size()) {
+                            std::string parent = trim(lhs.substr(0, last_dot));
+                            if (parent.find(main_window_access_prefix) != std::string::npos) {
+                                std::string resolved_parent = rewrite_main_window_access(std::move(parent));
+                                if (resolved_parent.find("::main_window_control<") != std::string::npos) {
+                                    out << "        " << resolved_parent << "." << lhs.substr(last_dot + 1)
+                                        << "(" << rewrite_callback_expr(std::move(rhs)) << ");\n";
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    if (dot != std::string::npos && dot > 0 && dot + 1 < lhs.size()
+                        && lhs.find('.', dot + 1) == std::string::npos) {
+                        std::string type_name = lhs.substr(0, dot);
+                        std::string property_name = lhs.substr(dot + 1);
+                        auto type_ns = g_type_ns.find(type_name);
+                        if (is_ident(type_name) && is_ident(property_name) && type_ns != g_type_ns.end()
+                            && !named_elements.count(type_name)) {
+                            out << "        " << cpp_qualified(type_ns->second, type_name) << "::put_" << property_name
+                                << "(" << rewrite_callback_expr(std::move(rhs)) << ");\n";
+                            continue;
+                        }
+                    }
                     bool valid = dot != std::string::npos && dot > 0 && dot + 1 < lhs.size();
                     if (valid)
                     {
                         std::string elem = lhs.substr(0, dot);
                         std::string prop = lhs.substr(dot + 1);
-                        auto is_ident = [](std::string const& s) {
-                            auto alpha = [](char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; };
-                            auto alnum = [&](char c) { return alpha(c) || (c >= '0' && c <= '9'); };
-                            if (s.empty() || !alpha(s[0])) return false;
-                            for (char c : s) if (!alnum(c)) return false;
-                            return true;
-                        };
-                        if (is_ident(elem) && is_ident(prop) && named_elements.count(elem) && !rhs.empty())
+                        auto named_element = named_elements.find(elem);
+                        auto state_element = element_named_types.find(elem);
+                        bool is_element = named_element != named_elements.end()
+                            || state_element != element_named_types.end();
+                        if (is_ident(elem) && is_ident(prop) && is_element && !rhs.empty())
                         {
+                            std::string element_type = named_element != named_elements.end()
+                                ? named_element->second : state_element->second;
                             // Projection getters are methods: a named-element
-                            // chain used as a value needs "()" on each link
-                            // (MapToken.Password -> MapToken.Password(),
-                            //  Tooltip.IsOpen -> Tooltip.IsOpen()).
-                            std::string val_cpp = rhs;
-                            {
-                                std::string best_root;
-                                std::size_t best_pos = std::string::npos;
-                                for (auto const& [nm, t] : named_elements)
-                                {
-                                    std::size_t p = val_cpp.find(nm);
-                                    while (p != std::string::npos)
-                                    {
-                                        std::size_t q = p + nm.size();
-                                        if (q < val_cpp.size() && val_cpp[q] == '.')
-                                        {
-                                            if (best_pos == std::string::npos || p < best_pos)
-                                            { best_pos = p; best_root = nm; }
-                                            break;
+                            // chain used as a value needs "()" on each link.
+                            std::string val_cpp = rewrite_callback_expr(std::move(rhs));
+                            if (val_cpp == "nullptr") {
+                                std::string metadata_type = element_type;
+                                if (auto const scope = metadata_type.rfind("::"); scope != std::string::npos)
+                                    metadata_type = metadata_type.substr(scope + 2);
+                                for (auto& ch : metadata_type)
+                                    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                                std::string property_key = prop;
+                                for (auto& ch : property_key)
+                                    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                                if (auto const properties = g_type_prop_kinds.find(metadata_type);
+                                    properties != g_type_prop_kinds.end()) {
+                                    if (auto const property_type = properties->second.find(property_key);
+                                        property_type != properties->second.end()) {
+                                        std::string value_type = property_type->second;
+                                        if (value_type == "hstring")
+                                            val_cpp = "winrt::hstring{}";
+                                        else if (value_type == "IInspectable")
+                                            val_cpp = "winrt::IInspectable{}";
+                                        else {
+                                            auto generic = value_type.find('<');
+                                            std::string type_name = value_type.substr(0, generic);
+                                            if (generic != std::string::npos && type_name == "IReference")
+                                                val_cpp = "winrt::Windows::Foundation::" + value_type + "{}";
+                                            else if (auto const type_ns = g_type_ns.find(type_name);
+                                                type_ns != g_type_ns.end())
+                                                val_cpp = cpp_qualified(type_ns->second, type_name) + "{}";
                                         }
-                                        p = val_cpp.find(nm, q);
                                     }
                                 }
-                                if (!best_root.empty())
+                            }
+                            auto is_code_position = [&](std::size_t position) {
+                                bool in_string = false;
+                                bool escaped = false;
+                                for (std::size_t i = 0; i < position; ++i)
                                 {
-                                    std::size_t i = best_pos + best_root.size();
-                                    while (i < val_cpp.size() && val_cpp[i] == '.')
+                                    char ch = val_cpp[i];
+                                    if (escaped) { escaped = false; continue; }
+                                    if (in_string && ch == '\\') { escaped = true; continue; }
+                                    if (ch == '"') in_string = !in_string;
+                                }
+                                return !in_string;
+                            };
+                            for (auto const& [nm, t] : named_elements)
+                            {
+                                std::size_t search_from = 0;
+                                while (search_from < val_cpp.size())
+                                {
+                                    std::size_t p = val_cpp.find(nm, search_from);
+                                    if (p == std::string::npos) break;
+                                    std::size_t q = p + nm.size();
+                                    bool identifier_boundary = p == 0
+                                        || !(std::isalnum(static_cast<unsigned char>(val_cpp[p - 1])) || val_cpp[p - 1] == '_');
+                                    if (identifier_boundary && is_code_position(p) && q < val_cpp.size() && val_cpp[q] == '.')
                                     {
-                                        std::size_t j = i + 1;
-                                        while (j < val_cpp.size() && (std::isalnum(static_cast<unsigned char>(val_cpp[j])) || val_cpp[j] == '_')) ++j;
-                                        if (j >= val_cpp.size() || val_cpp[j] != '(')
+                                        std::size_t i = q;
+                                        while (i < val_cpp.size() && val_cpp[i] == '.')
                                         {
-                                            val_cpp.insert(j, "()");
-                                            i = j + 2;
+                                            std::size_t j = i + 1;
+                                            while (j < val_cpp.size() && (std::isalnum(static_cast<unsigned char>(val_cpp[j])) || val_cpp[j] == '_')) ++j;
+                                            if (j == i + 1) break;
+                                            if (j >= val_cpp.size() || val_cpp[j] != '(')
+                                            {
+                                                val_cpp.insert(j, "()");
+                                                i = j + 2;
+                                            }
+                                            else
+                                                i = j + 1;
                                         }
-                                        else
-                                            i = j + 1;
                                     }
+                                    search_from = q;
                                 }
                             }
                             if (val_cpp.size() >= 2 && val_cpp.front() == '\"' && val_cpp.back() == '\"')
@@ -3572,9 +5106,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                             for (auto& ch : prop_lo2) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
                             if (prop_lo2 == "ischecked" && (val_cpp == "true" || val_cpp == "false"))
                             {
-                                auto eit = named_elements.find(elem);
-                                std::string elem_type = (eit != named_elements.end()) ? eit->second : elem;
-                                if (!is_plain_bool_ischecked(elem_type))
+                                if (!is_plain_bool_ischecked(element_type))
                                     val_cpp = "winrt::Windows::Foundation::IReference<bool>(winrt::box_value(" + val_cpp + "))";
                             }
                             // A bare C# member (e.g. BarItems) has no projection:
@@ -3598,6 +5130,88 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
                                 }
                             }
                             out << "        " << elem << "." << prop << "(" << val_cpp << ");\n";
+                            continue;
+                        }
+                    }
+                }
+                auto call_open = stmt.find('(');
+                if (call_open != std::string::npos && stmt.back() == ')') {
+                    std::string call_path = trim(stmt.substr(0, call_open));
+                    auto call_dot = call_path.find('.');
+                    if (call_dot != std::string::npos && call_path.find('.', call_dot + 1) == std::string::npos) {
+                        std::string type_name = call_path.substr(0, call_dot);
+                        std::string method_name = call_path.substr(call_dot + 1);
+                        auto type_ns = g_type_ns.find(type_name);
+                        std::string instance_type;
+                        if (auto element = named_elements.find(type_name); element != named_elements.end())
+                            instance_type = element->second;
+                        if (instance_type.empty()) {
+                            if (auto element = element_named_types.find(type_name); element != element_named_types.end())
+                                instance_type = element->second;
+                        }
+                        if (instance_type.empty() && is_state_variable_name(type_name)) {
+                            auto lower_name = type_name;
+                            for (auto& ch : lower_name)
+                                ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                            for (auto const& state : view.state_vars) {
+                                auto state_name = state.name;
+                                for (auto& ch : state_name)
+                                    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                                if (state_name == lower_name) {
+                                    instance_type = state.type;
+                                    break;
+                                }
+                            }
+                        }
+                        if (instance_type.empty() && is_view_base_property_name(type_name))
+                            instance_type = view.base_type;
+                        auto generic = instance_type.find('<');
+                        if (generic != std::string::npos) instance_type.resize(generic);
+                        auto type_separator = instance_type.find_last_of(".:");
+                        if (type_separator != std::string::npos)
+                            instance_type = instance_type.substr(type_separator + 1);
+                        for (auto& ch : instance_type)
+                            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                        auto lower_method = method_name;
+                        for (auto& ch : lower_method)
+                            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                        auto methods = g_type_methods.find(instance_type);
+                        if (is_ident(type_name) && is_ident(method_name)
+                            && methods != g_type_methods.end() && methods->second.count(lower_method)) {
+                            out << "        " << rewrite_callback_expr(stmt) << ";\n";
+                            continue;
+                        }
+                        if (is_ident(type_name) && is_ident(method_name)
+                            && is_view_base_property_name(type_name)) {
+                            out << "        " << rewrite_callback_expr(stmt) << ";\n";
+                            continue;
+                        }
+                        std::string static_type_key = type_name;
+                        for (auto& ch : static_type_key)
+                            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                        auto static_methods = g_type_static_methods.find(static_type_key);
+                        bool metadata_static_method = static_methods != g_type_static_methods.end()
+                            && static_methods->second.count(lower_method) != 0;
+                        if (is_ident(type_name) && is_ident(method_name) && type_ns != g_type_ns.end()
+                            && metadata_static_method && !named_elements.count(type_name)
+                            && !element_named_types.count(type_name) && !is_state_variable_name(type_name)) {
+                            std::string arguments = trim(stmt.substr(call_open + 1, stmt.size() - call_open - 2));
+                            auto tag_expr_pos = arguments.find("(sender.Tag)");
+                            if (tag_expr_pos != std::string::npos) {
+                                std::size_t enum_end = tag_expr_pos;
+                                while (enum_end > 0
+                                    && (std::isalnum(static_cast<unsigned char>(arguments[enum_end - 1])) || arguments[enum_end - 1] == '_')) --enum_end;
+                                std::string enum_name = arguments.substr(enum_end, tag_expr_pos - enum_end);
+                                auto enum_type = g_enum_info.find(enum_name);
+                                if (enum_type != g_enum_info.end()) {
+                                    std::string tag_value = "winrt::unbox_value_or<winrt::hstring>(winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(sender.get_abi()).Tag(), L\"0\")";
+                                    std::string cast_expr = "static_cast<" + cpp_qualified(enum_type->second.first, enum_name)
+                                        + ">(std::stoi(std::wstring(" + tag_value + ".to_view())))";
+                                    arguments.replace(enum_end, tag_expr_pos + std::string("(sender.Tag)").size() - enum_end, cast_expr);
+                                }
+                            }
+                            out << "        " << cpp_qualified(type_ns->second, type_name) << "::" << method_name
+                                << "(" << rewrite_callback_expr(std::move(arguments)) << ");\n";
                             continue;
                         }
                     }
@@ -3674,11 +5288,27 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     // the window through this function. The class derives from the projected
     // Window struct whose composable constructor creates the real runtime
     // window via IWindowFactory::CreateInstance.
-    if (is_window_class && !is_shell)
+    if (is_window_class && !is_shell
+        && (view.main_window_class.empty() || view.name == view.main_window_class))
     {
         out << "\nexport " << cpp_class << "& get_" << class_name << "()\n";
         out << "{\n";
         out << "    static " << cpp_class << " window_view;\n";
+        out << "    g_theme_state.get_main_window_control = +[](wchar_t const* control_type) -> void* {\n";
+        out << "        if (!control_type) return nullptr;\n";
+        out << "        std::wstring_view requested{control_type};\n";
+        std::map<std::string, std::set<std::string>> control_members;
+        for (auto const& [control, name] : view.main_window_controls)
+            if (!control.empty() && !name.empty())
+                control_members[control].insert(name);
+        for (auto const& [control, members] : control_members)
+        {
+            if (members.size() != 1) continue;
+            out << "        if (requested == L\"" << control << "\") return window_view."
+                << *members.begin() << ".m_unknown.get();\n";
+        }
+        out << "        return nullptr;\n";
+        out << "    };\n";
         out << "    return window_view;\n";
         out << "}\n";
         out << "\nexport void launch_" << class_name << "()\n";

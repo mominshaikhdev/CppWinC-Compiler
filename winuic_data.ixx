@@ -169,7 +169,11 @@ struct layout_event
 struct layout_node
 {
     std::string control;
+    std::string slot;
     std::vector<std::pair<std::string, std::string>> props;
+    std::set<std::string> literal_props;
+    std::unordered_map<std::string, std::string> state_refs;
+    std::unordered_map<std::string, std::string> binding_refs;
     std::vector<layout_event> events;
     std::vector<layout_node> children;
     std::vector<std::pair<std::string, std::string>> raw_attrs;
@@ -180,6 +184,16 @@ struct layout_node
     bool is_foreach = false;
     std::string collection;
 };
+
+inline std::string layout_value_text(json_value const& value)
+{
+    if (value.is_str()) return value.s;
+    if (value.is_obj())
+        for (auto const* key : { "$literal", "$state", "$binding" })
+            if (auto const* tagged = value.find(key))
+                return tagged->str_or("");
+    return {};
+}
 
 struct layout_view
 {
@@ -205,9 +219,12 @@ struct layout_view
     // hardcoded coupling.
     std::string main_window_class;
     std::string main_window_ns;
+    std::string application_class;
+    std::vector<std::pair<std::string, std::string>> main_window_controls;
     std::string app_icon_path;
     std::string backdrop_type;
     std::string titlebar_text;
+    std::string settings_page;
     // NavigationView tag -> page runtime class name ("ns.Page"), in menu
     // order (driver-computed from the project's own views; never hardcoded).
     // Non-empty only for window views; drives the synthesized nav handler.
@@ -228,6 +245,7 @@ inline layout_node parse_body_node(json_value const& j)
 {
     layout_node node;
     if (auto const* c = j.find("control")) node.control = c->str_or("");
+    if (auto const* slot = j.find("slot")) node.slot = slot->str_or("");
 
     if (node.control == "If")
     {
@@ -235,7 +253,7 @@ inline layout_node parse_body_node(json_value const& j)
         if (auto const* p = j.find("props"); p && p->is_obj())
             if (auto const* cond = p->find("condition"))
             {
-                node.condition = cond->str_or("");
+            node.condition = layout_value_text(*cond);
                 if (node.condition.size() >= 2 && node.condition.front() == '"' && node.condition.back() == '"')
                     node.condition = node.condition.substr(1, node.condition.size() - 2);
             }
@@ -251,7 +269,7 @@ inline layout_node parse_body_node(json_value const& j)
         if (auto const* p = j.find("props"); p && p->is_obj())
             if (auto const* col = p->find("collection"))
             {
-                node.collection = col->str_or("");
+            node.collection = layout_value_text(*col);
                 if (node.collection.size() >= 2 && node.collection.front() == '"' && node.collection.back() == '"')
                     node.collection = node.collection.substr(1, node.collection.size() - 2);
             }
@@ -268,6 +286,24 @@ inline layout_node parse_body_node(json_value const& j)
             if (v.is_str()) val = v.s;
             else if (v.is_num()) val = (v.n == static_cast<int64_t>(v.n)) ? std::to_string(static_cast<int64_t>(v.n)) : std::to_string(v.n);
             else if (v.is_bool()) val = v.b ? "true" : "false";
+            else if (v.is_obj())
+            {
+                if (auto const* literal = v.find("$literal"))
+                {
+                    val = literal->str_or("");
+                    node.literal_props.insert(k);
+                }
+                else if (auto const* state = v.find("$state"))
+                {
+                    val = state->str_or("");
+                    node.state_refs.emplace(k, val);
+                }
+                else if (auto const* binding = v.find("$binding"))
+                {
+                    val = binding->str_or("");
+                    node.binding_refs.emplace(k, val);
+                }
+            }
             node.props.emplace_back(k, std::move(val));
         }
     }
@@ -319,6 +355,8 @@ inline layout_view parse_layout_json(std::string_view json, std::string_view vie
                         if (auto const* iv = v.find("value"))
                         {
                             if (iv->is_str()) sv.initial = "\"" + iv->s + "\"";
+                            else if (iv->is_obj() && iv->find("$literal"))
+                                sv.initial = "\"" + layout_value_text(*iv) + "\"";
                             else if (iv->is_num()) sv.initial = (iv->n == static_cast<int64_t>(iv->n)) ? std::to_string(static_cast<int64_t>(iv->n)) : std::to_string(iv->n);
                             else if (iv->is_bool()) sv.initial = iv->b ? "true" : "false";
                         }
@@ -346,6 +384,24 @@ inline layout_view parse_layout_json(std::string_view json, std::string_view vie
             view.root.push_back(parse_body_node(node));
         }
     }
+    std::function<void(layout_node&)> collect_settings_page = [&](layout_node& node)
+    {
+        if (node.control == "NavigationView")
+        {
+            for (auto it = node.raw_attrs.begin(); it != node.raw_attrs.end();)
+            {
+                if (it->first == "CppWinC.SettingsPage")
+                {
+                    view.settings_page = it->second;
+                    it = node.raw_attrs.erase(it);
+                }
+                else ++it;
+            }
+        }
+        for (auto& child : node.children) collect_settings_page(child);
+        for (auto& child : node.else_branch) collect_settings_page(child);
+    };
+    for (auto& node : view.root) collect_settings_page(node);
     return view;
 }
 
@@ -360,6 +416,7 @@ inline std::string to_cxx_type(std::string_view json_type)
     // Control type references — map to WinRT types so property calls compile
     std::string s(json_type);
     for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (s == "color")           return "winrt::Windows::UI::Color";
     if (s == "toggleswitch")   return "winrt::Microsoft::UI::Xaml::Controls::ToggleSwitch";
     if (s == "textbox")        return "winrt::Microsoft::UI::Xaml::Controls::TextBox";
     if (s == "textblock")      return "winrt::Microsoft::UI::Xaml::Controls::TextBlock";
@@ -433,7 +490,7 @@ inline std::string to_cxx_type(std::string_view json_type)
     // Media/Data types - emit the bare name so ordinary lookup resolves it
     // exactly like the element-construction path does.
     if (s == "any" || s == "object") return "winrt::IInspectable";
-    if (s == "any[]" || s == "object[]") return "winrt::Windows::Foundation::Collections::IObservableVector<winrt::IInspectable>";
+    if (s == "any[]" || s == "object[]" || (s.size() > 2 && s.substr(s.size() - 2) == "[]")) return "winrt::Windows::Foundation::Collections::IObservableVector<winrt::IInspectable>";
     if (!json_type.empty() && std::isupper(static_cast<unsigned char>(json_type[0])))
         return std::string(json_type);
     return "winrt::hstring";
@@ -633,6 +690,8 @@ inline bool is_number_text(std::string raw)
 // Tooltip.Placement is PlacementMode, ...) - no control-name branches.
 // Any other value (unknown property, non-member, markup/structured
 // literal) is returned unchanged.
+inline bool is_brush_property(std::string_view pk);
+
 inline std::string resolve_typed_value(
     std::string const& control, std::string_view pk, std::string val,
     std::unordered_map<std::string, std::unordered_map<std::string, std::string>> const* prop_kinds,
@@ -642,7 +701,12 @@ inline std::string resolve_typed_value(
 
     // lowercased control leaf + property name (g_type_prop_kinds keys)
     std::string lo_c = control;
-    if (auto const csc = lo_c.rfind("::"); csc != std::string::npos) lo_c = lo_c.substr(csc + 2);
+    auto const cpp_scope = lo_c.rfind("::");
+    auto const metadata_scope = lo_c.rfind('.');
+    auto const scope = cpp_scope == std::string::npos ? metadata_scope
+        : metadata_scope == std::string::npos ? cpp_scope : std::max(cpp_scope, metadata_scope);
+    if (scope != std::string::npos)
+        lo_c = lo_c.substr(scope + (scope == cpp_scope ? 2 : 1));
     for (auto& c : lo_c) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     std::string lo_p(pk);
     for (auto& c : lo_p) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -653,7 +717,21 @@ inline std::string resolve_typed_value(
     if (auto const tit = prop_kinds->find(lo_c); tit != prop_kinds->end())
         if (auto const pit = tit->second.find(lo_p); pit != tit->second.end())
             ptype = pit->second;
-    if (ptype.empty()) return val;
+    auto const is_state_expression = [](std::string const& expression)
+    {
+        if (expression.empty()
+            || !(std::isalpha(static_cast<unsigned char>(expression.front())) || expression.front() == '_'))
+            return false;
+        return std::all_of(expression.begin(), expression.end(), [](unsigned char ch) {
+            return std::isalnum(ch) || ch == '_' || ch == '.';
+        });
+    };
+    if (ptype.empty())
+    {
+        if (is_state_expression(val) && is_brush_property(pk))
+            return "theme_brush_th(" + val + ")";
+        return val;
+    }
 
     // Candidate member: last :: segment, unwrapped from L"..." / "...",
     // whitespace-trimmed.
@@ -688,6 +766,51 @@ inline std::string resolve_typed_value(
             return "winrt::Windows::Foundation::IReference<double>(winrt::box_value(" + n + "))";
         }
         return val;
+    }
+
+    std::string property_type_leaf = ptype;
+    if (auto const scope = property_type_leaf.rfind("::"); scope != std::string::npos)
+        property_type_leaf = property_type_leaf.substr(scope + 2);
+    if (auto const scope = property_type_leaf.rfind('.'); scope != std::string::npos)
+        property_type_leaf = property_type_leaf.substr(scope + 1);
+    for (auto& c : property_type_leaf)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (is_state_expression(val))
+    {
+        if (property_type_leaf == "brush")
+            return "theme_brush_th(" + val + ")";
+        if (property_type_leaf == "thickness")
+            return "thickness_from_name(" + val + ")";
+        if (property_type_leaf == "cornerradius")
+            return "corner_from_name(" + val + ")";
+        if (property_type_leaf == "imagesource")
+            return "image_source_lookup_th(" + val + ")";
+        if (property_type_leaf == "style")
+            return "style_from_name(" + val + ")";
+    }
+    if (property_type_leaf == "string" || property_type_leaf == "hstring")
+    {
+        std::string selected_value(val);
+        if (selected_value.ends_with(".Value()"))
+            return "winrt::hstring(winrt::to_hstring(" + selected_value + ").c_str())";
+        if (selected_value.ends_with(".SelectedValue"))
+        {
+            selected_value += "()";
+            return "winrt::unbox_value_or<winrt::hstring>(" + selected_value + ", winrt::hstring{})";
+        }
+        if (selected_value.ends_with(".SelectedValue()"))
+            return "winrt::unbox_value_or<winrt::hstring>(" + selected_value + ", winrt::hstring{})";
+    }
+    if (property_type_leaf == "color") {
+        std::string color_name = strip_wstr(val);
+        bool quoted = (val.size() >= 2 && val.front() == '"')
+            || (val.size() >= 3 && val[0] == 'L' && val[1] == '"');
+        bool named = !color_name.empty()
+            && std::all_of(color_name.begin(), color_name.end(), [](unsigned char c) {
+                return std::isalpha(c) != 0;
+            });
+        if (quoted && named)
+            return "named_color(\"" + color_name + "\")";
     }
 
     // Only an enum the metadata declares for this property can qualify it.
@@ -903,7 +1026,6 @@ inline bool is_inspectable_string_prop(std::string_view pk)
     return lo == "content" || lo == "tag" || lo == "header"
         || lo == "selecteditem" || lo == "title"
         || lo == "description" || lo == "watermark"
-        || lo == "itemssource" || lo == "selecteditem"
         || lo == "child" || lo == "data";
 }
 
@@ -983,6 +1105,8 @@ inline std::string box_if_inspectable(std::string_view pk, std::string const& va
     if (val.find("from_abi") != std::string::npos) return val;
     bool is_num = !val.empty() && (std::isdigit(static_cast<unsigned char>(val.front())) || val.front() == '-');
     if (is_num) return "winrt::box_value(" + val + ")";
+    if (val == "m_Source" || val == "Source") return val;
+    if (val.rfind("m_", 0) == 0 || val.rfind("this->", 0) == 0) return "winrt::box_value(" + val + ")";
     return "winrt::box_value(winrt::hstring(L\"" + val + "\"))";
 }
 
@@ -1062,6 +1186,8 @@ inline std::string box_if_inspectable(std::string const& control, std::string_vi
     if (val.find("from_abi") != std::string::npos) return val;
     bool is_num = !val.empty() && (std::isdigit(static_cast<unsigned char>(val.front())) || val.front() == '-');
     if (is_num) return "winrt::box_value(" + val + ")";
+    if (val == "m_Source" || val == "Source") return val;
+    if (val.rfind("m_", 0) == 0 || val.rfind("this->", 0) == 0) return "winrt::box_value(" + val + ")";
     return "winrt::box_value(winrt::hstring(L\"" + val + "\"))";
 }
 
@@ -2581,10 +2707,13 @@ inline std::vector<std::string> g_dynamic_resource_dictionaries;
 //   type name -> set of lowercased event names (Event table, flattened over
 //                base classes + interfaces)
 //   type name -> { lowercased property -> metadata type name ("GridLength") }
+//   type name -> set of lowercased instance method names
 // Control-specific knowledge stays OUT of the compiler binary: new controls
 // and events arrive as metadata, never as new hardcoded lists.
 inline std::unordered_map<std::string, std::set<std::string>> g_type_events;
 inline std::unordered_map<std::string, std::unordered_map<std::string, std::string>> g_type_prop_kinds;
+inline std::unordered_map<std::string, std::set<std::string>> g_type_methods;
+inline std::unordered_map<std::string, std::set<std::string>> g_type_static_methods;
 // Enum type knowledge from the loaded winmds: enum type name ->
 // (namespace, member names). Populated by the driver next to g_type_ns;
 // resolve_typed_value() qualifies enum values from this table, so the
@@ -2851,49 +2980,67 @@ inline std::vector<stub_def> const& component_stub_catalog()
         add("CommunityToolkit.WinUI.Controls.SettingsCard", "winrt::CommunityToolkit::WinUI::Controls",
             "SettingsCard", CC, {
             sm_using(),
-            sm_raw("    struct _sc_state { winrt::Microsoft::UI::Xaml::Controls::TextBlock hdr{winrt::Microsoft::UI::Xaml::Controls::TextBlock::wrap_tag_t{}}; winrt::Microsoft::UI::Xaml::Controls::TextBlock desc{winrt::Microsoft::UI::Xaml::Controls::TextBlock::wrap_tag_t{}}; winrt::Microsoft::UI::Xaml::Controls::Border slot{winrt::Microsoft::UI::Xaml::Controls::Border::wrap_tag_t{}}; winrt::Microsoft::UI::Xaml::Controls::Border icon_slot{winrt::Microsoft::UI::Xaml::Controls::Border::wrap_tag_t{}}; winrt::Microsoft::UI::Xaml::Controls::Border action_slot{winrt::Microsoft::UI::Xaml::Controls::Border::wrap_tag_t{}}; };"),
+            sm_raw("    struct _sc_state { winrt::Microsoft::UI::Xaml::Controls::Grid grid{winrt::Microsoft::UI::Xaml::Controls::Grid::wrap_tag_t{}}; winrt::Microsoft::UI::Xaml::Controls::TextBlock hdr{winrt::Microsoft::UI::Xaml::Controls::TextBlock::wrap_tag_t{}}; winrt::Microsoft::UI::Xaml::Controls::Border desc_slot{winrt::Microsoft::UI::Xaml::Controls::Border::wrap_tag_t{}}; winrt::Microsoft::UI::Xaml::Controls::Border slot{winrt::Microsoft::UI::Xaml::Controls::Border::wrap_tag_t{}}; winrt::Microsoft::UI::Xaml::Controls::Border icon_slot{winrt::Microsoft::UI::Xaml::Controls::Border::wrap_tag_t{}}; winrt::Microsoft::UI::Xaml::Controls::Border action_slot{winrt::Microsoft::UI::Xaml::Controls::Border::wrap_tag_t{}}; winrt::Microsoft::UI::Xaml::HorizontalAlignment content_horizontal_alignment{winrt::Microsoft::UI::Xaml::HorizontalAlignment::Right}; std::vector<std::function<void(winrt::IInspectable const&, winrt::IInspectable const&)>> click_handlers; bool is_vertical{false}; bool has_explicit_content_alignment{false}; bool is_click_enabled{false}; bool is_enabled{true}; };"),
             sm_raw("    std::shared_ptr<_sc_state> _st;"),
             sm_raw("    SettingsCard() : ContentControl() {"),
             sm_raw("        _st = std::make_shared<_sc_state>();"),
-            sm_raw("        HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);"),
-            sm_raw("        HorizontalContentAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);"),
+            sm_raw("        static_cast<winrt::Microsoft::UI::Xaml::Controls::ContentControl const&>(*this).HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);"),
+            sm_raw("        static_cast<winrt::Microsoft::UI::Xaml::Controls::ContentControl const&>(*this).HorizontalContentAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);"),
             sm_raw("        auto b = winrt::Microsoft::UI::Xaml::Controls::Border();"),
             sm_raw("        b.Background(::theme_brush_th(L\"CardBackgroundFillColorDefaultBrush\"));"),
             sm_raw("        b.BorderBrush(::theme_brush_th(L\"CardStrokeColorDefaultBrush\"));"),
             sm_raw("        b.BorderThickness(winrt::Microsoft::UI::Xaml::Thickness{1,1,1,1});"),
             sm_raw("        b.CornerRadius(winrt::Microsoft::UI::Xaml::CornerRadius{4,4,4,4});"),
             sm_raw("        b.Padding(winrt::Microsoft::UI::Xaml::Thickness{16,14,16,14});"),
-            sm_raw("        b.Margin(winrt::Microsoft::UI::Xaml::Thickness{0,0,0,4});"),
             sm_raw("        b.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);"),
             sm_raw("        auto g = winrt::Microsoft::UI::Xaml::Controls::Grid();"),
+            sm_raw("        g.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);"),
+            sm_raw("        _st->grid = g;"),
             sm_raw("        auto c0 = winrt::Microsoft::UI::Xaml::Controls::ColumnDefinition(); c0.Width(winrt::Microsoft::UI::Xaml::GridLength(0, winrt::Microsoft::UI::Xaml::GridUnitType::Auto)); g.ColumnDefinitions().Append(c0);"),
             sm_raw("        auto c1 = winrt::Microsoft::UI::Xaml::Controls::ColumnDefinition(); c1.Width(winrt::Microsoft::UI::Xaml::GridLength(1, winrt::Microsoft::UI::Xaml::GridUnitType::Star)); g.ColumnDefinitions().Append(c1);"),
             sm_raw("        auto c2 = winrt::Microsoft::UI::Xaml::Controls::ColumnDefinition(); c2.Width(winrt::Microsoft::UI::Xaml::GridLength(0, winrt::Microsoft::UI::Xaml::GridUnitType::Auto)); g.ColumnDefinitions().Append(c2);"),
             sm_raw("        auto c3 = winrt::Microsoft::UI::Xaml::Controls::ColumnDefinition(); c3.Width(winrt::Microsoft::UI::Xaml::GridLength(0, winrt::Microsoft::UI::Xaml::GridUnitType::Auto)); g.ColumnDefinitions().Append(c3);"),
+            sm_raw("        auto r0 = winrt::Microsoft::UI::Xaml::Controls::RowDefinition(); r0.Height(winrt::Microsoft::UI::Xaml::GridLength(0, winrt::Microsoft::UI::Xaml::GridUnitType::Auto)); g.RowDefinitions().Append(r0);"),
+            sm_raw("        auto r1 = winrt::Microsoft::UI::Xaml::Controls::RowDefinition(); r1.Height(winrt::Microsoft::UI::Xaml::GridLength(0, winrt::Microsoft::UI::Xaml::GridUnitType::Auto)); g.RowDefinitions().Append(r1);"),
             sm_raw("        _st->icon_slot = winrt::Microsoft::UI::Xaml::Controls::Border(); _st->icon_slot.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center); _st->icon_slot.Margin(winrt::Microsoft::UI::Xaml::Thickness{0,0,16,0}); _st->icon_slot.Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);"),
             sm_raw("        winrt::Microsoft::UI::Xaml::Controls::Grid::SetColumn(winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(_st->icon_slot.m_unknown.get()), 0);"),
+            sm_raw("        winrt::Microsoft::UI::Xaml::Controls::Grid::SetRow(winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(_st->icon_slot.m_unknown.get()), 0);"),
             sm_raw("        g.Children().Append(_st->icon_slot);"),
             sm_raw("        auto sp = winrt::Microsoft::UI::Xaml::Controls::StackPanel(); sp.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center); sp.Spacing(2);"),
             sm_raw("        _st->hdr = winrt::Microsoft::UI::Xaml::Controls::TextBlock(); _st->hdr.FontSize(14); _st->hdr.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::Wrap); sp.Children().Append(_st->hdr);"),
-            sm_raw("        _st->desc = winrt::Microsoft::UI::Xaml::Controls::TextBlock(); _st->desc.FontSize(12); _st->desc.Foreground(::theme_brush_th(L\"TextFillColorSecondaryBrush\")); _st->desc.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::Wrap); _st->desc.Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed); sp.Children().Append(_st->desc);"),
+            sm_raw("        _st->desc_slot = winrt::Microsoft::UI::Xaml::Controls::Border(); _st->desc_slot.Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed); sp.Children().Append(_st->desc_slot);"),
             sm_raw("        winrt::Microsoft::UI::Xaml::Controls::Grid::SetColumn(winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(sp.m_unknown.get()), 1);"),
             sm_raw("        g.Children().Append(sp);"),
             sm_raw("        _st->slot = winrt::Microsoft::UI::Xaml::Controls::Border(); _st->slot.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center); _st->slot.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Right);"),
             sm_raw("        winrt::Microsoft::UI::Xaml::Controls::Grid::SetColumn(winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(_st->slot.m_unknown.get()), 2);"),
+            sm_raw("        winrt::Microsoft::UI::Xaml::Controls::Grid::SetRow(winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(_st->slot.m_unknown.get()), 0);"),
             sm_raw("        g.Children().Append(_st->slot);"),
             sm_raw("        _st->action_slot = winrt::Microsoft::UI::Xaml::Controls::Border(); _st->action_slot.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center); _st->action_slot.Margin(winrt::Microsoft::UI::Xaml::Thickness{12,0,0,0}); _st->action_slot.Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);"),
             sm_raw("        winrt::Microsoft::UI::Xaml::Controls::Grid::SetColumn(winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(_st->action_slot.m_unknown.get()), 3);"),
+            sm_raw("        winrt::Microsoft::UI::Xaml::Controls::Grid::SetRow(winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(_st->action_slot.m_unknown.get()), 0);"),
             sm_raw("        g.Children().Append(_st->action_slot);"),
             sm_raw("        b.Child(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(g.m_unknown.get()));"),
+            sm_raw("        b.add_Tapped([st = _st](auto const& sender, auto const& args) { if (!st || !st->is_click_enabled) return; winrt::IInspectable s(sender); winrt::IInspectable a(args); for (auto const& handler : st->click_handlers) handler(s, a); });"),
             sm_raw("        static_cast<winrt::Microsoft::UI::Xaml::Controls::ContentControl const&>(*this).Content(winrt::IInspectable(b.addref_borrowed()));"),
             sm_raw("    }"),
-            sm_raw("    template<class H> winrt::event_token add_Click(H const&) const { return {}; }"),
+            sm_raw("    void update_content_layout() const { if (!_st || !_st->slot.m_unknown.get()) return; auto slot = winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(_st->slot.m_unknown.get()); winrt::Microsoft::UI::Xaml::Controls::Grid::SetRow(slot, _st->is_vertical ? 1 : 0); winrt::Microsoft::UI::Xaml::Controls::Grid::SetColumn(slot, _st->is_vertical ? 1 : 2); winrt::Microsoft::UI::Xaml::Controls::Grid::SetColumnSpan(slot, _st->is_vertical ? 3 : 1); _st->slot.Margin(_st->is_vertical ? winrt::Microsoft::UI::Xaml::Thickness{0,8,0,0} : winrt::Microsoft::UI::Xaml::Thickness{0,0,0,0}); auto align = _st->has_explicit_content_alignment ? _st->content_horizontal_alignment : (_st->is_vertical ? winrt::Microsoft::UI::Xaml::HorizontalAlignment::Left : winrt::Microsoft::UI::Xaml::HorizontalAlignment::Right); _st->slot.HorizontalAlignment(align); static_cast<winrt::Microsoft::UI::Xaml::Controls::ContentControl const&>(*this).HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch); static_cast<winrt::Microsoft::UI::Xaml::Controls::ContentControl const&>(*this).HorizontalContentAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch); }"),
+            sm_raw("    template<class H> winrt::event_token add_Click(H const& handler) const { if (_st) _st->click_handlers.emplace_back(handler); return {}; }"),
+            sm_raw("    void IsClickEnabled(bool v) const { if (_st) _st->is_click_enabled = v; }"),
             sm_raw("    void Header(winrt::IInspectable const& v) const { if (_st && _st->hdr.m_unknown.get()) _st->hdr.Text(winrt::unbox_value_or<winrt::hstring>(v, L\"\")); }"),
             sm_raw("    void Header(winrt::hstring const& v) const { if (_st && _st->hdr.m_unknown.get()) _st->hdr.Text(v); }"),
-            sm_raw("    void Description(winrt::IInspectable const& v) const { if (_st && _st->desc.m_unknown.get()) { auto s = winrt::unbox_value_or<winrt::hstring>(v, L\"\"); _st->desc.Text(s); _st->desc.Visibility(s.empty() ? winrt::Microsoft::UI::Xaml::Visibility::Collapsed : winrt::Microsoft::UI::Xaml::Visibility::Visible); } }"),
-            sm_raw("    void Description(winrt::hstring const& v) const { if (_st && _st->desc.m_unknown.get()) { _st->desc.Text(v); _st->desc.Visibility(v.empty() ? winrt::Microsoft::UI::Xaml::Visibility::Collapsed : winrt::Microsoft::UI::Xaml::Visibility::Visible); } }"),
-            sm_raw("    void Content(winrt::Microsoft::UI::Xaml::UIElement const& v) const { if (_st && _st->slot.m_unknown.get()) _st->slot.Child(v); }"),
-            sm_raw("    void Content(winrt::IInspectable const& v) const { if (_st && _st->slot.m_unknown.get() && v.get_abi()) _st->slot.Child(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(v.get_abi())); }"),
+            sm_raw("    void Description(winrt::IInspectable const& v) const { Description(winrt::unbox_value_or<winrt::hstring>(v, L\"\")); }"),
+            sm_raw("    void Description(winrt::hstring const& v) const { if (!_st || !_st->desc_slot.m_unknown.get()) return; if (v.empty()) { _st->desc_slot.Child(winrt::Microsoft::UI::Xaml::UIElement{}); _st->desc_slot.Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed); return; } auto text = winrt::Microsoft::UI::Xaml::Controls::TextBlock(); text.FontSize(12); text.Foreground(::theme_brush_th(L\"TextFillColorSecondaryBrush\")); text.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::Wrap); text.Text(v); _st->desc_slot.Child(text); _st->desc_slot.Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible); }"),
+            sm_raw("    void Description(winrt::Microsoft::UI::Xaml::UIElement const& v) const { if (!_st || !_st->desc_slot.m_unknown.get()) return; _st->desc_slot.Child(v); _st->desc_slot.Visibility(v.get_abi() ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed); void* control_raw = nullptr; if (v.get_abi() && winrt::IUnknown::qi_raw(v.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::IControl>, &control_raw) >= 0 && control_raw) { auto control = winrt::Microsoft::UI::Xaml::Controls::Control::from_abi(control_raw); control.FontSize(12); control.Padding(winrt::Microsoft::UI::Xaml::Thickness{0,0,0,0}); control.MinHeight(0); } }"),
+            sm_raw("    void Content(winrt::Microsoft::UI::Xaml::UIElement const& v) const { if (_st && _st->slot.m_unknown.get()) { _st->slot.Child(v); void* ts_raw = nullptr; if (v.get_abi() && winrt::IUnknown::qi_raw(v.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::IToggleSwitch>, &ts_raw) >= 0 && ts_raw) { auto ts = winrt::Microsoft::UI::Xaml::Controls::ToggleSwitch::from_abi(ts_raw); ts.MinWidth(0); ts.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Right); auto st = ::style_lookup_th(L\"SettingsCardToggleSwitchStyle\"); if (st.get_abi()) ts.Style(st); } update_content_layout(); } }"),
+            sm_raw("    void Content(winrt::IInspectable const& v) const { if (_st && _st->slot.m_unknown.get() && v.get_abi()) { _st->slot.Child(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(v.get_abi())); void* ts_raw = nullptr; if (winrt::IUnknown::qi_raw(v.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::IToggleSwitch>, &ts_raw) >= 0 && ts_raw) { auto ts = winrt::Microsoft::UI::Xaml::Controls::ToggleSwitch::from_abi(ts_raw); ts.MinWidth(0); ts.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Right); auto st = ::style_lookup_th(L\"SettingsCardToggleSwitchStyle\"); if (st.get_abi()) ts.Style(st); } update_content_layout(); } }"),
+            sm_raw("    void ContentAlignment(winrt::IInspectable const& v) const { ContentAlignment(winrt::unbox_value_or<winrt::hstring>(v, L\"\")); }"),
+            sm_raw("    void ContentAlignment(winrt::hstring const& v) const { if (!_st) return; _st->is_vertical = (v == L\"Vertical\"); update_content_layout(); }"),
+            sm_raw("    void ContentHorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment v) const { if (!_st) return; _st->content_horizontal_alignment = v; _st->has_explicit_content_alignment = true; update_content_layout(); }"),
+            sm_raw("    void HorizontalContentAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment v) const { ContentHorizontalAlignment(v); }"),
+            sm_raw("    void HorizontalContentAlignment(winrt::IInspectable const& v) const { auto s = winrt::unbox_value_or<winrt::hstring>(v, L\"\"); if (s == L\"Left\") ContentHorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Left); else if (s == L\"Right\") ContentHorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Right); else if (s == L\"Center\") ContentHorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Center); else if (s == L\"Stretch\") ContentHorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch); }"),
+            sm_raw("    void HorizontalContentAlignment(winrt::hstring const& s) const { if (s == L\"Left\") ContentHorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Left); else if (s == L\"Right\") ContentHorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Right); else if (s == L\"Center\") ContentHorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Center); else if (s == L\"Stretch\") ContentHorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch); }"),
+            sm_raw("    void IsEnabled(bool v) const { if (!_st) return; _st->is_enabled = v; if (_st->hdr.m_unknown.get()) _st->hdr.Opacity(v ? 1.0 : 0.5); if (_st->icon_slot.m_unknown.get()) _st->icon_slot.Opacity(v ? 1.0 : 0.5); if (_st->slot.m_unknown.get() && _st->slot.Child().m_unknown.get()) { void* ctrl_raw = nullptr; if (winrt::IUnknown::qi_raw(_st->slot.Child().m_unknown.get(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::IControl>, &ctrl_raw) >= 0 && ctrl_raw) { auto ctrl = winrt::Microsoft::UI::Xaml::Controls::Control::from_abi(ctrl_raw); ctrl.IsEnabled(v); } } }"),
+            sm_raw("    bool IsEnabled() const { return _st ? _st->is_enabled : true; }"),
             sm_raw("    void set_icon_helper(winrt::Microsoft::UI::Xaml::Controls::Border const& border, winrt::hstring const& s) const {"),
             sm_raw("        if (!border.m_unknown.get() || s.empty()) return;"),
             sm_raw("        std::wstring ws(s.to_view());"),
@@ -2912,11 +3059,13 @@ inline std::vector<stub_def> const& component_stub_catalog()
             sm_raw("    void ActionIcon(winrt::IInspectable const& v) const { if (_st) set_icon_helper(_st->action_slot, winrt::unbox_value_or<winrt::hstring>(v, L\"\")); }"),
             sm_raw("    void ActionIcon(winrt::hstring const& v) const { if (_st) set_icon_helper(_st->action_slot, v); }"),
             sm_meth("void", "ActionIconToolTip", "(winrt::hstring const&)"),
-            sm_meth("void", "IsClickEnabled", "(bool)"),
-            sm_meth("void", "ContentAlignment", "(winrt::IInspectable const&)"),
-            sm_meth("void", "ContentAlignment", "(winrt::hstring const&)"),
             sm_meth("void", "IsExpanded", "(bool)"),
             sm_meth("bool", "IsExpanded", "()"),
+            sm_meth("void", "IsEnabled", "(bool)"),
+            sm_meth("bool", "IsEnabled", "()"),
+            sm_meth("void", "HorizontalContentAlignment", "(winrt::Microsoft::UI::Xaml::HorizontalAlignment)"),
+            sm_meth("void", "HorizontalContentAlignment", "(winrt::IInspectable const&)"),
+            sm_meth("void", "HorizontalContentAlignment", "(winrt::hstring const&)"),
         });
         add("CommunityToolkit.WinUI.Controls.SettingsExpander", "winrt::CommunityToolkit::WinUI::Controls",
             "SettingsExpander", CC, {
@@ -2927,7 +3076,7 @@ inline std::vector<stub_def> const& component_stub_catalog()
             sm_raw("        _st = std::make_shared<_se_state>();"),
             sm_raw("        HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);"),
             sm_raw("        HorizontalContentAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);"),
-            sm_raw("        auto outer = winrt::Microsoft::UI::Xaml::Controls::StackPanel(); outer.Spacing(2); outer.Margin(winrt::Microsoft::UI::Xaml::Thickness{0,0,0,4}); outer.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);"),
+            sm_raw("        auto outer = winrt::Microsoft::UI::Xaml::Controls::StackPanel(); outer.Spacing(0); outer.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);"),
             sm_raw("        auto b = winrt::Microsoft::UI::Xaml::Controls::Border();"),
             sm_raw("        b.Background(::theme_brush_th(L\"CardBackgroundFillColorDefaultBrush\"));"),
             sm_raw("        b.BorderBrush(::theme_brush_th(L\"CardStrokeColorDefaultBrush\"));"),
@@ -2955,16 +3104,16 @@ inline std::vector<stub_def> const& component_stub_catalog()
             sm_raw("        winrt::Microsoft::UI::Xaml::Controls::Grid::SetColumn(winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(_st->chevron.m_unknown.get()), 3);"),
             sm_raw("        g.Children().Append(_st->chevron);"),
             sm_raw("        b.Child(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(g.m_unknown.get()));"),
-            sm_raw("        auto toggle_exp = [st = _st](auto const&, auto const&) {"),
+            sm_raw("        auto toggle_exp = [st = _st, b](auto const&, auto const&) {"),
             sm_raw("            if (!st) return;"),
             sm_raw("            st->is_expanded = !st->is_expanded;"),
             sm_raw("            st->items_panel.Visibility(st->is_expanded ? winrt::Microsoft::UI::Xaml::Visibility::Visible : winrt::Microsoft::UI::Xaml::Visibility::Collapsed);"),
             sm_raw("            st->chevron.Glyph(st->is_expanded ? L\"\\uE70E\" : L\"\\uE70D\");"),
+            sm_raw("            b.CornerRadius(st->is_expanded ? winrt::Microsoft::UI::Xaml::CornerRadius{4, 4, 0, 0} : winrt::Microsoft::UI::Xaml::CornerRadius{4, 4, 4, 4});"),
             sm_raw("        };"),
-            sm_raw("        b.add_PointerPressed(toggle_exp);"),
             sm_raw("        b.add_Tapped(toggle_exp);"),
             sm_raw("        outer.Children().Append(b);"),
-            sm_raw("        _st->items_panel = winrt::Microsoft::UI::Xaml::Controls::StackPanel(); _st->items_panel.Spacing(2); _st->items_panel.Margin(winrt::Microsoft::UI::Xaml::Thickness{0, 2, 0, 0}); _st->items_panel.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch); _st->items_panel.Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);"),
+            sm_raw("        _st->items_panel = winrt::Microsoft::UI::Xaml::Controls::StackPanel(); _st->items_panel.Spacing(0); _st->items_panel.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch); _st->items_panel.Visibility(winrt::Microsoft::UI::Xaml::Visibility::Collapsed);"),
             sm_raw("        outer.Children().Append(_st->items_panel);"),
             sm_raw("        static_cast<winrt::Microsoft::UI::Xaml::Controls::ContentControl const&>(*this).Content(winrt::IInspectable(outer.addref_borrowed()));"),
             sm_raw("    }"),
@@ -2972,10 +3121,10 @@ inline std::vector<stub_def> const& component_stub_catalog()
             sm_raw("    void Header(winrt::hstring const& v) const { if (_st && _st->hdr.m_unknown.get()) _st->hdr.Text(v); }"),
             sm_raw("    void Description(winrt::IInspectable const& v) const { if (_st && _st->desc.m_unknown.get()) { auto s = winrt::unbox_value_or<winrt::hstring>(v, L\"\"); _st->desc.Text(s); _st->desc.Visibility(s.empty() ? winrt::Microsoft::UI::Xaml::Visibility::Collapsed : winrt::Microsoft::UI::Xaml::Visibility::Visible); } }"),
             sm_raw("    void Description(winrt::hstring const& v) const { if (_st && _st->desc.m_unknown.get()) { _st->desc.Text(v); _st->desc.Visibility(v.empty() ? winrt::Microsoft::UI::Xaml::Visibility::Collapsed : winrt::Microsoft::UI::Xaml::Visibility::Visible); } }"),
-            sm_raw("    void Content(winrt::Microsoft::UI::Xaml::UIElement const& v) const { if (_st && _st->slot.m_unknown.get()) _st->slot.Child(v); }"),
-            sm_raw("    void Content(winrt::IInspectable const& v) const { if (_st && _st->slot.m_unknown.get() && v.get_abi()) _st->slot.Child(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(v.get_abi())); }"),
-            sm_raw("    void Items(winrt::Microsoft::UI::Xaml::UIElement const& v) const { if (_st && _st->items_panel.m_unknown.get()) _st->items_panel.Children().Append(v); }"),
-            sm_raw("    void Items(winrt::IInspectable const& v) const { if (_st && _st->items_panel.m_unknown.get() && v.get_abi()) _st->items_panel.Children().Append(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(v.get_abi())); }"),
+            sm_raw("    void Content(winrt::Microsoft::UI::Xaml::UIElement const& v) const { if (_st && _st->slot.m_unknown.get()) { _st->slot.Child(v); void* ts_raw = nullptr; if (v.get_abi() && winrt::IUnknown::qi_raw(v.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::IToggleSwitch>, &ts_raw) >= 0 && ts_raw) { auto ts = winrt::Microsoft::UI::Xaml::Controls::ToggleSwitch::from_abi(ts_raw); ts.MinWidth(0); ts.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Right); auto st = ::style_lookup_th(L\"SettingsCardToggleSwitchStyle\"); if (st.get_abi()) ts.Style(st); } } }"),
+            sm_raw("    void Content(winrt::IInspectable const& v) const { if (_st && _st->slot.m_unknown.get() && v.get_abi()) { _st->slot.Child(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(v.get_abi())); void* ts_raw = nullptr; if (winrt::IUnknown::qi_raw(v.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::IToggleSwitch>, &ts_raw) >= 0 && ts_raw) { auto ts = winrt::Microsoft::UI::Xaml::Controls::ToggleSwitch::from_abi(ts_raw); ts.MinWidth(0); ts.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Right); auto st = ::style_lookup_th(L\"SettingsCardToggleSwitchStyle\"); if (st.get_abi()) ts.Style(st); } } }"),
+            sm_raw("    void Items(winrt::Microsoft::UI::Xaml::UIElement const& v) const { if (_st && _st->items_panel.m_unknown.get()) { void* fe_raw = nullptr; if (v.get_abi() && winrt::IUnknown::qi_raw(v.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::IFrameworkElement>, &fe_raw) >= 0 && fe_raw) { auto fe = winrt::Microsoft::UI::Xaml::FrameworkElement::from_abi(fe_raw); fe.Margin(winrt::Microsoft::UI::Xaml::Thickness{0, 0, 0, 0}); fe.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch); } void* cc_raw = nullptr; if (v.get_abi() && winrt::IUnknown::qi_raw(v.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::IContentControl>, &cc_raw) >= 0 && cc_raw) { auto cc = winrt::Microsoft::UI::Xaml::Controls::ContentControl::from_abi(cc_raw); auto cnt = cc.Content(); void* border_raw = nullptr; if (cnt.get_abi() && winrt::IUnknown::qi_raw(cnt.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::IBorder>, &border_raw) >= 0 && border_raw) { auto border = winrt::Microsoft::UI::Xaml::Controls::Border::from_abi(border_raw); border.Padding(winrt::Microsoft::UI::Xaml::Thickness{58, 14, 16, 14}); auto bg = border.Child(); void* grid_raw = nullptr; if (bg.get_abi() && winrt::IUnknown::qi_raw(bg.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::IGrid>, &grid_raw) >= 0 && grid_raw) { auto grid = winrt::Microsoft::UI::Xaml::Controls::Grid::from_abi(grid_raw); if (grid.Children().Size() > 3) { auto act = winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(grid.Children().GetAt(3).get_abi()); act.Width(26.0); act.Margin(winrt::Microsoft::UI::Xaml::Thickness{0, 0, 0, 0}); act.Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible); } } } } _st->items_panel.Children().Append(v); } }"),
+            sm_raw("    void Items(winrt::IInspectable const& v) const { if (_st && _st->items_panel.m_unknown.get() && v.get_abi()) { void* fe_raw = nullptr; if (v.get_abi() && winrt::IUnknown::qi_raw(v.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::IFrameworkElement>, &fe_raw) >= 0 && fe_raw) { auto fe = winrt::Microsoft::UI::Xaml::FrameworkElement::from_abi(fe_raw); fe.Margin(winrt::Microsoft::UI::Xaml::Thickness{0, 0, 0, 0}); fe.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch); } void* cc_raw = nullptr; if (v.get_abi() && winrt::IUnknown::qi_raw(v.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::IContentControl>, &cc_raw) >= 0 && cc_raw) { auto cc = winrt::Microsoft::UI::Xaml::Controls::ContentControl::from_abi(cc_raw); auto cnt = cc.Content(); void* border_raw = nullptr; if (cnt.get_abi() && winrt::IUnknown::qi_raw(cnt.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::IBorder>, &border_raw) >= 0 && border_raw) { auto border = winrt::Microsoft::UI::Xaml::Controls::Border::from_abi(border_raw); border.Padding(winrt::Microsoft::UI::Xaml::Thickness{58, 14, 16, 14}); auto bg = border.Child(); void* grid_raw = nullptr; if (bg.get_abi() && winrt::IUnknown::qi_raw(bg.get_abi(), winrt::iid_of<winrt::Microsoft::UI::Xaml::Controls::IGrid>, &grid_raw) >= 0 && grid_raw) { auto grid = winrt::Microsoft::UI::Xaml::Controls::Grid::from_abi(grid_raw); if (grid.Children().Size() > 3) { auto act = winrt::Microsoft::UI::Xaml::FrameworkElement::wrap_borrowed(grid.Children().GetAt(3).get_abi()); act.Width(26.0); act.Margin(winrt::Microsoft::UI::Xaml::Thickness{0, 0, 0, 0}); act.Visibility(winrt::Microsoft::UI::Xaml::Visibility::Visible); } } } } _st->items_panel.Children().Append(winrt::Microsoft::UI::Xaml::UIElement::wrap_borrowed(v.get_abi())); } }"),
             sm_raw("    void HeaderIcon(winrt::IInspectable const& v) const {"),
             sm_raw("        if (!_st) return; auto s = winrt::unbox_value_or<winrt::hstring>(v, L\"\"); if (s.empty()) return;"),
             sm_raw("        std::wstring ws(s.to_view());"),
@@ -3021,7 +3170,8 @@ inline std::vector<stub_def> const& component_stub_catalog()
             sm_field(), sm_ctor(), sm_fromabi(),
         }, false, true);
         add("CommunityToolkit.WinUI.Controls.SwitchPresenter", "", "SwitchPresenter", CC, {
-            sm_dctor(), sm_fromabi(),
+            sm_raw("    SwitchPresenter() : " + CC + "() { HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch); HorizontalContentAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch); VerticalContentAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Stretch); }"),
+            sm_fromabi(),
             sm_meth("void", "Value", "(winrt::IInspectable const&)", true),
             sm_meth("void", "TargetType", "(winrt::Windows::UI::Xaml::Interop::TypeName const&)", true),
         }, false, true);
@@ -3115,7 +3265,8 @@ inline std::vector<stub_def> const& component_stub_catalog()
 // exactly like the old chain), gate each row on the projected-name set, and
 // emit `struct T : base { ... };` plus its body rows.
 inline void emit_component_stubs(std::ostringstream& out, std::string const& ns,
-                                 std::set<std::string> const& projected_names)
+                                 std::set<std::string> const& projected_names,
+                                 bool is_shared_module = false)
 {
     auto const& cat = component_stub_catalog();
     auto const expand = [&](std::string const& s) {
@@ -3136,13 +3287,17 @@ inline void emit_component_stubs(std::ostringstream& out, std::string const& ns,
         if (ens != open)
         {
             if (!open.empty()) out << "} // namespace " << open << "\n\n";
-            if (!ens.empty())  out << "namespace " << ens << " {\n";
+            if (!ens.empty()) {
+                if (is_shared_module) out << "export namespace " << ens << " {\n";
+                else out << "namespace " << ens << " {\n";
+            }
             open = ens;
         }
         std::string const gate = expand(d.gate);
         // Winmd really exports the type: views import it from the app module,
         // so a local stub would be a second definition (C1117).
         if (!gate.empty() && projected_names.count(gate) != 0) continue;
+        if (is_shared_module && ens.empty()) out << "export ";
         out << "struct " << d.type << " : " << d.base << " {\n";
         for (auto const& m : d.body)
         {

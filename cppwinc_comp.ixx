@@ -143,11 +143,9 @@ void write_component_class_impl(writer& w, winmd::type_info const& type, type_ma
                 }
                 else
                 {
-                    // borrowed for the same reason: interface/generic
-                    // parameters are the caller's references, so no
-                    // owning wrapper is created (a from_abi temporary
-                    // would Release them at the end of the thunk)
-                    w.write("*reinterpret_cast<% const*>(&a%)", mapper.map(pt), p);
+                    // borrowed: construct via borrow_arg_in so runtime classes
+                    // with m_cache get a valid zero-initialized iface_cache!
+                    w.write("winrt::impl::borrow_arg_in<%>(a%)", mapper.map(pt), p);
                 }
             }
             w.write(");\n");

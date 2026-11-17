@@ -239,34 +239,37 @@ namespace winrt
         Windows::Win32::ROAPI::RoUninitialize();
     }
 
-    // Boot diagnostics: append a line to boot_log.txt in the exe's working
-    // directory. Exported from winrt_base so view modules (which import
-    // winrt_base but not the app module) can mark their BuildUI steps.
-    // Active in debug (NDEBUG undefined) - silent in release builds.
+    // Keep diagnostics available when a packaged app has a non-writable working directory.
     export inline void boot_log(char const* s)
     {
 #pragma warning(push)
 #pragma warning(disable: 4996) // fopen: CRT secure-overload lives in a header, unavailable in import-std context
-        std::FILE* f = std::fopen("boot_log.txt", "a");
-#pragma warning(pop)
-        if (f)
+        auto append_line = [s](char const* path)
         {
-            std::fputs(s, f);
-            std::fputc('\n', f);
-            std::fclose(f);
+            std::FILE* f = std::fopen(path, "a");
+            if (f)
+            {
+                std::fputs(s, f);
+                std::fputc('\n', f);
+                std::fclose(f);
+            }
+        };
+        append_line("boot_log.txt");
+        if (auto temp = std::getenv("TEMP"); temp && *temp)
+        {
+            std::string path(temp);
+            path += "\\cppwinc_boot_log.txt";
+            append_line(path.c_str());
         }
+#pragma warning(pop)
     }
     export inline void boot_logf(char const* fmt, void* v)
     {
         (void)fmt; (void)v;
     }
 
-    // Fatal-exception self-report: registered by main via set_crash_reporter.
-    // When an uncaught exception reaches terminate(), the exception kind,
-    // HRESULT and message are appended to boot_log.txt before the process
-    // dies - turning every "stopped working" into a diagnosable event
-    // without a debugger attached.
-    export inline void crash_report_current_exception() noexcept
+    // Record the active exception and its details in boot_log.txt.
+    export inline void report_current_exception(char const* context) noexcept
     {
         try { throw; }
         catch (hresult_error const& e)
@@ -277,7 +280,7 @@ namespace winrt
 #pragma warning(pop)
             if (f)
             {
-                std::fprintf(f, "crash: hresult_error 0x%08lX: ", static_cast<unsigned long>(e.value()));
+                std::fprintf(f, "%s: hresult_error 0x%08lX: ", context, static_cast<unsigned long>(e.value()));
                 for (wchar_t c : e.message())
                 {
                     if (c == L'\n' || c == L'\r') std::fputc(' ', f);
@@ -295,14 +298,21 @@ namespace winrt
 #pragma warning(pop)
             if (f)
             {
-                std::fprintf(f, "crash: std::exception: %s\n", e.what());
+                std::fprintf(f, "%s: std::exception: %s\n", context, e.what());
                 std::fclose(f);
             }
         }
         catch (...)
         {
-            boot_log("crash: unknown exception");
+            std::string message = std::string(context) + ": unknown exception";
+            boot_log(message.c_str());
         }
+    }
+
+    // Registered by main to record uncaught exceptions before terminate.
+    export inline void crash_report_current_exception() noexcept
+    {
+        report_current_exception("crash");
     }
 
     export inline void set_crash_reporter()
@@ -600,6 +610,9 @@ namespace winrt
             void* get_abi() const noexcept { return m_ptr; }
             static IUnknown from_abi(void* ptr) noexcept { return IUnknown(ptr); }
             explicit operator bool() const noexcept { return m_ptr != nullptr; }
+            bool operator!() const noexcept { return m_ptr == nullptr; }
+            bool operator==(std::nullptr_t) const noexcept { return m_ptr == nullptr; }
+            bool operator!=(std::nullptr_t) const noexcept { return m_ptr != nullptr; }
 
             private:
                 void AddRef_thunk() const { auto* vt = *reinterpret_cast<void* const**>(m_ptr); reinterpret_cast<std::uint32_t(__stdcall*)(void*)>(vt[1])(m_ptr); }
@@ -658,9 +671,11 @@ namespace winrt
             void** put() noexcept { if (m_ptr) IUnknown::release_raw(m_ptr); m_ptr = nullptr; return &m_ptr; }
             static IInspectable from_abi(void* ptr) noexcept { return IInspectable(ptr); }
             explicit operator bool() const noexcept { return m_ptr != nullptr; }
+            bool operator!() const noexcept { return m_ptr == nullptr; }
             friend bool operator==(IInspectable const&, IInspectable const&) = default;
             friend auto operator<=>(IInspectable const&, IInspectable const&) = default;
             bool operator==(std::nullptr_t) const noexcept { return m_ptr == nullptr; }
+            bool operator!=(std::nullptr_t) const noexcept { return m_ptr != nullptr; }
 
             winrt::hstring GetRuntimeClassName() const
             {
@@ -671,6 +686,33 @@ namespace winrt
                 return winrt::hstring::from_abi(result);
             }
         };
+
+        export inline bool same_com_identity(void* left, void* right) noexcept
+        {
+            if (left == right) return true;
+            if (!left || !right) return false;
+            void* left_identity = nullptr;
+            void* right_identity = nullptr;
+            auto const left_result = IUnknown::qi_raw(left, iid_iunknown, &left_identity);
+            auto const right_result = IUnknown::qi_raw(right, iid_iunknown, &right_identity);
+            bool const same = left_result >= 0 && right_result >= 0
+                && left_identity == right_identity;
+            IUnknown::release_raw(left_identity);
+            IUnknown::release_raw(right_identity);
+            return same;
+        }
+
+        export template <typename L, typename R>
+            requires (!std::is_same_v<std::remove_cvref_t<L>, hstring>)
+                && (!std::is_same_v<std::remove_cvref_t<R>, hstring>)
+                && requires(L const& left, R const& right) {
+                    { left.get_abi() } -> std::same_as<void*>;
+                    { right.get_abi() } -> std::same_as<void*>;
+                }
+        inline bool operator==(L const& left, R const& right) noexcept
+        {
+            return same_com_identity(left.get_abi(), right.get_abi());
+        }
 
         template <>
     inline constexpr winrt_guid iid_of<IInspectable> = iid_iinspectable;
@@ -1431,6 +1473,23 @@ namespace winrt
         bind_in<T> bind(T const& object) noexcept
         {
             return bind_in<T>{ object };
+        }
+
+        export template <typename T, typename A>
+        decltype(auto) borrow_arg_in(A const& a) noexcept
+        {
+            if constexpr (requires { T::wrap_borrowed(a); })
+            {
+                return T::wrap_borrowed(a);
+            }
+            else if constexpr (std::is_same_v<A, void*>)
+            {
+                return *reinterpret_cast<T const*>(static_cast<void const*>(&a));
+            }
+            else
+            {
+                return a;
+            }
         }
     }
 
@@ -3145,7 +3204,9 @@ com_ns::CoTaskMemFree(m_data);
                 m_reserveable.m_owner = this;
             }
 
-            void* get_abi() noexcept { return &m_observable; }
+            void* get_abi() noexcept { return &m_vector; }
+            void* get_vector_abi() noexcept { return &m_vector; }
+            void* get_observable_abi() noexcept { return &m_observable; }
 
             void* make_iterator()
             {
@@ -4038,7 +4099,9 @@ com_ns::CoTaskMemFree(m_data);
                 m_observable.m_owner = this;
             }
 
-            void* get_abi() noexcept { return &m_observable; }
+            void* get_abi() noexcept { return &m_map; }
+            void* get_map_abi() noexcept { return &m_map; }
+            void* get_observable_abi() noexcept { return &m_observable; }
 
             void* make_iterator()
             {
@@ -4172,13 +4235,25 @@ com_ns::CoTaskMemFree(m_data);
         export template <typename T>
         void* make_single_threaded_vector()
         {
-            return (new vector_impl<T>())->get_abi();
+            return (new vector_impl<T>())->get_vector_abi();
+        }
+
+        export template <typename T>
+        void* make_single_threaded_observable_vector()
+        {
+            return (new vector_impl<T>())->get_observable_abi();
         }
 
         export template <typename K, typename V>
         void* make_single_threaded_map()
         {
-            return (new map_impl<K, V>())->get_abi();
+            return (new map_impl<K, V>())->get_map_abi();
+        }
+
+        export template <typename K, typename V>
+        void* make_single_threaded_observable_map()
+        {
+            return (new map_impl<K, V>())->get_observable_abi();
         }
 
         // IReference<T> pattern GUID (61C17706-2D65-11E0-9AE8-D48564015472)
@@ -5008,6 +5083,11 @@ com_ns::CoTaskMemFree(m_data);
     export inline void* box_value(wchar_t const* value) { return impl::box_value_impl<hstring>(hstring(value)); }
     export inline void* box_value(char const* value) { return impl::box_value_impl<hstring>(hstring(winrt::to_hstring(std::string_view(value)))); }
     export inline void* box_value(winrt_guid const& value) { return impl::box_value_impl<winrt_guid>(value); }
+    export inline void* box_value(IInspectable const& value)
+    {
+        if (value.m_ptr) IUnknown::addref_raw(value.m_ptr);
+        return value.m_ptr;
+    }
 
     // unboxing (inspect a boxed value through IPropertyValue)
 
@@ -5228,6 +5308,45 @@ com_ns::CoTaskMemFree(m_data);
         {
             return default_value;
         }
+    }
+
+    export template <typename T>
+        requires std::is_same_v<std::remove_cvref_t<T>, IInspectable>
+    inline bool operator==(T const& value, wchar_t const* text)
+    {
+        if (!value || !text)
+        {
+            return false;
+        }
+        try
+        {
+            return unbox_value<hstring>(value) == hstring(text);
+        }
+        catch (hresult_error const&)
+        {
+            return false;
+        }
+    }
+
+    export template <typename T>
+        requires std::is_same_v<std::remove_cvref_t<T>, IInspectable>
+    inline bool operator==(wchar_t const* text, T const& value)
+    {
+        return value == text;
+    }
+
+    export template <typename T>
+        requires std::is_same_v<std::remove_cvref_t<T>, IInspectable>
+    inline bool operator!=(T const& value, wchar_t const* text)
+    {
+        return !(value == text);
+    }
+
+    export template <typename T>
+        requires std::is_same_v<std::remove_cvref_t<T>, IInspectable>
+    inline bool operator!=(wchar_t const* text, T const& value)
+    {
+        return !(value == text);
     }
 
         )cppwinc");
@@ -5864,15 +5983,9 @@ com_ns::CoTaskMemFree(m_data);
 // % — generated by cppwinc v1.
 // Copyright (c) 2026 Momin Shaikh. All rights reserved.
 
-module;
-
-#include <algorithm>
-#include <cstdint>
-#include <string>
-#include <string_view>
-#include <utility>
-
 export module %;
+
+import std;
 
 export import winrt_base;
 
