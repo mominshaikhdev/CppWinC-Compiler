@@ -1112,10 +1112,7 @@
                         || pk_lo_bool == "scaley" || pk_lo_bool == "resources"
                         || pk_lo_bool == "flyout" || pk_lo_bool == "tooltip"
                         || pk_lo_bool == "numberformatter" || pk_lo_bool == "maxlength"
-                        || pk_lo_bool == "ismenuopen" || pk_lo_bool == "title"
-                        || pk_lo_bool == "isexpanded" || pk_lo_bool == "ishitvisible"
-                        || pk_lo_bool == "isreadonly" || pk_lo_bool == "isopen"
-                        || pk_lo_bool == "isactive" || pk_lo_bool == "isindeterminate"
+                        || pk_lo_bool == "title"
                         || pk_lo_bool == "value" || pk_lo_bool == "minimum"
                         || pk_lo_bool == "maximum" || pk_lo_bool == "stepfrequency"
                         || pk_lo_bool == "disabledforeground" || pk_lo_bool == "titleforeground"
@@ -1125,7 +1122,7 @@
                         || pk_lo_bool == "strokethickness" || pk_lo_bool == "radiusx"
                         || pk_lo_bool == "radiusy" || pk_lo_bool == "selectedindex"
                         || pk_lo_bool == "selecteditem" || pk_lo_bool == "selectedvalue"
-                        || pk_lo_bool == "isdropdownopen" || pk_lo_bool == "itemslist"
+                        || pk_lo_bool == "itemslist"
                         || pk_lo_bool == "tabitems" || pk_lo_bool == "menuitems");
                     if (!skip_bool) {
                         if (pk_lo_bool == "ischecked")
@@ -2578,12 +2575,30 @@
                         if (ke != std::string::npos)
                         {
                             std::string res_key = raw_val.substr(ks, ke - ks);
-                            out << indent << var_name << ".Template(control_template_th(L\"" << res_key << "\"));\n";
+                            out << indent << "{ auto __tpl = control_template_th(L\"" << res_key << "\"); if (__tpl.get_abi()) " << var_name << ".Template(__tpl); }\n";
                         }
                     }
                     else if (!raw_val.empty() && raw_val[0] == '<')
                     {
-                        out << indent << var_name << ".Template(load_control_template(L\"" << escape_wstr(raw_val) << "\"));\n";
+                        out << indent << "{ auto __tpl = load_control_template(L\"" << escape_wstr(raw_val) << "\"); if (__tpl.get_abi()) " << var_name << ".Template(__tpl); }\n";
+                    }
+                }
+                else if (rk == "ItemsPanel" || rk == "itemsPanel")
+                {
+                    std::string raw_val = normalize_payload_value(rval);
+                    if (raw_val.find("StaticResource ") != std::string::npos || raw_val.find("ThemeResource ") != std::string::npos)
+                    {
+                        auto ks = raw_val.find("Resource ") + 9;
+                        auto ke = raw_val.find('}', ks);
+                        if (ke != std::string::npos)
+                        {
+                            std::string res_key = raw_val.substr(ks, ke - ks);
+                            out << indent << "{ auto __ipt = items_panel_template_th(L\"" << res_key << "\"); if (__ipt.get_abi()) " << var_name << ".ItemsPanel(__ipt); }\n";
+                        }
+                    }
+                    else if (!raw_val.empty() && raw_val[0] == '<')
+                    {
+                        out << indent << "{ auto __ipt = load_items_panel_template(L\"" << escape_wstr(raw_val) << "\"); if (__ipt.get_abi()) " << var_name << ".ItemsPanel(__ipt); }\n";
                     }
                 }
                 else if (rk.rfind("AutomationProperties.", 0) == 0)

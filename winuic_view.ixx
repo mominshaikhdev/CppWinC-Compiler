@@ -3242,7 +3242,7 @@ inline std::string generate_view_module(layout_view const& view, attribute_catal
     // view renders empty). Templated ContentControls (OpacityMaskView, Button)
     // use Content for user payload, NOT visual root; setting root as Content
     // creates a cycle with PART_ContentPresenter.
-    bool is_content_control_base = (view.base_type == "ContentControl" || view.base_type == "Button" || view.base_type == "Control" || view.base_type == "ToggleButton")
+    bool is_content_control_base = (view.base_type == "ContentControl" || view.base_type == "Button" || view.base_type == "ToggleButton")
         && view.base_type != "UserControl" && view.base_type != "Page" && !view.base_type.ends_with("Page");
     if (root_vars.size() == 1)
     {
