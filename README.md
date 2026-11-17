@@ -215,7 +215,7 @@ Because elements are strongly typed members:
 
 #### 2. Business Logic & MVVM Integration
 
-Connect views to C++23 view models, state containers, data binding models (`INotifyPropertyChanged`, `IObservableVector`), and background worker coroutines (`co_await winrt::resume_background()`):
+Connect views to C++23 view models, state containers, data binding models (`INotifyPropertyChanged`, `IObservableVector`), and background worker coroutines (`co_await winrt::impl::resume_background()`):
 
 ```cpp
 // Sample C++23 ViewModel module:
@@ -225,7 +225,7 @@ import std;
 import winrt_base;
 import winrt.Windows.Foundation;
 import winrt.Windows.Foundation.Collections;
-import winrt.Microsoft.UI.Xaml.Data;
+import winrt.Microsoft.UI.Xaml;
 import winrt.Microsoft.UI.Dispatching;
 
 export struct SampleViewModel : winrt::implements<SampleViewModel,
@@ -247,7 +247,9 @@ export struct SampleViewModel : winrt::implements<SampleViewModel,
     void Title(winrt::hstring const& value) {
         if (m_title != value) {
             m_title = value;
-            m_propertyChanged(*this, winrt::Microsoft::UI::Xaml::Data::PropertyChangedEventArgs{ L"Title" });
+            m_propertyChanged.invoke(
+                get_strong().as<winrt::IInspectable>(),
+                winrt::Microsoft::UI::Xaml::Data::PropertyChangedEventArgs{ L"Title" });
         }
     }
 
@@ -256,17 +258,17 @@ export struct SampleViewModel : winrt::implements<SampleViewModel,
     }
 
     // Coroutine offloading intensive work to thread pool:
-    winrt::Windows::Foundation::IAsyncAction LoadDataAsync(winrt::Microsoft::UI::Dispatching::DispatcherQueue queue) {
-        co_await winrt::resume_background(); // Worker thread
+    winrt::impl::cancellable_async_action LoadDataAsync(winrt::Microsoft::UI::Dispatching::DispatcherQueue queue) {
+        co_await winrt::impl::resume_background(); // Worker thread
 
         std::vector<winrt::hstring> loaded;
         for (int i = 1; i <= 50; ++i) {
-            loaded.push_back(winrt::to_hstring(std::format("Data Record #{}", i)));
+            loaded.emplace_back(winrt::to_hstring(std::format("Data Record #{}", i)).c_str());
         }
 
-        co_await winrt::resume_foreground(queue); // Dispatch back to UI thread
+        co_await winrt::impl::resume_foreground(queue); // Dispatch back to UI thread
         for (auto const& item : loaded) {
-            m_items.Append(winrt::box_value(item));
+            m_items.Append(winrt::IInspectable(winrt::box_value(item)));
         }
     }
 };
@@ -289,10 +291,10 @@ You can connect your ViewModel to the View using either of two patterns:
       auto viewModel = winrt::make_self<SampleViewModel>();
 
       // Bind ViewModel to View's DataContext:
-      view->DataContext(*viewModel);
+      view->DataContext(viewModel.as<winrt::IInspectable>());
 
       // Trigger background coroutine worker:
-      viewModel->LoadDataAsync(view->DispatcherQueue());
+      winrt::attach_cancellable(viewModel->LoadDataAsync(view->DispatcherQueue()));
 
       contentFrame.Content(*view);
   }
@@ -313,8 +315,8 @@ You can connect your ViewModel to the View using either of two patterns:
 
           // Connect ViewModel directly in the View's constructor:
           auto vm = winrt::make_self<SampleViewModel>();
-          DataContext(*vm);
-          vm->LoadDataAsync(DispatcherQueue());
+          DataContext(vm.as<winrt::IInspectable>());
+          winrt::attach_cancellable(vm->LoadDataAsync(DispatcherQueue()));
       }
       // ...
   };
