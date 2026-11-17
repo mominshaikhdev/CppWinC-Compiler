@@ -78,12 +78,12 @@ It projects four API surfaces from a single compiler:
 
 | API Surface | Metadata Source | Namespaces | Runtime |
 |---|---|---|---|
-| **WinUI 3** | `.winui` XAML views (xaml2winuic / winuic), WASDK | `Microsoft.UI.*` | `winui_base.ixx` / `winrt_base.ixx` |
+| **WinUI 3** | `.winui` XAML views (xaml2winuic / winuic), WASDK | `Microsoft.UI.*` | `winui_base.ixx` |
 | **WinRT** | System `WinMetadata`, Windows SDK, WASDK/WinUI3 | `Windows.*` | `winrt_base.ixx` |
 | **Win32** | `winversec`-generated `.winmd` | `Windows.Win32.*` | None (plain C++) |
 | **Driver (WDK)** | `winversec`-generated `.winmd` | `Windows.Wdk.*` (shared utilities, RPC, string, network) | None (plain C++) |
 
-WinUI 3 and WinRT modules import `winrt_base` for the runtime wrapper layer
+WinUI 3 modules import `winui_base` and WinRT modules import `winrt_base` for the runtime wrapper layer
 (`hstring`, `com_ptr`, coroutines, etc.). Win32 and WDK modules are plain C++
 with no runtime dependency — direct `extern "C"` linkage, RAII handle wrappers,
 and correct calling conventions.
@@ -401,7 +401,7 @@ Resource lookups dynamically search the WinUI 3 resource hierarchy:
 ### Shared WinUI 3 Base Module (`winui_base`)
 
 For WinUI 3 builds, `CppWinC` emits a shared `winui_base.ixx` (`export module winui_base;`) that every generated view module re-exports (`export import winui_base;`). Instead of repeating platform imports, theme helpers, and component stubs in every view `.ixx`, `winui_base` centralizes:
-- **Platform & Runtime Re-exports:** `winrt_base`, `Microsoft.UI.Xaml.*`, `Microsoft.UI.Dispatching`, `Microsoft.UI.Windowing`, `Windows.Foundation.*`, `Windows.UI.*`, `Windows.Win32.UI.WindowsAndMessaging`, and the app's own component module.
+- **Platform & Runtime Re-exports:** `Microsoft.UI.Xaml.*`, `Microsoft.UI.Dispatching`, `Microsoft.UI.Windowing`, `Windows.Foundation.*`, `Windows.UI.*`, `Windows.Win32.UI.WindowsAndMessaging`, and the app's own component module.
 - **Shared Theme & Resource Runtime (`ThemeState`):** `theme_lookup_th`, `theme_brush_th`, `style_lookup_th`, `data_template_th`, `apply_xaml_resources`, `apply_visual_state_groups`, `symbol_from_name`, `parse_svg_path`, and recent-history persistence.
 - **Metadata-Driven Component Stubs & Helpers:** Emits projection-agnostic helper wrappers and fallback stubs discovered from `.winmd` metadata once in `winui_base` rather than duplicating them across individual view modules.
 
